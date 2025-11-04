@@ -24,7 +24,7 @@ import math
 import struct
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Type, TypeVar
 
 import numpy as np
 import hashlib
@@ -39,6 +39,9 @@ import zlib
 
 class BudgetError(RuntimeError):
     """Raised when a runtime budget specified by the Sera spec is violated."""
+
+
+T = TypeVar("T")
 
 
 def _validate_prefix_free(vocabulary: Dict[bytes, int]) -> None:
@@ -77,6 +80,31 @@ def _kahan_update(sum_: float, c: float, value: float) -> Tuple[float, float]:
     t = sum_ + y
     c_new = (t - sum_) - y
     return t, c_new
+
+
+def _coerce_dataclass_config(
+    value: object,
+    cls: Type[T],
+    factory: Callable[[], T],
+) -> T:
+    """Return an instance of ``cls`` merging ``value`` with default fields.
+
+    ``SeraConfig`` accepts dictionaries for nested configuration sections so
+    that callers can override only the parameters they care about.  The helper
+    centralises the merging logic to guarantee that every field inherits
+    defaults from the canonical configuration.  ``factory`` is evaluated for
+    each coercion to avoid sharing mutable defaults between ``SeraConfig``
+    instances.
+    """
+
+    if isinstance(value, cls):
+        return value
+    if isinstance(value, dict):
+        default = factory()
+        merged = {field.name: getattr(default, field.name) for field in dataclasses.fields(cls)}
+        merged.update(value)
+        return cls(**merged)  # type: ignore[arg-type]
+    raise TypeError(f"Expected {cls.__name__} or dict, got {type(value)!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -916,10 +944,12 @@ class ManifestRecord:
         }
 
 
-@dataclass(frozen=True)
-class SeraConfig:
-    tokenizer: TokenizerConfig = TokenizerConfig()
-    attention: PRFAttentionConfig = PRFAttentionConfig(
+def _default_tokenizer_config() -> TokenizerConfig:
+    return TokenizerConfig()
+
+
+def _default_attention_config() -> PRFAttentionConfig:
+    return PRFAttentionConfig(
         dim=4,
         value_dim=4,
         features=16,
@@ -927,41 +957,102 @@ class SeraConfig:
         tau=1.0,
         beta_floor=1e-3,
     )
-    linear: SparseLinearConfig = SparseLinearConfig(
-        capacity=512, tau_low=0.1, tau_high=0.9, learning_rate=0.05
-    )
-    memory: FiniteMemoryConfig = FiniteMemoryConfig(lift_coordinates=(0,), max_active=8, delay=1)
-    fusion: FusionConfig = FusionConfig()
-    ccr: CCRConfig = CCRConfig()
-    bridge: BridgeConfig = BridgeConfig()
-    tree_search: TreeSearchConfig = TreeSearchConfig()
+
+
+def _default_linear_config() -> SparseLinearConfig:
+    return SparseLinearConfig(capacity=512, tau_low=0.1, tau_high=0.9, learning_rate=0.05)
+
+
+def _default_memory_config() -> FiniteMemoryConfig:
+    return FiniteMemoryConfig(lift_coordinates=(0,), max_active=8, delay=1)
+
+
+def _default_fusion_config() -> FusionConfig:
+    return FusionConfig()
+
+
+def _default_ccr_config() -> CCRConfig:
+    return CCRConfig()
+
+
+def _default_bridge_config() -> BridgeConfig:
+    return BridgeConfig()
+
+
+def _default_tree_search_config() -> TreeSearchConfig:
+    return TreeSearchConfig()
+
+
+def _default_fp_contract() -> FPContract:
+    return FPContract()
+
+
+@dataclass(frozen=True)
+class SeraConfig:
+    tokenizer: TokenizerConfig = field(default_factory=_default_tokenizer_config)
+    attention: PRFAttentionConfig = field(default_factory=_default_attention_config)
+    linear: SparseLinearConfig = field(default_factory=_default_linear_config)
+    memory: FiniteMemoryConfig = field(default_factory=_default_memory_config)
+    fusion: FusionConfig = field(default_factory=_default_fusion_config)
+    ccr: CCRConfig = field(default_factory=_default_ccr_config)
+    bridge: BridgeConfig = field(default_factory=_default_bridge_config)
+    tree_search: TreeSearchConfig = field(default_factory=_default_tree_search_config)
     lambda_floor: float = 0.05
     feature_budget: int = 32
-    fp_contract: FPContract = FPContract()
+    fp_contract: FPContract = field(default_factory=_default_fp_contract)
 
     def __post_init__(self) -> None:
         if self.lambda_floor <= 0:
             raise ValueError("lambda_floor must be positive")
         if self.feature_budget <= 0:
             raise ValueError("feature_budget must be positive")
-        if isinstance(self.tokenizer, dict):
-            object.__setattr__(self, "tokenizer", TokenizerConfig(**self.tokenizer))
-        if isinstance(self.attention, dict):
-            object.__setattr__(self, "attention", PRFAttentionConfig(**self.attention))
-        if isinstance(self.linear, dict):
-            object.__setattr__(self, "linear", SparseLinearConfig(**self.linear))
-        if isinstance(self.memory, dict):
-            object.__setattr__(self, "memory", FiniteMemoryConfig(**self.memory))
-        if isinstance(self.fusion, dict):
-            object.__setattr__(self, "fusion", FusionConfig(**self.fusion))
-        if isinstance(self.ccr, dict):
-            object.__setattr__(self, "ccr", CCRConfig(**self.ccr))
-        if isinstance(self.bridge, dict):
-            object.__setattr__(self, "bridge", BridgeConfig(**self.bridge))
-        if isinstance(self.tree_search, dict):
-            object.__setattr__(self, "tree_search", TreeSearchConfig(**self.tree_search))
-        if isinstance(self.fp_contract, dict):
-            object.__setattr__(self, "fp_contract", FPContract(**self.fp_contract))
+        object.__setattr__(
+            self,
+            "tokenizer",
+            _coerce_dataclass_config(self.tokenizer, TokenizerConfig, _default_tokenizer_config),
+        )
+        object.__setattr__(
+            self,
+            "attention",
+            _coerce_dataclass_config(self.attention, PRFAttentionConfig, _default_attention_config),
+        )
+        object.__setattr__(
+            self,
+            "linear",
+            _coerce_dataclass_config(self.linear, SparseLinearConfig, _default_linear_config),
+        )
+        object.__setattr__(
+            self,
+            "memory",
+            _coerce_dataclass_config(self.memory, FiniteMemoryConfig, _default_memory_config),
+        )
+        object.__setattr__(
+            self,
+            "fusion",
+            _coerce_dataclass_config(self.fusion, FusionConfig, _default_fusion_config),
+        )
+        object.__setattr__(
+            self,
+            "ccr",
+            _coerce_dataclass_config(self.ccr, CCRConfig, _default_ccr_config),
+        )
+        object.__setattr__(
+            self,
+            "bridge",
+            _coerce_dataclass_config(self.bridge, BridgeConfig, _default_bridge_config),
+        )
+        object.__setattr__(
+            self,
+            "tree_search",
+            _coerce_dataclass_config(
+                self.tree_search, TreeSearchConfig, _default_tree_search_config
+            ),
+        )
+        object.__setattr__(
+            self,
+            "fp_contract",
+            _coerce_dataclass_config(self.fp_contract, FPContract, _default_fp_contract),
+        )
 
 
 @dataclass

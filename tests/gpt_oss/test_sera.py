@@ -68,3 +68,21 @@ def test_step_enforces_feature_budget() -> None:
     query = [1.0] * model.config.attention.dim
     outputs = model.step(query=query)
     assert outputs["y_att"] is not None
+
+
+def test_sera_config_allows_partial_nested_overrides() -> None:
+    config = SeraConfig(attention={"dim": 8})
+
+    assert config.attention.dim == 8
+    # Other values come from the canonical defaults.
+    assert config.attention.value_dim == 4
+    assert config.attention.features == 16
+
+
+def test_sera_config_provides_fresh_defaults() -> None:
+    config_a = SeraConfig()
+    config_b = SeraConfig()
+
+    assert config_a is not config_b
+    assert config_a.attention is not config_b.attention
+    assert config_a.linear is not config_b.linear
