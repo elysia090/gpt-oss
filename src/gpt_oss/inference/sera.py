@@ -89,6 +89,8 @@ class TokenizerConfig:
     normalizer_states: int = 8
     vocabulary: Dict[bytes, int] = dataclasses.field(default_factory=dict)
     edit_window: int = 4
+    max_event_bytes: int = 64
+    max_event_tokens: int = 64
 
     def __post_init__(self) -> None:
         if self.max_piece_length <= 0:
@@ -97,6 +99,12 @@ class TokenizerConfig:
             raise ValueError("normalizer_states must be positive")
         if self.edit_window < self.max_piece_length:
             raise ValueError("edit_window must be >= max_piece_length")
+        if self.max_event_bytes <= 0:
+            raise ValueError("max_event_bytes must be positive")
+        if self.max_event_tokens <= 0:
+            raise ValueError("max_event_tokens must be positive")
+        if self.max_event_tokens < self.max_piece_length:
+            raise ValueError("max_event_tokens must be >= max_piece_length")
         if not self.vocabulary:
             # Provide a default byte-level vocabulary when none is supplied.
             vocabulary = {bytes([i]): i for i in range(256)}
@@ -136,6 +144,8 @@ class TokenizerState:
         """Encode bytes into token ids following the algorithm in spec §2.4."""
 
         normalised = self._normalise_bytes(data)
+        if len(normalised) > self.config.max_event_bytes:
+            raise BudgetError("Tokenizer byte budget exceeded")
         output: List[int] = []
         i = 0
         max_len = self.config.max_piece_length
@@ -161,6 +171,8 @@ class TokenizerState:
                     raise KeyError(f"Byte {byte!r} missing from vocabulary")
                 output.append(token_id)
                 i += 1
+            if len(output) > self.config.max_event_tokens:
+                raise BudgetError("Tokenizer token budget exceeded")
         return output
 
     # -- Decoder --------------------------------------------------------
@@ -168,6 +180,8 @@ class TokenizerState:
     def decode(self, tokens: Sequence[int]) -> bytes:
         """Decode token ids back to bytes (spec §2.5)."""
 
+        if len(tokens) > self.config.max_event_tokens:
+            raise BudgetError("Tokenizer token budget exceeded")
         pieces = []
         for token in tokens:
             piece = self._id_to_bytes.get(token)
@@ -539,9 +553,9 @@ class BridgeState:
         return value, True
 
     def gate(self, base: float, bridge_val: np.ndarray, guard: bool) -> float:
-        beta = self.config.beta_min if guard else 0.0
-        if guard:
-            beta += (self.config.beta_max - self.config.beta_min) / 2.0
+        guard_weight = float(bool(guard))
+        beta_mid = self.config.beta_min + (self.config.beta_max - self.config.beta_min) / 2.0
+        beta = guard_weight * beta_mid
         alpha = 1.0 - beta
         return alpha * base + beta * float(np.mean(bridge_val))
 
@@ -594,10 +608,13 @@ class SeraConfig:
     bridge: BridgeConfig = BridgeConfig()
     tree_search: TreeSearchConfig = TreeSearchConfig()
     lambda_floor: float = 0.05
+    feature_budget: int = 32
 
     def __post_init__(self) -> None:
         if self.lambda_floor <= 0:
             raise ValueError("lambda_floor must be positive")
+        if self.feature_budget <= 0:
+            raise ValueError("feature_budget must be positive")
 
 
 @dataclass
@@ -684,8 +701,11 @@ class Sera:
             )
             att_features = self._attention_features(y_att, phi_q)
 
-        features = list(sparse_features or [])
-        features.extend(att_features)
+        features = self._collect_features(sparse_features or [])
+        for feature in att_features:
+            if len(features) >= self.config.feature_budget:
+                raise BudgetError("Feature budget exceeded")
+            features.append(feature)
         y_lin = self.linear.predict(features)
         if target is not None:
             self.linear.update(features, target)
@@ -778,6 +798,17 @@ class Sera:
         mean_att = float(np.mean(y_att))
         norm_phi = float(np.linalg.norm(phi_q))
         return [(-1, mean_att), (-2, norm_phi)]
+
+    def _collect_features(
+        self, features: Iterable[Tuple[int, float]]
+    ) -> List[Tuple[int, float]]:
+        collected: List[Tuple[int, float]] = []
+        budget = self.config.feature_budget
+        for idx, value in features:
+            if len(collected) >= budget:
+                raise BudgetError("Feature budget exceeded")
+            collected.append((int(idx), float(value)))
+        return collected
 
 
 __all__ = ["Sera", "SeraConfig"]
