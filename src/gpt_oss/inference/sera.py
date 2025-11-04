@@ -426,12 +426,22 @@ class FiniteMemoryConfig:
     lift_coordinates: Sequence[int]
     max_active: int
     delay: int
+    a_coeffs: Sequence[float] = ()
+    b_coeffs: Sequence[float] = (1.0,)
+    input_clip: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.max_active <= 0:
             raise ValueError("max_active must be positive")
         if self.delay < 0:
             raise ValueError("delay must be non-negative")
+        if not self.b_coeffs:
+            raise ValueError("b_coeffs must not be empty")
+        if self.input_clip is not None and self.input_clip <= 0:
+            raise ValueError("input_clip must be positive")
+        # Normalise coefficients to tuples for fast access during runtime.
+        object.__setattr__(self, "a_coeffs", tuple(float(x) for x in self.a_coeffs))
+        object.__setattr__(self, "b_coeffs", tuple(float(x) for x in self.b_coeffs))
 
 
 @dataclass
@@ -441,13 +451,19 @@ class FiniteMemoryState:
     _delay_buffer: List[float] = field(init=False)
     _delay_index: int = 0
     _lift_set: Set[int] = field(init=False)
+    _input_history: List[float] = field(init=False)
+    _output_history: List[float] = field(init=False)
 
     def __post_init__(self) -> None:
         self._delay_buffer = [0.0 for _ in range(max(self.config.delay, 1))]
         self._lift_set = set(self.config.lift_coordinates)
+        self._input_history = [0.0 for _ in range(len(self.config.b_coeffs))]
+        self._output_history = [0.0 for _ in range(len(self.config.a_coeffs))]
 
     def accumulate(self, lifts: Iterable[Tuple[int, float]]) -> float:
         count = 0
+        aggregate = 0.0
+        aggregate_comp = 0.0
         for coord, value in lifts:
             if coord not in self._lift_set:
                 continue
@@ -457,10 +473,32 @@ class FiniteMemoryState:
             total, comp = self._accumulators.get(coord, (0.0, 0.0))
             total, comp = _kahan_update(total, comp, value)
             self._accumulators[coord] = (total, comp)
-        result = self._delay_buffer[self._delay_index]
-        self._delay_buffer[self._delay_index] = 0.0
+            aggregate, aggregate_comp = _kahan_update(aggregate, aggregate_comp, value)
+
+        if self.config.input_clip is not None:
+            limit = self.config.input_clip
+            aggregate = max(-limit, min(limit, aggregate))
+
+        delayed_input = self._delay_buffer[self._delay_index]
+        self._delay_buffer[self._delay_index] = aggregate
         self._delay_index = (self._delay_index + 1) % len(self._delay_buffer)
-        return result
+
+        if self._input_history:
+            self._input_history.insert(0, delayed_input)
+            del self._input_history[len(self.config.b_coeffs) :]
+
+        output = 0.0
+        comp = 0.0
+        for coeff, past in zip(self.config.a_coeffs, self._output_history):
+            output, comp = _kahan_update(output, comp, coeff * past)
+        for coeff, past in zip(self.config.b_coeffs, self._input_history):
+            output, comp = _kahan_update(output, comp, coeff * past)
+
+        if self._output_history:
+            self._output_history.insert(0, output)
+            del self._output_history[len(self.config.a_coeffs) :]
+
+        return output
 
 
 # ---------------------------------------------------------------------------
