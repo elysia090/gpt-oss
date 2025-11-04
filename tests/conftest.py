@@ -1,11 +1,14 @@
 import os
 import sys
+from pathlib import Path
 import pytest
 from typing import Generator, Any
 from unittest.mock import Mock, MagicMock
 from fastapi.testclient import TestClient
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+
+sys.path.insert(0, str(SRC_DIR))
 
 from openai_harmony import (
     HarmonyEncodingName,

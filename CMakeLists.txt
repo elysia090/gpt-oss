@@ -19,5 +19,5 @@ set(GPTOSS_BUILD_METAL "${GPTOSS_BUILD_METAL}" CACHE BOOL "Enable Metal backend"
 
 if(GPTOSS_BUILD_METAL)
   enable_language(OBJC)
-  add_subdirectory(gpt_oss/metal)
+add_subdirectory(src/gpt_oss/metal)
 endif()

@@ -217,6 +217,20 @@ This repository provides a collection of reference implementations:
   - [`chat`](#terminal-chat) — a basic terminal chat application that uses the PyTorch or Triton implementations for inference along with the python and browser tools
   - [`responses_api`](#responses-api) — an example Responses API compatible server that implements the browser tool along with other Responses-compatible functionality
 
+### Repository layout
+
+```
+.
+├── src/gpt_oss/         # Primary Python package sources
+├── tools/mcp_server/    # MCP-compatible wrappers around the reference tools
+├── docs/                # Project documentation and diagrams
+├── examples/            # Sample scripts demonstrating API usage
+├── tests/               # Automated tests and shared fixtures
+└── tests/data/          # Test resource files consumed by the suite
+```
+
+The `src/` based layout keeps the importable package separate from auxiliary tooling, while the `tools/` and `tests/` directories group developer utilities and quality checks in predictable locations.
+
 ## Setup
 
 ### Requirements
@@ -260,7 +274,7 @@ hf download openai/gpt-oss-20b --include "original/*" --local-dir gpt-oss-20b/
 
 ## Reference PyTorch implementation
 
-We include an inefficient reference PyTorch implementation in [gpt_oss/torch/model.py](gpt_oss/torch/model.py). This code uses basic PyTorch operators to show the exact model architecture, with a small addition of supporting tensor parallelism in MoE so that the larger model can run with this code (e.g., on 4xH100 or 2xH200). In this implementation, we upcast all weights to BF16 and run the model in BF16.
+We include an inefficient reference PyTorch implementation in [src/gpt_oss/torch/model.py](src/gpt_oss/torch/model.py). This code uses basic PyTorch operators to show the exact model architecture, with a small addition of supporting tensor parallelism in MoE so that the larger model can run with this code (e.g., on 4xH100 or 2xH200). In this implementation, we upcast all weights to BF16 and run the model in BF16.
 
 To run the reference implementation, install the dependencies:
 
@@ -316,7 +330,7 @@ GPTOSS_BUILD_METAL=1 pip install -e ".[metal]"
 To perform inference you'll need to first convert the SafeTensor weights from Hugging Face into the right format using:
 
 ```shell
-python gpt_oss/metal/scripts/create-local-model.py -s <model_dir> -d <output_file>
+python src/gpt_oss/metal/scripts/create-local-model.py -s <model_dir> -d <output_file>
 ```
 
 Or download the pre-converted weights:
@@ -329,14 +343,14 @@ hf download openai/gpt-oss-20b --include "metal/*" --local-dir gpt-oss-20b/metal
 To test it you can run:
 
 ```shell
-python gpt_oss/metal/examples/generate.py gpt-oss-20b/metal/model.bin -p "why did the chicken cross the road?"
+python src/gpt_oss/metal/examples/generate.py gpt-oss-20b/metal/model.bin -p "why did the chicken cross the road?"
 ```
 
 ## Harmony format & tools
 
 Along with the model, we are also releasing a new chat format library `harmony` to interact with the model. Check [this guide](https://cookbook.openai.com/articles/openai-harmony) for more info about harmony.
 
-We also include two system tools for the model: browsing and python container. Check [gpt_oss/tools](gpt_oss/tools) for the tool implementation.
+We also include two system tools for the model: browsing and python container. Check [src/gpt_oss/tools](src/gpt_oss/tools) for the tool implementation.
 
 ## Clients
 
@@ -426,7 +440,7 @@ codex -p oss
 ### Browser
 
 > [!WARNING]
-> This implementation is purely for educational purposes and should not be used in production. You should implement your own equivalent of the [`YouComBackend`](gpt_oss/tools/simple_browser/backend.py) class with your own browsing environment. Currently we have available `YouComBackend` and `ExaBackend`. 
+> This implementation is purely for educational purposes and should not be used in production. You should implement your own equivalent of the [`YouComBackend`](src/gpt_oss/tools/simple_browser/backend.py) class with your own browsing environment. Currently we have available `YouComBackend` and `ExaBackend`.
 
 Both gpt-oss models were trained with the capability to browse using the `browser` tool that exposes the following three methods:
 

@@ -79,8 +79,8 @@ This is a list of guides and resources to help you get started with the gpt-oss 
 
 ## Tools
 
-- [Example `python` tool for gpt-oss](./gpt_oss/tools/python_docker/)
-- [Example `browser` tool for gpt-oss](./gpt_oss/tools/simple_browser/)
+- [Example `python` tool for gpt-oss](./src/gpt_oss/tools/python_docker/)
+- [Example `browser` tool for gpt-oss](./src/gpt_oss/tools/simple_browser/)
 
 ## Training
 
