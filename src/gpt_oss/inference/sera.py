@@ -27,6 +27,9 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
+import hashlib
+import json
+import zlib
 
 
 # ---------------------------------------------------------------------------
@@ -438,9 +441,73 @@ class SparseLinearConfig:
             raise ValueError("learning_rate must be positive")
 
 
+@dataclass(frozen=True)
+class InjectiveHandle:
+    """Stable external handle for a sparse linear key (spec §4.3)."""
+
+    generation: int
+    slot: int
+
+    def as_tuple(self) -> Tuple[int, int]:
+        return (self.generation, self.slot)
+
+
+@dataclass
+class InjectiveAddressBook:
+    """Tracks injective key -> slot assignments within a generation."""
+
+    generation: int = 0
+    _key_to_slot: Dict[int, int] = field(default_factory=dict)
+    _next_slot: int = 0
+
+    def slot_of(self, key: int) -> Optional[InjectiveHandle]:
+        slot = self._key_to_slot.get(key)
+        if slot is None:
+            return None
+        return InjectiveHandle(self.generation, slot)
+
+    def ensure_slot(self, key: int) -> Tuple[InjectiveHandle, bool]:
+        created = False
+        slot = self._key_to_slot.get(key)
+        if slot is None:
+            slot = self._next_slot
+            self._key_to_slot[key] = slot
+            self._next_slot += 1
+            created = True
+        return InjectiveHandle(self.generation, slot), created
+
+    @property
+    def size(self) -> int:
+        return len(self._key_to_slot)
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "generation": self.generation,
+            "key_to_slot": dict(self._key_to_slot),
+            "next_slot": self._next_slot,
+        }
+
+    @classmethod
+    def restore(cls, blob: Dict[str, object]) -> "InjectiveAddressBook":
+        book = cls(generation=int(blob["generation"]))
+        book._key_to_slot = {int(k): int(v) for k, v in blob["key_to_slot"].items()}
+        book._next_slot = int(blob["next_slot"])
+        return book
+
+    def manifest(self) -> List[Dict[str, int]]:
+        return [
+            {"key": int(key), "slot": int(slot), "generation": self.generation}
+            for key, slot in sorted(self._key_to_slot.items())
+        ]
+
+    def advance_generation(self, generation: int) -> None:
+        self.generation = generation
+
+
 @dataclass
 class SparseLinearState:
     config: SparseLinearConfig
+    _address_book: InjectiveAddressBook = field(default_factory=InjectiveAddressBook)
     _weights: Dict[int, float] = field(default_factory=dict)
     _bias: float = 0.0
 
@@ -448,7 +515,11 @@ class SparseLinearState:
         total = self._bias
         comp = 0.0
         for idx, value in features:
-            weight = self._weights.get(idx, 0.0)
+            handle = self._address_book.slot_of(int(idx))
+            if handle is None:
+                weight = 0.0
+            else:
+                weight = self._weights.get(handle.slot, 0.0)
             total, comp = _kahan_update(total, comp, weight * value)
         return total
 
@@ -457,11 +528,44 @@ class SparseLinearState:
         error = prediction - target
         lr = self.config.learning_rate
         for idx, value in features:
-            if idx not in self._weights and len(self._weights) >= self.config.capacity:
+            handle, created = self._address_book.ensure_slot(int(idx))
+            if created and self._address_book.size > self.config.capacity:
+                # Revert slot assignment to keep invariants consistent.
+                del self._address_book._key_to_slot[int(idx)]
+                self._address_book._next_slot -= 1
                 raise BudgetError("Sparse linear capacity exceeded")
-            grad = error * value + self.config.l2 * self._weights.get(idx, 0.0)
-            self._weights[idx] = self._weights.get(idx, 0.0) - lr * grad
+            weight = self._weights.get(handle.slot, 0.0)
+            grad = error * value + self.config.l2 * weight
+            self._weights[handle.slot] = weight - lr * grad
         self._bias -= lr * (error + self.config.l2 * self._bias)
+
+    def handles_for(self, keys: Iterable[int]) -> List[InjectiveHandle]:
+        return [handle for key in keys if (handle := self._address_book.slot_of(int(key))) is not None]
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "address_book": self._address_book.snapshot(),
+            "weights": {int(slot): float(weight) for slot, weight in self._weights.items()},
+            "bias": float(self._bias),
+        }
+
+    @classmethod
+    def restore(cls, config: SparseLinearConfig, blob: Dict[str, object]) -> "SparseLinearState":
+        state = cls(config)
+        state._address_book = InjectiveAddressBook.restore(blob["address_book"])
+        state._weights = {int(k): float(v) for k, v in blob["weights"].items()}
+        state._bias = float(blob["bias"])
+        return state
+
+    def manifest(self) -> Dict[str, object]:
+        return {
+            "handles": [handle for handle in self._address_book.manifest()],
+            "weights": {int(slot): float(weight) for slot, weight in sorted(self._weights.items())},
+            "bias": float(self._bias),
+        }
+
+    def advance_generation(self, generation: int) -> None:
+        self._address_book.advance_generation(generation)
 
 
 # ---------------------------------------------------------------------------
@@ -592,18 +696,53 @@ class CCRConfig:
 @dataclass
 class CCRState:
     config: CCRConfig
+    _certificate: "CCRProof" = field(init=False)
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.config.gamma < 1):
+            raise ValueError("gamma must be in [0,1)")
+        tail = self._tail_bound(self.config.gamma, self.config.truncation_order)
+        self._certificate = CCRProof(
+            gamma=self.config.gamma,
+            truncation_order=self.config.truncation_order,
+            tail_bound=tail,
+        )
 
     def correct(self, residuals: np.ndarray, h_operator: np.ndarray) -> np.ndarray:
         if residuals.ndim != 1:
             raise ValueError("Residuals must be a vector")
         if h_operator.shape != (residuals.shape[0], residuals.shape[0]):
             raise ValueError("Operator shape mismatch")
+        if self.config.gamma >= 1:
+            raise BudgetError("CCR contraction gamma must be < 1")
         correction = np.zeros_like(residuals, dtype=float)
         power = np.eye(residuals.shape[0])
         for _ in range(self.config.truncation_order):
             power = power @ (np.eye(residuals.shape[0]) - self.config.gamma * h_operator)
             correction -= power @ residuals
         return residuals + correction
+
+    @staticmethod
+    def _tail_bound(gamma: float, order: int) -> float:
+        return gamma ** (order + 1) / (1 - gamma) if gamma < 1 else float("inf")
+
+    @property
+    def certificate(self) -> "CCRProof":
+        return self._certificate
+
+
+@dataclass(frozen=True)
+class CCRProof:
+    gamma: float
+    truncation_order: int
+    tail_bound: float
+
+    def as_dict(self) -> Dict[str, float]:
+        return {
+            "gamma": float(self.gamma),
+            "truncation_order": int(self.truncation_order),
+            "tail_bound": float(self.tail_bound),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -620,23 +759,62 @@ class BridgeConfig:
 
 
 @dataclass
+class BridgeGuardRecord:
+    """Guard metadata for bridge promotions (spec §10.3)."""
+
+    margin: float
+    threshold: float
+
+    def check(self) -> bool:
+        return self.margin >= self.threshold
+
+    def as_dict(self) -> Dict[str, float]:
+        return {"margin": float(self.margin), "threshold": float(self.threshold)}
+
+
+@dataclass
+class BridgeEntry:
+    value: np.ndarray
+    guard: BridgeGuardRecord
+    generation: int
+
+    def manifest(self) -> Dict[str, object]:
+        return {
+            "guard": self.guard.as_dict(),
+            "generation": self.generation,
+            "value_shape": list(self.value.shape),
+        }
+
+
+@dataclass
 class BridgeState:
     config: BridgeConfig
     _hub_bits: Dict[int, int] = field(default_factory=dict)
-    _store: Dict[Tuple[int, int], np.ndarray] = field(default_factory=dict)
+    _store: Dict[Tuple[int, int], BridgeEntry] = field(default_factory=dict)
+    _generation: int = 0
 
-    def promote(self, ctx: int, token: int, value: np.ndarray) -> None:
-        self._store[(ctx, token)] = value
+    def promote(
+        self,
+        ctx: int,
+        token: int,
+        value: np.ndarray,
+        *,
+        guard_margin: float = 0.0,
+        guard_threshold: float = 0.0,
+    ) -> None:
+        guard = BridgeGuardRecord(guard_margin, guard_threshold)
+        self._store[(ctx, token)] = BridgeEntry(value, guard, self._generation)
         self._hub_bits.setdefault(ctx, 0)
         self._hub_bits.setdefault(token, 0)
 
     def read(self, ctx: int, token: Optional[int]) -> Tuple[np.ndarray, bool]:
         if token is None:
             return np.zeros(1, dtype=float), False
-        value = self._store.get((ctx, token))
-        if value is None:
+        entry = self._store.get((ctx, token))
+        if entry is None:
             return np.zeros(1, dtype=float), False
-        return value, True
+        guard_ok = entry.guard.check()
+        return entry.value, guard_ok
 
     def gate(self, base: float, bridge_val: np.ndarray, guard: bool) -> float:
         guard_weight = float(bool(guard))
@@ -644,6 +822,24 @@ class BridgeState:
         beta = guard_weight * beta_mid
         alpha = 1.0 - beta
         return alpha * base + beta * float(np.mean(bridge_val))
+
+    def advance_generation(self, generation: int) -> None:
+        self._generation = generation
+
+    def guard_record(self, ctx: int, token: Optional[int]) -> Optional[BridgeGuardRecord]:
+        if token is None:
+            return None
+        entry = self._store.get((ctx, token))
+        if entry is None:
+            return None
+        return entry.guard
+
+    def manifest(self) -> Dict[str, object]:
+        entries = {
+            f"{ctx}:{token}": entry.manifest()
+            for (ctx, token), entry in sorted(self._store.items())
+        }
+        return {"generation": self._generation, "entries": entries}
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +871,52 @@ class TreeSearchState:
 
 
 @dataclass(frozen=True)
+class FPContract:
+    precision: str = "float64"
+    rounding: str = "nearest_even"
+    fma: bool = True
+    denormals: str = "preserved"
+    reduction_order: str = "fixed"
+
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "precision": self.precision,
+            "rounding": self.rounding,
+            "fma": self.fma,
+            "denormals": self.denormals,
+            "reduction_order": self.reduction_order,
+        }
+
+
+@dataclass(frozen=True)
+class ManifestRecord:
+    generation: int
+    fp_contract: FPContract
+    sections: Dict[str, object]
+
+    def digest(self) -> Dict[str, str]:
+        payload = json.dumps(
+            {
+                "generation": self.generation,
+                "fp_contract": self.fp_contract.as_dict(),
+                "sections": self.sections,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        crc = zlib.crc32(payload) & 0xFFFFFFFF
+        sha = hashlib.sha256(payload).hexdigest()
+        return {"crc32c": f"0x{crc:08x}", "sha256": sha}
+
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "generation": self.generation,
+            "fp_contract": self.fp_contract.as_dict(),
+            "sections": self.sections,
+            "digest": self.digest(),
+        }
+
+
+@dataclass(frozen=True)
 class SeraConfig:
     tokenizer: TokenizerConfig = TokenizerConfig()
     attention: PRFAttentionConfig = PRFAttentionConfig(
@@ -695,12 +937,31 @@ class SeraConfig:
     tree_search: TreeSearchConfig = TreeSearchConfig()
     lambda_floor: float = 0.05
     feature_budget: int = 32
+    fp_contract: FPContract = FPContract()
 
     def __post_init__(self) -> None:
         if self.lambda_floor <= 0:
             raise ValueError("lambda_floor must be positive")
         if self.feature_budget <= 0:
             raise ValueError("feature_budget must be positive")
+        if isinstance(self.tokenizer, dict):
+            object.__setattr__(self, "tokenizer", TokenizerConfig(**self.tokenizer))
+        if isinstance(self.attention, dict):
+            object.__setattr__(self, "attention", PRFAttentionConfig(**self.attention))
+        if isinstance(self.linear, dict):
+            object.__setattr__(self, "linear", SparseLinearConfig(**self.linear))
+        if isinstance(self.memory, dict):
+            object.__setattr__(self, "memory", FiniteMemoryConfig(**self.memory))
+        if isinstance(self.fusion, dict):
+            object.__setattr__(self, "fusion", FusionConfig(**self.fusion))
+        if isinstance(self.ccr, dict):
+            object.__setattr__(self, "ccr", CCRConfig(**self.ccr))
+        if isinstance(self.bridge, dict):
+            object.__setattr__(self, "bridge", BridgeConfig(**self.bridge))
+        if isinstance(self.tree_search, dict):
+            object.__setattr__(self, "tree_search", TreeSearchConfig(**self.tree_search))
+        if isinstance(self.fp_contract, dict):
+            object.__setattr__(self, "fp_contract", FPContract(**self.fp_contract))
 
 
 @dataclass
@@ -730,6 +991,7 @@ class Sera:
     bridge: BridgeState = field(init=False)
     tree_search: TreeSearchState = field(init=False)
     diagnostics: SeraDiagnostics = field(default_factory=SeraDiagnostics)
+    generation: int = field(init=False, default=0)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tokenizer", TokenizerState(self.config.tokenizer))
@@ -740,6 +1002,7 @@ class Sera:
         object.__setattr__(self, "ccr", CCRState(self.config.ccr))
         object.__setattr__(self, "bridge", BridgeState(self.config.bridge))
         object.__setattr__(self, "tree_search", TreeSearchState(self.config.tree_search))
+        self.bridge.advance_generation(self.generation)
 
     # ------------------------------------------------------------------
     # Factory
@@ -856,7 +1119,11 @@ class Sera:
     def bridge_read(self, ctx: int, token: Optional[int] = None) -> Dict[str, object]:
         value, guard = self.bridge.read(ctx, token)
         proof = struct.pack("<Q", len(value))
-        return {"r_t": value, "guard_ok": guard, "proof64B": proof}
+        guard_record = self.bridge.guard_record(ctx, token)
+        guard_blob: Optional[Dict[str, float]] = None
+        if guard_record is not None:
+            guard_blob = guard_record.as_dict()
+        return {"r_t": value, "guard_ok": guard, "proof64B": proof, "guard": guard_blob}
 
     # ------------------------------------------------------------------
     # Tree search hook (spec §1.4)
@@ -873,22 +1140,57 @@ class Sera:
     def snapshot(self) -> Dict[str, object]:
         return {
             "config": dataclasses.asdict(self.config),
-            "linear_weights": dict(self.linear._weights),
-            "linear_bias": self.linear._bias,
+            "linear_state": self.linear.snapshot(),
             "diagnostics": self.diagnostics_record(),
+            "generation": self.generation,
+            "manifest": self.manifest_record().as_dict(),
         }
 
     @classmethod
     def restore(cls, blob: Dict[str, object]) -> "Sera":
         config = SeraConfig(**blob["config"])
         model = cls(config)
-        model.linear._weights = dict(blob["linear_weights"])
-        model.linear._bias = float(blob["linear_bias"])
+        linear_blob = blob.get("linear_state")
+        if linear_blob is not None:
+            model.linear = SparseLinearState.restore(model.config.linear, linear_blob)
+        else:
+            # Backwards compatibility
+            model.linear._weights = {
+                int(k): float(v) for k, v in dict(blob["linear_weights"]).items()
+            }
+            model.linear._bias = float(blob.get("linear_bias", 0.0))
         diag_blob = dict(blob["diagnostics"])
         if diag_blob.get("attention_den_min") is None:
             diag_blob["attention_den_min"] = float("inf")
         model.diagnostics = SeraDiagnostics(**diag_blob)
+        model.generation = int(blob.get("generation", 0))
+        model.linear.advance_generation(model.generation)
+        model.bridge.advance_generation(model.generation)
         return model
+
+    # ------------------------------------------------------------------
+    # Generation + Manifest
+    # ------------------------------------------------------------------
+
+    def publish_generation(self) -> None:
+        self.generation += 1
+        self.linear.advance_generation(self.generation)
+        self.bridge.advance_generation(self.generation)
+
+    def _manifest_sections(self) -> Dict[str, object]:
+        return {
+            "linear": self.linear.manifest(),
+            "bridge": self.bridge.manifest(),
+            "ccr_proof": self.ccr.certificate.as_dict(),
+            "diagnostics": self.diagnostics_record(),
+        }
+
+    def manifest_record(self) -> ManifestRecord:
+        return ManifestRecord(
+            generation=self.generation,
+            fp_contract=self.config.fp_contract,
+            sections=self._manifest_sections(),
+        )
 
     # ------------------------------------------------------------------
     # Diagnostics (spec §1.4)
