@@ -36,7 +36,11 @@ build-backend = "gpt_oss_build_backend.backend"
 backend-path = ["_build"]
 
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["gpt_oss*"]
+
+[tool.setuptools.package-dir]
+"" = "src"
 
 [tool.scikit-build]
 cmake.source-dir = "." # pick up the root CMakeLists.txt
@@ -47,3 +51,4 @@ cmake.args = [
 ]
 [tool.scikit-build.wheel]
 packages = ["gpt_oss"] # copy the whole Python package tree
+root = "src"
