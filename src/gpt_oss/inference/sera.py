@@ -113,11 +113,22 @@ class TokenizerConfig:
 
 
 @dataclass
+class TokenizerEncodeStats:
+    """Runtime diagnostics collected by :meth:`TokenizerState.encode`."""
+
+    bytes_in: int
+    normalized_bytes: int
+    tokens_out: int
+    max_probes: int
+
+
+@dataclass
 class TokenizerState:
     """State for the constant-time tokenizer (spec §2)."""
 
     config: TokenizerConfig
     _id_to_bytes: Dict[int, bytes] = field(init=False)
+    _last_stats: Optional[TokenizerEncodeStats] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self._id_to_bytes = {idx: piece for piece, idx in self.config.vocabulary.items()}
@@ -150,6 +161,7 @@ class TokenizerState:
         i = 0
         max_len = self.config.max_piece_length
         vocab = self.config.vocabulary
+        max_probe = 0
         while i < len(normalised):
             remaining = len(normalised) - i
             probe_count = 0
@@ -171,8 +183,15 @@ class TokenizerState:
                     raise KeyError(f"Byte {byte!r} missing from vocabulary")
                 output.append(token_id)
                 i += 1
+            max_probe = max(max_probe, probe_count)
             if len(output) > self.config.max_event_tokens:
                 raise BudgetError("Tokenizer token budget exceeded")
+        self._last_stats = TokenizerEncodeStats(
+            bytes_in=len(data),
+            normalized_bytes=len(normalised),
+            tokens_out=len(output),
+            max_probes=max_probe,
+        )
         return output
 
     # -- Decoder --------------------------------------------------------
@@ -189,6 +208,12 @@ class TokenizerState:
                 raise KeyError(f"Unknown token id {token}")
             pieces.append(piece)
         return b"".join(pieces)
+
+    @property
+    def last_encode_stats(self) -> Optional[TokenizerEncodeStats]:
+        """Return diagnostics from the most recent :meth:`encode` call."""
+
+        return self._last_stats
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +260,9 @@ class PRFAttentionState:
     _s_comp: np.ndarray = field(init=False)
     _mu_comp: np.ndarray = field(init=False)
     _sig2_comp: np.ndarray = field(init=False)
+    _clip_events: int = field(init=False, default=0)
+    _clip_candidates: int = field(init=False, default=0)
+    _last_denominator: Optional[float] = field(init=False, default=None)
 
     # Overlay budgets (spec §3.4)
     type_a: List[Tuple[np.ndarray, np.ndarray]] = field(default_factory=list)
@@ -262,9 +290,17 @@ class PRFAttentionState:
             raise ValueError(f"Input must be shape {(self.config.dim,)}, got {x.shape}")
         scaled = self._weights @ x / math.sqrt(self.config.tau)
         norm = np.dot(x, x)
-        phi = np.exp(scaled - norm / (2 * self.config.tau)) / math.sqrt(self.config.features)
-        if self.config.clip_value is not None:
-            phi = np.clip(phi, -self.config.clip_value, self.config.clip_value)
+        raw_phi = np.exp(scaled - norm / (2 * self.config.tau)) / math.sqrt(
+            self.config.features
+        )
+        clip_value = self.config.clip_value
+        if clip_value is not None:
+            clipped_mask = np.abs(raw_phi) > clip_value
+            self._clip_events += int(np.count_nonzero(clipped_mask))
+            phi = np.clip(raw_phi, -clip_value, clip_value)
+        else:
+            phi = raw_phi
+        self._clip_candidates += raw_phi.size
         return phi
 
     def _phi_whitened(self, x: np.ndarray) -> np.ndarray:
@@ -308,6 +344,7 @@ class PRFAttentionState:
         denominator = float(np.dot(phi_q, self._s) + lambda_floor)
         if denominator < self.config.beta_floor:
             denominator = self.config.beta_floor
+        self._last_denominator = denominator
         return numerator, denominator, phi_q
 
     # -- Overlay application (spec §3.4) -------------------------------
@@ -331,6 +368,7 @@ class PRFAttentionState:
         if denominator < self.config.beta_floor:
             denominator = self.config.beta_floor
         result = (base_num + delta_num) / denominator
+        self._last_denominator = denominator
         return result, phi_q
 
     # -- Internal helpers ----------------------------------------------
@@ -355,6 +393,16 @@ class PRFAttentionState:
         matrix = gamma * matrix
         comp = gamma * comp
         return matrix, comp
+
+    @property
+    def clip_rate(self) -> float:
+        if self._clip_candidates == 0:
+            return 0.0
+        return float(self._clip_events) / float(self._clip_candidates)
+
+    @property
+    def last_denominator(self) -> Optional[float]:
+        return self._last_denominator
 
     def _accumulate_matrix(
         self, matrix: np.ndarray, comp: np.ndarray, update: np.ndarray
@@ -657,8 +705,14 @@ class SeraConfig:
 
 @dataclass
 class SeraDiagnostics:
+    tok_bytes_in: int = 0
+    tok_emitted: int = 0
+    tokenizer_probe_max: int = 0
     tokens_emitted: int = 0
     attention_updates: int = 0
+    attention_clip_rate: float = 0.0
+    attention_den_min: float = field(default=float("inf"))
+    lambda_star: float = 0.0
     bridge_hits: int = 0
     bridge_misses: int = 0
     tree_simulations: int = 0
@@ -724,12 +778,19 @@ class Sera:
         tokens: List[int] = []
         if bytes_data is not None:
             tokens = self.tokenizer.encode(bytes_data)
-            self.diagnostics.tokens_emitted += len(tokens)
+            stats = self.tokenizer.last_encode_stats
+            if stats is not None:
+                diag = self.diagnostics
+                diag.tok_bytes_in += stats.bytes_in
+                diag.tok_emitted += stats.tokens_out
+                diag.tokenizer_probe_max = max(diag.tokenizer_probe_max, stats.max_probes)
+                diag.tokens_emitted = diag.tok_emitted
 
         y_att = None
         if key is not None and value is not None:
             self.attention.update(np.asarray(key, dtype=float), np.asarray(value, dtype=float))
             self.diagnostics.attention_updates += 1
+            self.diagnostics.attention_clip_rate = self.attention.clip_rate
 
         att_features: List[Tuple[int, float]] = []
         phi_q = None
@@ -738,6 +799,13 @@ class Sera:
                 np.asarray(query, dtype=float), self.config.lambda_floor
             )
             att_features = self._attention_features(y_att, phi_q)
+            denominator = self.attention.last_denominator
+            if denominator is not None:
+                self.diagnostics.attention_den_min = min(
+                    self.diagnostics.attention_den_min, float(denominator)
+                )
+            self.diagnostics.attention_clip_rate = self.attention.clip_rate
+            self.diagnostics.lambda_star = self.config.lambda_floor
 
         features = self._collect_features(sparse_features or [])
         for feature in att_features:
@@ -768,6 +836,7 @@ class Sera:
 
         self.tree_search.maybe_select()
         self.diagnostics.tree_simulations = self.tree_search._simulations
+        self.diagnostics.lambda_star = self.config.lambda_floor
 
         return {
             "tokens": tokens,
@@ -806,7 +875,7 @@ class Sera:
             "config": dataclasses.asdict(self.config),
             "linear_weights": dict(self.linear._weights),
             "linear_bias": self.linear._bias,
-            "diagnostics": dataclasses.asdict(self.diagnostics),
+            "diagnostics": self.diagnostics_record(),
         }
 
     @classmethod
@@ -815,7 +884,10 @@ class Sera:
         model = cls(config)
         model.linear._weights = dict(blob["linear_weights"])
         model.linear._bias = float(blob["linear_bias"])
-        model.diagnostics = SeraDiagnostics(**blob["diagnostics"])
+        diag_blob = dict(blob["diagnostics"])
+        if diag_blob.get("attention_den_min") is None:
+            diag_blob["attention_den_min"] = float("inf")
+        model.diagnostics = SeraDiagnostics(**diag_blob)
         return model
 
     # ------------------------------------------------------------------
@@ -823,7 +895,10 @@ class Sera:
     # ------------------------------------------------------------------
 
     def diagnostics_record(self) -> Dict[str, object]:
-        return dataclasses.asdict(self.diagnostics)
+        record = dataclasses.asdict(self.diagnostics)
+        if math.isinf(record["attention_den_min"]):
+            record["attention_den_min"] = None
+        return record
 
     # ------------------------------------------------------------------
     # Feature adapters
