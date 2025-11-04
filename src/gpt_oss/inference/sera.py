@@ -24,7 +24,7 @@ import math
 import struct
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -217,6 +217,10 @@ class PRFAttentionState:
     _s: np.ndarray = field(init=False)
     _mu: np.ndarray = field(init=False)
     _sig2: np.ndarray = field(init=False)
+    _R_comp: np.ndarray = field(init=False)
+    _s_comp: np.ndarray = field(init=False)
+    _mu_comp: np.ndarray = field(init=False)
+    _sig2_comp: np.ndarray = field(init=False)
 
     # Overlay budgets (spec §3.4)
     type_a: List[Tuple[np.ndarray, np.ndarray]] = field(default_factory=list)
@@ -228,9 +232,13 @@ class PRFAttentionState:
         rng = np.random.default_rng(self.config.rng_seed)
         self._weights = rng.standard_normal((self.config.features, self.config.dim))
         self._R = np.zeros((self.config.features, self.config.value_dim), dtype=float)
+        self._R_comp = np.zeros_like(self._R)
         self._s = np.zeros(self.config.features, dtype=float)
+        self._s_comp = np.zeros_like(self._s)
         self._mu = np.zeros(self.config.features, dtype=float)
+        self._mu_comp = np.zeros_like(self._mu)
         self._sig2 = np.ones(self.config.features, dtype=float)
+        self._sig2_comp = np.zeros_like(self._sig2)
 
     # -- Random feature map (spec §3.1) --------------------------------
 
@@ -262,24 +270,31 @@ class PRFAttentionState:
             raise ValueError("Value shape mismatch")
         phi_k = self._phi(key)
         gamma = self.config.gamma
-        self._R *= gamma
-        self._R += np.outer(phi_k, value)
-        self._s *= gamma
-        self._s += phi_k
-        # Running moments for whitening
-        self._mu = gamma * self._mu + (1 - gamma) * phi_k
+        self._R, self._R_comp = self._decay_matrix(self._R, self._R_comp, gamma)
+        outer = np.outer(phi_k, value)
+        self._R, self._R_comp = self._accumulate_matrix(self._R, self._R_comp, outer)
+
+        self._s, self._s_comp = self._decay_vector(self._s, self._s_comp, gamma)
+        self._s, self._s_comp = self._accumulate_vector(self._s, self._s_comp, phi_k)
+
+        # Running moments for whitening (compensated EMA)
+        self._mu, self._mu_comp = self._decay_vector(self._mu, self._mu_comp, gamma)
+        ema_update = (1 - gamma) * phi_k
+        self._mu, self._mu_comp = self._accumulate_vector(self._mu, self._mu_comp, ema_update)
         centred = phi_k - self._mu
-        self._sig2 = gamma * self._sig2 + (1 - gamma) * centred**2
+        self._sig2, self._sig2_comp = self._decay_vector(self._sig2, self._sig2_comp, gamma)
+        sig2_update = (1 - gamma) * centred**2
+        self._sig2, self._sig2_comp = self._accumulate_vector(self._sig2, self._sig2_comp, sig2_update)
 
     # -- Base readout (spec §3.3) --------------------------------------
 
-    def read(self, query: np.ndarray, lambda_floor: float) -> Tuple[np.ndarray, float]:
+    def read(self, query: np.ndarray, lambda_floor: float) -> Tuple[np.ndarray, float, np.ndarray]:
         phi_q = self._phi_whitened(query)
         numerator = phi_q @ self._R
         denominator = float(np.dot(phi_q, self._s) + lambda_floor)
         if denominator < self.config.beta_floor:
             denominator = self.config.beta_floor
-        return numerator, denominator
+        return numerator, denominator, phi_q
 
     # -- Overlay application (spec §3.4) -------------------------------
 
@@ -295,14 +310,48 @@ class PRFAttentionState:
             delta_num += z @ self.type_c_deltaW
         return delta_num, delta_den
 
-    def read_with_overlays(self, query: np.ndarray, lambda_floor: float) -> np.ndarray:
-        phi_q = self._phi_whitened(query)
-        base_num, base_den = self.read(query, lambda_floor)
+    def read_with_overlays(self, query: np.ndarray, lambda_floor: float) -> Tuple[np.ndarray, np.ndarray]:
+        base_num, base_den, phi_q = self.read(query, lambda_floor)
         delta_num, delta_den = self.apply_overlays(phi_q)
         denominator = base_den + delta_den
         if denominator < self.config.beta_floor:
             denominator = self.config.beta_floor
-        return (base_num + delta_num) / denominator
+        result = (base_num + delta_num) / denominator
+        return result, phi_q
+
+    # -- Internal helpers ----------------------------------------------
+
+    def _decay_vector(
+        self, array: np.ndarray, comp: np.ndarray, gamma: float
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        array = gamma * array
+        comp = gamma * comp
+        return array, comp
+
+    def _accumulate_vector(
+        self, array: np.ndarray, comp: np.ndarray, update: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        for i in range(array.shape[0]):
+            array[i], comp[i] = _kahan_update(array[i], comp[i], float(update[i]))
+        return array, comp
+
+    def _decay_matrix(
+        self, matrix: np.ndarray, comp: np.ndarray, gamma: float
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        matrix = gamma * matrix
+        comp = gamma * comp
+        return matrix, comp
+
+    def _accumulate_matrix(
+        self, matrix: np.ndarray, comp: np.ndarray, update: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        rows, cols = matrix.shape
+        for i in range(rows):
+            for j in range(cols):
+                matrix[i, j], comp[i, j] = _kahan_update(
+                    matrix[i, j], comp[i, j], float(update[i, j])
+                )
+        return matrix, comp
 
 
 # ---------------------------------------------------------------------------
@@ -377,13 +426,17 @@ class FiniteMemoryState:
     _accumulators: Dict[int, Tuple[float, float]] = field(default_factory=dict)
     _delay_buffer: List[float] = field(init=False)
     _delay_index: int = 0
+    _lift_set: Set[int] = field(init=False)
 
     def __post_init__(self) -> None:
         self._delay_buffer = [0.0 for _ in range(max(self.config.delay, 1))]
+        self._lift_set = set(self.config.lift_coordinates)
 
     def accumulate(self, lifts: Iterable[Tuple[int, float]]) -> float:
         count = 0
         for coord, value in lifts:
+            if coord not in self._lift_set:
+                continue
             if count >= self.config.max_active:
                 raise BudgetError("Lift activation budget exceeded")
             count += 1
@@ -623,12 +676,16 @@ class Sera:
             self.attention.update(np.asarray(key, dtype=float), np.asarray(value, dtype=float))
             self.diagnostics.attention_updates += 1
 
+        att_features: List[Tuple[int, float]] = []
+        phi_q = None
         if query is not None:
-            y_att = self.attention.read_with_overlays(
+            y_att, phi_q = self.attention.read_with_overlays(
                 np.asarray(query, dtype=float), self.config.lambda_floor
             )
+            att_features = self._attention_features(y_att, phi_q)
 
         features = list(sparse_features or [])
+        features.extend(att_features)
         y_lin = self.linear.predict(features)
         if target is not None:
             self.linear.update(features, target)
@@ -709,6 +766,18 @@ class Sera:
 
     def diagnostics_record(self) -> Dict[str, object]:
         return dataclasses.asdict(self.diagnostics)
+
+    # ------------------------------------------------------------------
+    # Feature adapters
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _attention_features(y_att: Optional[np.ndarray], phi_q: Optional[np.ndarray]) -> List[Tuple[int, float]]:
+        if y_att is None or phi_q is None:
+            return []
+        mean_att = float(np.mean(y_att))
+        norm_phi = float(np.linalg.norm(phi_q))
+        return [(-1, mean_att), (-2, norm_phi)]
 
 
 __all__ = ["Sera", "SeraConfig"]
