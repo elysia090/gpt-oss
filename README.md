@@ -207,21 +207,25 @@ Check out our [awesome list](./awesome-gpt-oss.md) for a broader collection of g
 This repository provides a collection of reference implementations:
 
 - **Inference:**
-  - [`torch`](#reference-pytorch-implementation) — a non-optimized [PyTorch](https://pytorch.org/) implementation for educational purposes only. Requires at least 4× H100 GPUs due to lack of optimization.
-  - [`triton`](#reference-triton-implementation-single-gpu) — a more optimized implementation using [PyTorch](https://pytorch.org/) & [Triton](https://github.com/triton-lang/triton) incl. using CUDA graphs and basic caching
-  - [`metal`](#reference-metal-implementation) — a Metal-specific implementation for running the models on Apple Silicon hardware
+  - [`inference/torch`](#reference-pytorch-implementation) — a non-optimized [PyTorch](https://pytorch.org/) implementation for educational purposes only. Requires at least 4× H100 GPUs due to lack of optimization.
+  - [`inference/triton`](#reference-triton-implementation-single-gpu) — a more optimized implementation using [PyTorch](https://pytorch.org/) & [Triton](https://github.com/triton-lang/triton) incl. using CUDA graphs and basic caching
+  - [`inference/metal`](#reference-metal-implementation) — a Metal-specific implementation for running the models on Apple Silicon hardware
 - **Tools:**
   - [`browser`](#browser) — a reference implementation of the browser tool the models got trained on
   - [`python`](#python) — a stateless reference implementation of the python tool the model got trained on
 - **Client examples:**
-  - [`chat`](#terminal-chat) — a basic terminal chat application that uses the PyTorch or Triton implementations for inference along with the python and browser tools
-  - [`responses_api`](#responses-api) — an example Responses API compatible server that implements the browser tool along with other Responses-compatible functionality
+  - [`cli/chat`](#terminal-chat) — a basic terminal chat application that uses the PyTorch or Triton implementations for inference along with the python and browser tools
+  - [`api/responses`](#responses-api) — an example Responses API compatible server that implements the browser tool along with other Responses-compatible functionality
 
 ### Repository layout
 
 ```
 .
 ├── src/gpt_oss/         # Primary Python package sources
+│   ├── api/             # FastAPI-powered surfaces (e.g. Responses API)
+│   ├── cli/             # Command-line entry points
+│   ├── inference/       # Backend-specific inference implementations
+│   └── tools/           # Reference tool implementations
 ├── tools/mcp_server/    # MCP-compatible wrappers around the reference tools
 ├── docs/                # Project documentation and diagrams
 ├── examples/            # Sample scripts demonstrating API usage
@@ -286,7 +290,7 @@ And then run:
 
 ```shell
 # On 4xH100:
-torchrun --nproc-per-node=4 -m gpt_oss.generate gpt-oss-120b/original/
+torchrun --nproc-per-node=4 -m gpt_oss.cli.generate_cli gpt-oss-120b/original/
 ```
 
 ## Reference Triton implementation (single GPU)
@@ -312,7 +316,7 @@ And then run:
 ```shell
 # On 1xH100
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-python -m gpt_oss.generate --backend triton gpt-oss-120b/original/
+python -m gpt_oss.cli.generate_cli --backend triton gpt-oss-120b/original/
 ```
 
 If you encounter `torch.OutOfMemoryError`, make sure to turn on the expandable allocator to avoid crashes when loading weights from the checkpoint.
@@ -359,7 +363,7 @@ We also include two system tools for the model: browsing and python container. C
 The terminal chat application is a basic example of how to use the harmony format together with the PyTorch, Triton, and vLLM implementations. It also exposes both the python and browser tool as optional tools that can be used.
 
 ```bash
-usage: python -m gpt_oss.chat [-h] [-r REASONING_EFFORT] [-a] [-b] [--show-browser-results] [-p] [--developer-message DEVELOPER_MESSAGE] [-c CONTEXT] [--raw] [--backend {triton,torch,vllm}] FILE
+usage: python -m gpt_oss.cli.chat_cli [-h] [-r REASONING_EFFORT] [-a] [-b] [--show-browser-results] [-p] [--developer-message DEVELOPER_MESSAGE] [-c CONTEXT] [--raw] [--backend {triton,torch,vllm}] FILE
 
 Chat example
 
@@ -400,7 +404,7 @@ You can start this server with the following inference backends:
 - `transformers` — uses your installed transformers version to perform local inference
 
 ```bash
-usage: python -m gpt_oss.responses_api.serve [-h] [--checkpoint FILE] [--port PORT] [--inference-backend BACKEND]
+usage: python -m gpt_oss.api.responses.serve [-h] [--checkpoint FILE] [--port PORT] [--inference-backend BACKEND]
 
 Responses API server
 

@@ -14,7 +14,7 @@ from openai_harmony import (
     HarmonyEncodingName,
     load_harmony_encoding,
 )
-from gpt_oss.responses_api.api_server import create_api_server
+from gpt_oss.api.responses.api_server import create_api_server
 
 
 @pytest.fixture(scope="session")
