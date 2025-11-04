@@ -7,7 +7,7 @@ from openai_harmony import (
     load_harmony_encoding,
 )
 
-from gpt_oss.responses_api.api_server import create_api_server
+from gpt_oss.api.responses.api_server import create_api_server
 
 encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 

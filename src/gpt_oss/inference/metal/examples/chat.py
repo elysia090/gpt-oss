@@ -4,7 +4,7 @@ import argparse
 import sys
 
 from datetime import date
-from gpt_oss.metal import Context, Model
+from gpt_oss.inference.metal import Context, Model
 
 
 DEFAULT_PROMPT = f"""You are ChatGPT, a large language model trained by OpenAI.

@@ -3,7 +3,7 @@
 import argparse
 import sys
 
-from gpt_oss.metal import Context, Model
+from gpt_oss.inference.metal import Context, Model
 
 
 parser = argparse.ArgumentParser(description='Chat with gpt-oss', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
