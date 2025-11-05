@@ -23,6 +23,9 @@ import dataclasses
 import math
 import struct
 import unicodedata
+import copy
+import threading
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Type, TypeVar
 
@@ -944,6 +947,120 @@ class ManifestRecord:
         }
 
 
+@dataclass(frozen=True)
+class PublishedGeneration:
+    """Immutable record for a published generation."""
+
+    generation: int
+    manifest: Dict[str, object]
+    epoch: int
+
+
+class GenerationPin(AbstractContextManager["GenerationPin"]):
+    """Context manager representing a live generation pin."""
+
+    def __init__(
+        self,
+        pointer: "GenerationPointer",
+        generation: int,
+        epoch: int,
+        manifest: Dict[str, object],
+    ) -> None:
+        self._pointer = pointer
+        self.generation = generation
+        self.epoch = epoch
+        self.manifest = manifest
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._pointer._release(self.generation)
+
+    def __enter__(self) -> "GenerationPin":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+        self.release()
+
+
+class GenerationPointer:
+    """Manages single-pointer generation publication with pinning."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._current: Optional[PublishedGeneration] = None
+        self._pins: Dict[int, int] = {}
+        self._history: Dict[int, PublishedGeneration] = {}
+        self._epoch_counter = 0
+
+    def publish(self, record: ManifestRecord) -> PublishedGeneration:
+        manifest = copy.deepcopy(record.as_dict())
+        with self._lock:
+            self._epoch_counter += 1
+            published = PublishedGeneration(
+                generation=record.generation,
+                manifest=manifest,
+                epoch=self._epoch_counter,
+            )
+            self._current = published
+            self._history[published.generation] = published
+            self._garbage_collect_locked()
+            return published
+
+    def pin(self) -> GenerationPin:
+        with self._lock:
+            if self._current is None:
+                raise RuntimeError("No generation published")
+            entry = self._current
+            self._pins[entry.generation] = self._pins.get(entry.generation, 0) + 1
+            manifest = copy.deepcopy(entry.manifest)
+            return GenerationPin(self, entry.generation, entry.epoch, manifest)
+
+    def current_manifest(self) -> Optional[Dict[str, object]]:
+        with self._lock:
+            if self._current is None:
+                return None
+            return copy.deepcopy(self._current.manifest)
+
+    def manifest_for(self, generation: int) -> Optional[Dict[str, object]]:
+        with self._lock:
+            entry = self._history.get(generation)
+            if entry is None:
+                return None
+            return copy.deepcopy(entry.manifest)
+
+    def pinned_generations(self) -> List[int]:
+        with self._lock:
+            return sorted(self._pins.keys())
+
+    @property
+    def epoch(self) -> int:
+        with self._lock:
+            return self._epoch_counter
+
+    def _release(self, generation: int) -> None:
+        with self._lock:
+            count = self._pins.get(generation)
+            if count is None:
+                return
+            if count <= 1:
+                self._pins.pop(generation, None)
+            else:
+                self._pins[generation] = count - 1
+            self._garbage_collect_locked()
+
+    def _garbage_collect_locked(self) -> None:
+        if self._current is None:
+            self._history.clear()
+            return
+        keep = {self._current.generation, *self._pins.keys()}
+        for generation in list(self._history.keys()):
+            if generation not in keep:
+                del self._history[generation]
+
+
 def _default_tokenizer_config() -> TokenizerConfig:
     return TokenizerConfig()
 
@@ -1083,6 +1200,7 @@ class Sera:
     tree_search: TreeSearchState = field(init=False)
     diagnostics: SeraDiagnostics = field(default_factory=SeraDiagnostics)
     generation: int = field(init=False, default=0)
+    _generation_pointer: GenerationPointer = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tokenizer", TokenizerState(self.config.tokenizer))
@@ -1094,6 +1212,8 @@ class Sera:
         object.__setattr__(self, "bridge", BridgeState(self.config.bridge))
         object.__setattr__(self, "tree_search", TreeSearchState(self.config.tree_search))
         self.bridge.advance_generation(self.generation)
+        object.__setattr__(self, "_generation_pointer", GenerationPointer())
+        self._generation_pointer.publish(self.manifest_record())
 
     # ------------------------------------------------------------------
     # Factory
@@ -1129,79 +1249,95 @@ class Sera:
         return dictionary exposes the outputs from spec §1.3.
         """
 
-        tokens: List[int] = []
-        if bytes_data is not None:
-            tokens = self.tokenizer.encode(bytes_data)
-            stats = self.tokenizer.last_encode_stats
-            if stats is not None:
-                diag = self.diagnostics
-                diag.tok_bytes_in += stats.bytes_in
-                diag.tok_emitted += stats.tokens_out
-                diag.tokenizer_probe_max = max(diag.tokenizer_probe_max, stats.max_probes)
-                diag.tokens_emitted = diag.tok_emitted
+        with self.pin_generation():
+            tokens: List[int] = []
+            if bytes_data is not None:
+                tokens = self.tokenizer.encode(bytes_data)
+                stats = self.tokenizer.last_encode_stats
+                if stats is not None:
+                    diag = self.diagnostics
+                    diag.tok_bytes_in += stats.bytes_in
+                    diag.tok_emitted += stats.tokens_out
+                    diag.tokenizer_probe_max = max(
+                        diag.tokenizer_probe_max, stats.max_probes
+                    )
+                    diag.tokens_emitted = diag.tok_emitted
 
-        y_att = None
-        if key is not None and value is not None:
-            self.attention.update(np.asarray(key, dtype=float), np.asarray(value, dtype=float))
-            self.diagnostics.attention_updates += 1
-            self.diagnostics.attention_clip_rate = self.attention.clip_rate
-
-        att_features: List[Tuple[int, float]] = []
-        phi_q = None
-        if query is not None:
-            y_att, phi_q = self.attention.read_with_overlays(
-                np.asarray(query, dtype=float), self.config.lambda_floor
-            )
-            att_features = self._attention_features(y_att, phi_q)
-            denominator = self.attention.last_denominator
-            if denominator is not None:
-                self.diagnostics.attention_den_min = min(
-                    self.diagnostics.attention_den_min, float(denominator)
+            y_att = None
+            if key is not None and value is not None:
+                self.attention.update(
+                    np.asarray(key, dtype=float), np.asarray(value, dtype=float)
                 )
-            self.diagnostics.attention_clip_rate = self.attention.clip_rate
+                self.diagnostics.attention_updates += 1
+                self.diagnostics.attention_clip_rate = self.attention.clip_rate
+
+            att_features: List[Tuple[int, float]] = []
+            phi_q = None
+            if query is not None:
+                y_att, phi_q = self.attention.read_with_overlays(
+                    np.asarray(query, dtype=float), self.config.lambda_floor
+                )
+                att_features = self._attention_features(y_att, phi_q)
+                denominator = self.attention.last_denominator
+                if denominator is not None:
+                    self.diagnostics.attention_den_min = min(
+                        self.diagnostics.attention_den_min, float(denominator)
+                    )
+                self.diagnostics.attention_clip_rate = self.attention.clip_rate
+                self.diagnostics.lambda_star = self.config.lambda_floor
+
+            features = self._collect_features(sparse_features or [])
+            for feature in att_features:
+                if len(features) >= self.config.feature_budget:
+                    raise BudgetError("Feature budget exceeded")
+                features.append(feature)
+            y_lin = self.linear.predict(features)
+            if target is not None:
+                self.linear.update(features, target)
+
+            mem_value = self.memory.accumulate((idx, val) for idx, val in features)
+
+            fused = self.fusion.fuse(y_att, y_lin)
+            gated = self.fusion.gate(y_att, y_lin)
+
+            residual = np.array([fused - gated], dtype=float)
+            corrected = self.ccr.correct(residual, np.eye(1))
+
+            bridge_val = np.zeros(1, dtype=float)
+            guard = False
+            if bridge_ctx is not None:
+                bridge_val, guard = self.bridge.read(bridge_ctx, bridge_token)
+                if guard:
+                    self.diagnostics.bridge_hits += 1
+                else:
+                    self.diagnostics.bridge_misses += 1
+            bridged = self.bridge.gate(gated, bridge_val, guard)
+
+            self.tree_search.maybe_select()
+            self.diagnostics.tree_simulations = self.tree_search._simulations
             self.diagnostics.lambda_star = self.config.lambda_floor
 
-        features = self._collect_features(sparse_features or [])
-        for feature in att_features:
-            if len(features) >= self.config.feature_budget:
-                raise BudgetError("Feature budget exceeded")
-            features.append(feature)
-        y_lin = self.linear.predict(features)
-        if target is not None:
-            self.linear.update(features, target)
+            return {
+                "tokens": tokens,
+                "y_att": y_att,
+                "y_lin": y_lin,
+                "memory": mem_value,
+                "y_fus": fused,
+                "y_gate": gated,
+                "y_out": corrected,
+                "y_bridge": bridged,
+            }
 
-        mem_value = self.memory.accumulate((idx, val) for idx, val in features)
+    def pin_generation(self) -> GenerationPin:
+        """Pin the current generation for the duration of a critical section."""
 
-        fused = self.fusion.fuse(y_att, y_lin)
-        gated = self.fusion.gate(y_att, y_lin)
+        return self._generation_pointer.pin()
 
-        residual = np.array([fused - gated], dtype=float)
-        corrected = self.ccr.correct(residual, np.eye(1))
+    @property
+    def manifest_pointer(self) -> GenerationPointer:
+        """Expose the generation pointer for diagnostics and testing."""
 
-        bridge_val = np.zeros(1, dtype=float)
-        guard = False
-        if bridge_ctx is not None:
-            bridge_val, guard = self.bridge.read(bridge_ctx, bridge_token)
-            if guard:
-                self.diagnostics.bridge_hits += 1
-            else:
-                self.diagnostics.bridge_misses += 1
-        bridged = self.bridge.gate(gated, bridge_val, guard)
-
-        self.tree_search.maybe_select()
-        self.diagnostics.tree_simulations = self.tree_search._simulations
-        self.diagnostics.lambda_star = self.config.lambda_floor
-
-        return {
-            "tokens": tokens,
-            "y_att": y_att,
-            "y_lin": y_lin,
-            "memory": mem_value,
-            "y_fus": fused,
-            "y_gate": gated,
-            "y_out": corrected,
-            "y_bridge": bridged,
-        }
+        return self._generation_pointer
 
     # ------------------------------------------------------------------
     # Bridge API (spec §1.4)
@@ -1257,6 +1393,7 @@ class Sera:
         model.generation = int(blob.get("generation", 0))
         model.linear.advance_generation(model.generation)
         model.bridge.advance_generation(model.generation)
+        model._generation_pointer.publish(model.manifest_record())
         return model
 
     # ------------------------------------------------------------------
@@ -1267,6 +1404,7 @@ class Sera:
         self.generation += 1
         self.linear.advance_generation(self.generation)
         self.bridge.advance_generation(self.generation)
+        self._generation_pointer.publish(self.manifest_record())
 
     def _manifest_sections(self) -> Dict[str, object]:
         return {
@@ -1317,5 +1455,11 @@ class Sera:
         return collected
 
 
-__all__ = ["Sera", "SeraConfig"]
+__all__ = [
+    "GenerationPin",
+    "GenerationPointer",
+    "ManifestRecord",
+    "Sera",
+    "SeraConfig",
+]
 
