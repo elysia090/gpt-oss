@@ -213,6 +213,74 @@ class _MPHTable:
                 return entry.token_id, probes
         return None, probes
 
+
+@dataclass(frozen=True)
+class _LinearMPHEntry:
+    key: int
+    slot: int
+
+
+class _LinearMPHTable:
+    """Minimal perfect hash specialised for sparse linear handles (spec §4.4)."""
+
+    __slots__ = ("size", "seeds", "entries")
+
+    def __init__(self, size: int, seeds: List[int], entries: List[Optional[_LinearMPHEntry]]):
+        self.size = size
+        self.seeds = seeds
+        self.entries = entries
+
+    @staticmethod
+    def build(items: List[Tuple[int, int]]) -> "_LinearMPHTable":
+        if not items:
+            return _LinearMPHTable(0, [], [])
+        records = sorted({(int(key), int(slot)) for key, slot in items})
+        size = max(1, math.ceil(1.23 * len(records)))
+        seeds = [0 for _ in range(size)]
+        entries: List[Optional[_LinearMPHEntry]] = [None for _ in range(size)]
+        occupied = [False for _ in range(size)]
+        buckets: Dict[int, List[Tuple[int, int]]] = {}
+        for key, slot in records:
+            bucket = _mix64(key) % size
+            buckets.setdefault(bucket, []).append((key, slot))
+        for bucket in sorted(buckets.keys(), key=lambda b: (len(buckets[b]), b), reverse=True):
+            bucket_items = sorted(buckets[bucket], key=lambda rec: (rec[0], rec[1]))
+            seed, assignment = _LinearMPHTable._find_seed(bucket_items, occupied, size)
+            seeds[bucket] = seed
+            for (key, slot), position in zip(bucket_items, assignment):
+                entries[position] = _LinearMPHEntry(key=key, slot=slot)
+                occupied[position] = True
+        return _LinearMPHTable(size, seeds, entries)
+
+    @staticmethod
+    def _find_seed(
+        items: List[Tuple[int, int]], occupied: List[bool], size: int
+    ) -> Tuple[int, List[int]]:
+        if not items:
+            return 0, []
+        for seed in range(0, 1 << 16):
+            options: List[Tuple[int, int]] = []
+            for key, _slot in items:
+                pos0 = _mix64(key, seed) % size
+                pos1 = _mix64(key, seed + 1) % size
+                options.append((pos0, pos1))
+            assignment = _MPHTable._assign_positions(options, occupied)
+            if assignment is not None:
+                return seed, assignment
+        raise RuntimeError("Unable to construct linear minimal perfect hash (seed cap exceeded)")
+
+    def manifest(self) -> Dict[str, object]:
+        return {
+            "size": int(self.size),
+            "seeds": [int(seed) for seed in self.seeds],
+            "entries": [
+                None
+                if entry is None
+                else {"key": int(entry.key), "slot": int(entry.slot)}
+                for entry in self.entries
+            ],
+        }
+
 # ---------------------------------------------------------------------------
 # Tokenizer (spec section 2)
 # ---------------------------------------------------------------------------
@@ -746,6 +814,12 @@ class SparseLinearConfig:
     tau_high: float
     learning_rate: float
     l2: float = 0.0
+    buckets: int = 4
+    bucket_size: int = 2
+    stash_capacity: int = 8
+    max_kicks: int = 8
+    ring_capacity: int = 16
+    margin: float = 4.0
 
     def __post_init__(self) -> None:
         if self.capacity <= 0:
@@ -754,6 +828,18 @@ class SparseLinearConfig:
             raise ValueError("tau_low < tau_high < 1 must hold")
         if self.learning_rate <= 0:
             raise ValueError("learning_rate must be positive")
+        if self.buckets <= 0:
+            raise ValueError("buckets must be positive")
+        if self.bucket_size <= 0:
+            raise ValueError("bucket_size must be positive")
+        if self.stash_capacity < 0:
+            raise ValueError("stash_capacity must be non-negative")
+        if self.max_kicks <= 0:
+            raise ValueError("max_kicks must be positive")
+        if self.ring_capacity < 0:
+            raise ValueError("ring_capacity must be non-negative")
+        if self.margin < 0:
+            raise ValueError("margin must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -823,8 +909,26 @@ class InjectiveAddressBook:
 class SparseLinearState:
     config: SparseLinearConfig
     _address_book: InjectiveAddressBook = field(default_factory=InjectiveAddressBook)
-    _weights: Dict[int, float] = field(default_factory=dict)
+    _weights: BoundedCuckooMap = field(init=False, repr=False)
     _bias: float = 0.0
+    _capacity_monitor: LinearCapacityMonitor = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_weights",
+            BoundedCuckooMap(
+                capacity=self.config.capacity,
+                choices=self.config.buckets,
+                bucket_size=self.config.bucket_size,
+                stash_capacity=self.config.stash_capacity,
+                max_kicks=self.config.max_kicks,
+                ring_capacity=self.config.ring_capacity,
+            ),
+        )
+        object.__setattr__(
+            self, "_capacity_monitor", LinearCapacityMonitor(self.config)
+        )
 
     def predict(self, features: Iterable[Tuple[int, float]]) -> float:
         total = self._bias
@@ -843,15 +947,25 @@ class SparseLinearState:
         error = prediction - target
         lr = self.config.learning_rate
         for idx, value in features:
-            handle, created = self._address_book.ensure_slot(int(idx))
+            key = int(idx)
+            handle = self._address_book.slot_of(key)
+            created = False
+            if handle is None:
+                projected_load = (self._address_book.size + 1) / float(self.config.capacity)
+                if self._capacity_monitor.should_freeze(projected_load):
+                    self._capacity_monitor.freeze(projected_load)
+                    raise BudgetError("Sparse linear insert frozen due to slack")
+                handle, created = self._address_book.ensure_slot(key)
             if created and self._address_book.size > self.config.capacity:
-                # Revert slot assignment to keep invariants consistent.
-                del self._address_book._key_to_slot[int(idx)]
+                del self._address_book._key_to_slot[key]
                 self._address_book._next_slot -= 1
+                self._capacity_monitor.freeze(self._address_book.size / float(self.config.capacity))
                 raise BudgetError("Sparse linear capacity exceeded")
+            load = self._address_book.size / float(self.config.capacity)
+            self._capacity_monitor.observe(created, load)
             weight = self._weights.get(handle.slot, 0.0)
             grad = error * value + self.config.l2 * weight
-            self._weights[handle.slot] = weight - lr * grad
+            self._weights.insert(handle.slot, weight - lr * grad)
         self._bias -= lr * (error + self.config.l2 * self._bias)
 
     def handles_for(self, keys: Iterable[int]) -> List[InjectiveHandle]:
@@ -860,27 +974,55 @@ class SparseLinearState:
     def snapshot(self) -> Dict[str, object]:
         return {
             "address_book": self._address_book.snapshot(),
-            "weights": {int(slot): float(weight) for slot, weight in self._weights.items()},
+            "weights": self._weights.snapshot(),
             "bias": float(self._bias),
+            "capacity": self._capacity_monitor.snapshot(),
         }
 
     @classmethod
     def restore(cls, config: SparseLinearConfig, blob: Dict[str, object]) -> "SparseLinearState":
         state = cls(config)
         state._address_book = InjectiveAddressBook.restore(blob["address_book"])
-        state._weights = {int(k): float(v) for k, v in blob["weights"].items()}
+        weights_blob = blob.get("weights", {})
+        if isinstance(weights_blob, dict):
+            state._weights.restore(weights_blob)
         state._bias = float(blob["bias"])
+        capacity_blob = blob.get("capacity")
+        if capacity_blob is not None:
+            state._capacity_monitor = LinearCapacityMonitor.restore(state.config, capacity_blob)
+        state._capacity_monitor.recompute(
+            state._address_book.size / float(state.config.capacity)
+        )
         return state
 
     def manifest(self) -> Dict[str, object]:
+        key_to_slot = dict(self._address_book._key_to_slot)
+        mph = _LinearMPHTable.build(list(key_to_slot.items()))
+        handles = [
+            {
+                "key": int(key),
+                "slot": int(slot),
+                "generation": self._address_book.generation,
+            }
+            for key, slot in sorted(key_to_slot.items())
+        ]
         return {
-            "handles": [handle for handle in self._address_book.manifest()],
-            "weights": {int(slot): float(weight) for slot, weight in sorted(self._weights.items())},
+            "handles": {
+                "generation": self._address_book.generation,
+                "size": self._address_book.size,
+                "mph": mph.manifest(),
+                "list": handles,
+            },
+            "weights": self._weights.manifest(),
             "bias": float(self._bias),
+            "capacity": self._capacity_monitor.manifest(),
         }
 
     def advance_generation(self, generation: int) -> None:
         self._address_book.advance_generation(generation)
+        self._capacity_monitor.recompute(
+            self._address_book.size / float(self.config.capacity)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1059,6 +1201,359 @@ class CCRProof:
             "tail_bound": float(self.tail_bound),
         }
 
+
+@dataclass(frozen=True)
+class _CuckooEntry:
+    key: int
+    value: float
+
+
+class BoundedCuckooMap:
+    """Deterministic bounded cuckoo hash table for sparse weights (spec §4.5)."""
+
+    __slots__ = (
+        "capacity",
+        "choices",
+        "bucket_size",
+        "stash_capacity",
+        "max_kicks",
+        "ring_capacity",
+        "_bucket_count",
+        "_table",
+        "_stash",
+        "_ring",
+        "_size",
+        "_max_kick_length",
+    )
+
+    def __init__(
+        self,
+        *,
+        capacity: int,
+        choices: int,
+        bucket_size: int,
+        stash_capacity: int,
+        max_kicks: int,
+        ring_capacity: int,
+    ) -> None:
+        if capacity < 0:
+            raise ValueError("capacity must be non-negative")
+        self.capacity = capacity
+        self.choices = max(1, choices)
+        self.bucket_size = max(1, bucket_size)
+        self.stash_capacity = max(0, stash_capacity)
+        self.max_kicks = max(1, max_kicks)
+        self.ring_capacity = max(0, ring_capacity)
+        bucket_count = max(1, math.ceil(self.capacity / self.bucket_size))
+        self._bucket_count = bucket_count
+        self._table: List[List[Optional[_CuckooEntry]]] = [
+            [None for _ in range(self.bucket_size)] for _ in range(bucket_count)
+        ]
+        self._stash: List[_CuckooEntry] = []
+        self._ring: List[_CuckooEntry] = []
+        self._size = 0
+        self._max_kick_length = 0
+
+    def _hash_bucket(self, key: int, choice: int) -> int:
+        return _mix64(key, choice + 1) % self._bucket_count
+
+    def _candidate_buckets(self, key: int) -> List[int]:
+        buckets: List[int] = []
+        for choice in range(self.choices):
+            bucket = self._hash_bucket(key, choice)
+            if bucket not in buckets:
+                buckets.append(bucket)
+        return buckets
+
+    def __len__(self) -> int:  # pragma: no cover - trivial
+        return self._size
+
+    def get(self, key: int, default: float = 0.0) -> float:
+        key = int(key)
+        for bucket in self._candidate_buckets(key):
+            for entry in self._table[bucket]:
+                if entry is not None and entry.key == key:
+                    return entry.value
+        for entry in self._stash:
+            if entry.key == key:
+                return entry.value
+        for entry in self._ring:
+            if entry.key == key:
+                return entry.value
+        return float(default)
+
+    def insert(self, key: int, value: float) -> bool:
+        key = int(key)
+        value = float(value)
+        entry = _CuckooEntry(key=key, value=value)
+        # Update existing entries first.
+        for bucket in self._candidate_buckets(key):
+            for slot_idx, slot in enumerate(self._table[bucket]):
+                if slot is not None and slot.key == key:
+                    self._table[bucket][slot_idx] = entry
+                    return False
+        for idx, slot in enumerate(self._stash):
+            if slot.key == key:
+                self._stash[idx] = entry
+                return False
+        for idx, slot in enumerate(self._ring):
+            if slot.key == key:
+                self._ring[idx] = entry
+                return False
+        self._place(entry)
+        return True
+
+    def _place(self, entry: _CuckooEntry) -> None:
+        # Try direct placements first.
+        for bucket in self._candidate_buckets(entry.key):
+            slots = self._table[bucket]
+            for idx in range(self.bucket_size):
+                if slots[idx] is None:
+                    slots[idx] = entry
+                    self._size += 1
+                    self._max_kick_length = max(self._max_kick_length, 0)
+                    return
+        # Deterministic kick-out procedure.
+        current = entry
+        for kick in range(self.max_kicks):
+            choice = kick % self.choices
+            bucket_idx = self._hash_bucket(current.key, choice)
+            slot_idx = (bucket_idx + kick) % self.bucket_size
+            slots = self._table[bucket_idx]
+            slots[slot_idx], current = current, slots[slot_idx]
+            if current is None:
+                self._size += 1
+                self._max_kick_length = max(self._max_kick_length, kick + 1)
+                return
+        # Stash fallback.
+        if current is None:
+            return
+        if len(self._stash) < self.stash_capacity:
+            self._stash.append(current)
+            self._size += 1
+            self._max_kick_length = max(self._max_kick_length, self.max_kicks)
+            return
+        if len(self._ring) < self.ring_capacity:
+            self._ring.append(current)
+            self._size += 1
+            self._max_kick_length = max(self._max_kick_length, self.max_kicks)
+            return
+        raise BudgetError("Bounded cuckoo map overflow")
+
+    def items(self) -> Iterable[Tuple[int, float]]:
+        for bucket in self._table:
+            for entry in bucket:
+                if entry is not None:
+                    yield entry.key, entry.value
+        for entry in self._stash:
+            yield entry.key, entry.value
+        for entry in self._ring:
+            yield entry.key, entry.value
+
+    @property
+    def load_factor(self) -> float:
+        if self.capacity <= 0:
+            return 0.0
+        return min(1.0, self._size / float(self.capacity))
+
+    @property
+    def stash_load(self) -> int:
+        return len(self._stash)
+
+    @property
+    def ring_load(self) -> int:
+        return len(self._ring)
+
+    @property
+    def max_kick_length(self) -> int:
+        return self._max_kick_length
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "capacity": int(self.capacity),
+            "choices": int(self.choices),
+            "bucket_size": int(self.bucket_size),
+            "stash_capacity": int(self.stash_capacity),
+            "max_kicks": int(self.max_kicks),
+            "ring_capacity": int(self.ring_capacity),
+            "max_kick_length": int(self._max_kick_length),
+            "table": [
+                [
+                    None
+                    if entry is None
+                    else [int(entry.key), float(entry.value)]
+                    for entry in bucket
+                ]
+                for bucket in self._table
+            ],
+            "stash": [[int(entry.key), float(entry.value)] for entry in self._stash],
+            "ring": [[int(entry.key), float(entry.value)] for entry in self._ring],
+        }
+
+    def restore(self, blob: Dict[str, object]) -> None:
+        table_blob = blob.get("table")
+        if table_blob is None:
+            # Backwards compatibility with dict snapshots.
+            for key, value in blob.items():
+                target_key: Optional[int] = None
+                if isinstance(key, int):
+                    target_key = key
+                elif isinstance(key, str) and key.isdigit():
+                    target_key = int(key)
+                if target_key is not None:
+                    self.insert(int(target_key), float(value))
+            return
+        self._table = [
+            [
+                None
+                if entry is None
+                else _CuckooEntry(key=int(entry[0]), value=float(entry[1]))
+                for entry in bucket
+            ]
+            for bucket in table_blob
+        ]
+        self._bucket_count = len(self._table)
+        self.capacity = int(blob.get("capacity", self.capacity))
+        self.choices = int(blob.get("choices", self.choices))
+        self.bucket_size = int(blob.get("bucket_size", self.bucket_size))
+        self.stash_capacity = int(blob.get("stash_capacity", self.stash_capacity))
+        self.max_kicks = int(blob.get("max_kicks", self.max_kicks))
+        self.ring_capacity = int(blob.get("ring_capacity", self.ring_capacity))
+        self._stash = [
+            _CuckooEntry(key=int(entry[0]), value=float(entry[1]))
+            for entry in blob.get("stash", [])
+        ]
+        self._ring = [
+            _CuckooEntry(key=int(entry[0]), value=float(entry[1]))
+            for entry in blob.get("ring", [])
+        ]
+        self._size = sum(1 for _ in self.items())
+        self._max_kick_length = int(blob.get("max_kick_length", self._max_kick_length))
+
+    def manifest(self) -> Dict[str, object]:
+        return {
+            "capacity": int(self.capacity),
+            "choices": int(self.choices),
+            "bucket_size": int(self.bucket_size),
+            "stash_capacity": int(self.stash_capacity),
+            "ring_capacity": int(self.ring_capacity),
+            "load": float(self.load_factor),
+            "max_kick_length": int(self._max_kick_length),
+            "stash": [
+                {"key": int(entry.key), "value": float(entry.value)}
+                for entry in self._stash
+            ],
+            "ring": [
+                {"key": int(entry.key), "value": float(entry.value)}
+                for entry in self._ring
+            ],
+            "table": [
+                [
+                    None
+                    if entry is None
+                    else {"key": int(entry.key), "value": float(entry.value)}
+                    for entry in bucket
+                ]
+                for bucket in self._table
+            ],
+        }
+
+
+class LinearCapacityMonitor:
+    """Tracks τ-threshold slack and insert freeze state (spec §4.4)."""
+
+    __slots__ = (
+        "capacity",
+        "tau_low",
+        "tau_high",
+        "margin",
+        "lambda_hat",
+        "events",
+        "new_keys",
+        "load",
+        "slack",
+        "frozen",
+    )
+
+    def __init__(self, config: SparseLinearConfig) -> None:
+        self.capacity = config.capacity
+        self.tau_low = config.tau_low
+        self.tau_high = config.tau_high
+        self.margin = config.margin
+        self.lambda_hat = 0.0
+        self.events = 0
+        self.new_keys = 0
+        self.load = 0.0
+        self.slack = float(self.capacity) * (self.tau_high - self.tau_low)
+        self.frozen = False
+
+    def should_freeze(self, projected_load: float) -> bool:
+        if projected_load >= self.tau_high:
+            return True
+        slack = max(0.0, (self.tau_high - projected_load) * self.capacity)
+        return slack < self.margin
+
+    def observe(self, new_key: bool, load: float) -> None:
+        self.events += 1
+        if new_key:
+            self.new_keys += 1
+        self.lambda_hat = self.new_keys / float(self.events) if self.events else 0.0
+        self.load = load
+        self.slack = max(0.0, (self.tau_high - load) * self.capacity)
+        if load <= self.tau_low:
+            self.frozen = False
+        elif self.should_freeze(load):
+            self.frozen = True
+
+    def freeze(self, load: float) -> None:
+        self.load = load
+        self.slack = max(0.0, (self.tau_high - load) * self.capacity)
+        self.frozen = True
+
+    def recompute(self, load: float) -> None:
+        self.load = load
+        self.slack = max(0.0, (self.tau_high - load) * self.capacity)
+        if load <= self.tau_low:
+            self.frozen = False
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "lambda_hat": float(self.lambda_hat),
+            "events": int(self.events),
+            "new_keys": int(self.new_keys),
+            "load": float(self.load),
+            "slack": float(self.slack),
+            "frozen": bool(self.frozen),
+            "margin": float(self.margin),
+        }
+
+    @classmethod
+    def restore(
+        cls, config: SparseLinearConfig, blob: Dict[str, object]
+    ) -> "LinearCapacityMonitor":
+        monitor = cls(config)
+        monitor.lambda_hat = float(blob.get("lambda_hat", 0.0))
+        monitor.events = int(blob.get("events", 0))
+        monitor.new_keys = int(blob.get("new_keys", 0))
+        monitor.load = float(blob.get("load", 0.0))
+        monitor.slack = float(blob.get("slack", monitor.slack))
+        monitor.frozen = bool(blob.get("frozen", False))
+        monitor.margin = float(blob.get("margin", monitor.margin))
+        return monitor
+
+    def manifest(self) -> Dict[str, object]:
+        return {
+            "capacity": int(self.capacity),
+            "tau_low": float(self.tau_low),
+            "tau_high": float(self.tau_high),
+            "margin": float(self.margin),
+            "lambda_hat": float(self.lambda_hat),
+            "events": int(self.events),
+            "new_keys": int(self.new_keys),
+            "load": float(self.load),
+            "slack": float(self.slack),
+            "frozen": bool(self.frozen),
+        }
 
 # ---------------------------------------------------------------------------
 # External bridge (spec section 10)
@@ -1668,10 +2163,12 @@ class Sera:
             model.linear = SparseLinearState.restore(model.config.linear, linear_blob)
         else:
             # Backwards compatibility
-            model.linear._weights = {
-                int(k): float(v) for k, v in dict(blob["linear_weights"]).items()
-            }
+            for k, v in dict(blob["linear_weights"]).items():
+                model.linear._weights.insert(int(k), float(v))
             model.linear._bias = float(blob.get("linear_bias", 0.0))
+            model.linear._capacity_monitor.recompute(
+                model.linear._address_book.size / float(model.linear.config.capacity)
+            )
         diag_blob = dict(blob["diagnostics"])
         if diag_blob.get("attention_den_min") is None:
             diag_blob["attention_den_min"] = float("inf")

@@ -24,6 +24,7 @@ Sera = _SERA_MODULE.Sera
 SeraConfig = _SERA_MODULE.SeraConfig
 TokenizerConfig = _SERA_MODULE.TokenizerConfig
 TokenizerState = _SERA_MODULE.TokenizerState
+SparseLinearConfig = _SERA_MODULE.SparseLinearConfig
 
 
 def test_tokenizer_enforces_event_budgets() -> None:
@@ -120,3 +121,48 @@ def test_tokenizer_rejects_disallowed_unicode(payload: str) -> None:
 
     with pytest.raises(ValueError):
         tokenizer.encode(payload.encode("utf-8"))
+
+
+def test_sparse_linear_manifest_includes_mph_and_cuckoo() -> None:
+    config = SeraConfig()
+    model = Sera(config)
+
+    model.linear.update([(1, 1.0)], target=0.5)
+
+    manifest = model.linear.manifest()
+    handles = manifest["handles"]
+    assert handles["size"] == 1
+    assert "mph" in handles
+    mph = handles["mph"]
+    assert mph["size"] >= handles["size"]
+    weights = manifest["weights"]
+    assert weights["capacity"] == config.linear.capacity
+    assert weights["choices"] == config.linear.buckets
+    assert weights["stash_capacity"] == config.linear.stash_capacity
+    capacity = manifest["capacity"]
+    assert capacity["tau_low"] == pytest.approx(config.linear.tau_low)
+    assert "slack" in capacity
+
+
+def test_sparse_linear_tau_freeze() -> None:
+    config = SeraConfig(
+        linear=SparseLinearConfig(
+            capacity=4,
+            tau_low=0.1,
+            tau_high=0.5,
+            learning_rate=0.1,
+            buckets=2,
+            bucket_size=2,
+            stash_capacity=1,
+            max_kicks=2,
+            ring_capacity=1,
+            margin=0.0,
+        )
+    )
+    model = Sera(config)
+
+    model.linear.update([(0, 1.0)], target=0.0)
+    with pytest.raises(BudgetError):
+        model.linear.update([(1, 1.0)], target=0.0)
+    capacity = model.linear.manifest()["capacity"]
+    assert capacity["frozen"] is True
