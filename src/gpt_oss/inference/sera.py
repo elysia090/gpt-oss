@@ -1147,13 +1147,37 @@ class FusionState:
 @dataclass(frozen=True)
 class CCRConfig:
     gamma: float = 0.25
-    truncation_order: int = 1
+    truncation_order: int = 2
+
+
+@dataclass(frozen=True)
+class CCRSmallBlocks:
+    """Small precomputed blocks for the CCR contraction (spec §7)."""
+
+    dim: int
+    B_blocks: Tuple[np.ndarray, ...]
+    W_blocks: Tuple[np.ndarray, ...]
+    pi: np.ndarray
+    h: np.ndarray
+    h_series: np.ndarray
+
+
+@dataclass(frozen=True)
+class CCRResult:
+    """Result of a CCR correction step including residual construction."""
+
+    residual: np.ndarray
+    correction: np.ndarray
+    corrected_locals: np.ndarray
+    target: float
+    y: float
 
 
 @dataclass
 class CCRState:
     config: CCRConfig
     _certificate: "CCRProof" = field(init=False)
+    _blocks: CCRSmallBlocks = field(init=False)
 
     def __post_init__(self) -> None:
         if not (0 <= self.config.gamma < 1):
@@ -1164,20 +1188,60 @@ class CCRState:
             truncation_order=self.config.truncation_order,
             tail_bound=tail,
         )
+        self._blocks = self._precompute_small_blocks(self.config.truncation_order)
 
-    def correct(self, residuals: np.ndarray, h_operator: np.ndarray) -> np.ndarray:
-        if residuals.ndim != 1:
-            raise ValueError("Residuals must be a vector")
-        if h_operator.shape != (residuals.shape[0], residuals.shape[0]):
-            raise ValueError("Operator shape mismatch")
+    def correct(self, locals_: np.ndarray) -> CCRResult:
+        locals_vec = np.asarray(locals_, dtype=float)
+        if locals_vec.ndim != 1:
+            raise ValueError("Locals must be a vector")
+        if locals_vec.shape[0] != self._blocks.dim:
+            raise ValueError("Unexpected locals dimensionality")
         if self.config.gamma >= 1:
             raise BudgetError("CCR contraction gamma must be < 1")
-        correction = np.zeros_like(residuals, dtype=float)
-        power = np.eye(residuals.shape[0])
-        for _ in range(self.config.truncation_order):
-            power = power @ (np.eye(residuals.shape[0]) - self.config.gamma * h_operator)
-            correction -= power @ residuals
-        return residuals + correction
+        target = float(self._blocks.pi @ locals_vec)
+        residual = locals_vec - target
+        correction = -self._blocks.h_series @ residual
+        corrected = locals_vec + correction
+        y_val = float(self._blocks.pi @ corrected)
+        return CCRResult(
+            residual=residual,
+            correction=correction,
+            corrected_locals=corrected,
+            target=target,
+            y=y_val,
+        )
+
+    def _precompute_small_blocks(self, order: int) -> CCRSmallBlocks:
+        if order != 2:
+            raise NotImplementedError("Only truncation order m=2 is supported")
+        dim = 2
+        h = np.array([[1.0, -1.0], [-1.0, 1.0]], dtype=float)
+        identity = np.eye(dim, dtype=float)
+        contraction = identity - self.config.gamma * h
+        B_blocks: List[np.ndarray] = [identity]
+        current = identity
+        for _ in range(order):
+            current = current @ contraction
+            B_blocks.append(current)
+        gamma_h = -self.config.gamma * h
+        W_blocks: List[np.ndarray] = [identity]
+        current_w = identity
+        for _ in range(order):
+            current_w = current_w @ gamma_h
+            W_blocks.append(current_w)
+        series = np.zeros((dim, dim), dtype=float)
+        for block in W_blocks[: order + 1]:
+            series += block
+        h_series = h @ series
+        pi = np.ones(dim, dtype=float) * (1.0 / dim)
+        return CCRSmallBlocks(
+            dim=dim,
+            B_blocks=tuple(B_blocks),
+            W_blocks=tuple(W_blocks),
+            pi=pi,
+            h=h,
+            h_series=h_series,
+        )
 
     @staticmethod
     def _tail_bound(gamma: float, order: int) -> float:
@@ -1186,6 +1250,10 @@ class CCRState:
     @property
     def certificate(self) -> "CCRProof":
         return self._certificate
+
+    @property
+    def blocks(self) -> CCRSmallBlocks:
+        return self._blocks
 
 
 @dataclass(frozen=True)
@@ -2274,8 +2342,8 @@ class Sera:
             fused = self.fusion.fuse(y_att, y_lin)
             gated = self.fusion.gate(y_att, y_lin)
 
-            residual = np.array([fused - gated], dtype=float)
-            corrected = self.ccr.correct(residual, np.eye(1))
+            locals_vec = np.array([fused, gated], dtype=float)
+            ccr_result = self.ccr.correct(locals_vec)
 
             bridge_val = np.zeros(1, dtype=float)
             guard = False
@@ -2300,7 +2368,9 @@ class Sera:
                 "memory": mem_value,
                 "y_fus": fused,
                 "y_gate": gated,
-                "y_out": corrected,
+                "y_out": ccr_result.y,
+                "ccr_residual": ccr_result.residual,
+                "ccr_correction": ccr_result.correction,
                 "y_bridge": bridged,
             }
 
