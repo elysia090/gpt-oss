@@ -29,7 +29,10 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Type, TypeVar
 
-import numpy as np
+try:  # pragma: no cover - exercised indirectly by the tests
+    import numpy as np
+except ModuleNotFoundError:  # pragma: no cover - deterministic fallback for test envs
+    from gpt_oss._compat import numpy_stub as np
 import hashlib
 import json
 import zlib
