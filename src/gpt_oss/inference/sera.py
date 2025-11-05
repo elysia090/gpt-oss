@@ -1562,24 +1562,48 @@ class LinearCapacityMonitor:
 
 @dataclass(frozen=True)
 class BridgeConfig:
+    """Static configuration for the external bridge (spec §10.1–§10.7)."""
+
     hub_window: int = 8
     candidate_bound: int = 4
     beta_min: float = 0.1
     beta_max: float = 0.9
 
+    def __post_init__(self) -> None:
+        if self.hub_window <= 0:
+            raise ValueError("hub_window must be positive")
+        if self.candidate_bound <= 0:
+            raise ValueError("candidate_bound must be positive")
+        if not 0.0 <= self.beta_min <= self.beta_max <= 1.0:
+            raise ValueError("beta range must satisfy 0 <= beta_min <= beta_max <= 1")
+
 
 @dataclass
 class BridgeGuardRecord:
-    """Guard metadata for bridge promotions (spec §10.3)."""
+    """Guard metadata for bridge promotions (spec §10.3–§10.5)."""
 
     margin: float
-    threshold: float
+    eps_row: float
+    leg_bound_in: float
+    leg_bound_out: float
+    competitor_bounds: Tuple[float, ...] = field(default_factory=tuple)
 
     def check(self) -> bool:
-        return self.margin >= self.threshold
+        """Evaluate the guard inequality from spec §10.5."""
 
-    def as_dict(self) -> Dict[str, float]:
-        return {"margin": float(self.margin), "threshold": float(self.threshold)}
+        half_margin = 0.5 * float(self.margin) + float(self.eps_row)
+        if float(self.leg_bound_in) + float(self.leg_bound_out) >= half_margin:
+            return False
+        return all(float(bound) < half_margin for bound in self.competitor_bounds)
+
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "margin": float(self.margin),
+            "eps_row": float(self.eps_row),
+            "leg_bound_in": float(self.leg_bound_in),
+            "leg_bound_out": float(self.leg_bound_out),
+            "competitor_bounds": [float(b) for b in self.competitor_bounds],
+        }
 
 
 @dataclass
@@ -1596,11 +1620,44 @@ class BridgeEntry:
         }
 
 
+@dataclass(frozen=True)
+class BridgeProof:
+    """64-byte proof record emitted by :meth:`BridgeState.read` (spec §10.3)."""
+
+    hub: int
+    margin: float
+    leg_bound_in: float
+    leg_bound_out: float
+    eps_row: float
+    best_cost: float
+    guard_pass: bool
+    ctx: int
+    token: int
+
+    _SCHEMA = struct.Struct("<QddddddQ")
+
+    def pack(self) -> bytes:
+        guard_flag = 1.0 if self.guard_pass else 0.0
+        packed_ids = ((self.ctx & 0xFFFFFFFF) << 32) | (self.token & 0xFFFFFFFF)
+        return self._SCHEMA.pack(
+            self.hub & 0xFFFFFFFFFFFFFFFF,
+            float(self.margin),
+            float(self.leg_bound_in),
+            float(self.leg_bound_out),
+            float(self.eps_row),
+            float(self.best_cost),
+            guard_flag,
+            packed_ids,
+        )
+
+
 @dataclass
 class BridgeState:
     config: BridgeConfig
-    _hub_bits: Dict[int, int] = field(default_factory=dict)
+    _hub_bits: Dict[int, List[int]] = field(default_factory=dict)
     _store: Dict[Tuple[int, int], BridgeEntry] = field(default_factory=dict)
+    _qdin: Dict[Tuple[int, int], float] = field(default_factory=dict)
+    _qdout: Dict[Tuple[int, int], float] = field(default_factory=dict)
     _generation: int = 0
 
     def promote(
@@ -1610,28 +1667,145 @@ class BridgeState:
         value: np.ndarray,
         *,
         guard_margin: float = 0.0,
-        guard_threshold: float = 0.0,
+        guard_eps_row: float = 0.0,
+        leg_bound_in: float = 0.0,
+        leg_bound_out: float = 0.0,
+        competitor_bounds: Optional[Sequence[float]] = None,
     ) -> None:
-        guard = BridgeGuardRecord(guard_margin, guard_threshold)
+        """Promote a dictionary value for ``(ctx, token)`` (spec §10.3)."""
+
+        guard = BridgeGuardRecord(
+            guard_margin,
+            guard_eps_row,
+            leg_bound_in,
+            leg_bound_out,
+            tuple(float(b) for b in (competitor_bounds or ())),
+        )
         self._store[(ctx, token)] = BridgeEntry(value, guard, self._generation)
-        self._hub_bits.setdefault(ctx, 0)
-        self._hub_bits.setdefault(token, 0)
+        self._hub_bits.setdefault(ctx, [0] * self.config.hub_window)
+        self._hub_bits.setdefault(token, [0] * self.config.hub_window)
 
-    def read(self, ctx: int, token: Optional[int]) -> Tuple[np.ndarray, bool]:
+    # ------------------------------------------------------------------
+    # Hub and quantized distance management (spec §10.3–§10.4)
+    # ------------------------------------------------------------------
+
+    def set_hub(self, node: int, hub_index: int, enabled: bool = True) -> None:
+        if hub_index < 0:
+            raise ValueError("hub_index must be non-negative")
+        word = hub_index // 64
+        bit = hub_index % 64
+        if word >= self.config.hub_window:
+            raise ValueError("hub_index exceeds configured hub window")
+        bits = self._hub_bits.setdefault(node, [0] * self.config.hub_window)
+        if enabled:
+            bits[word] |= 1 << bit
+        else:
+            bits[word] &= ~(1 << bit)
+
+    def set_hub_bits(self, node: int, words: Sequence[int]) -> None:
+        if len(words) != self.config.hub_window:
+            raise ValueError("words length must match hub_window")
+        self._hub_bits[node] = [int(word) & 0xFFFFFFFFFFFFFFFF for word in words]
+
+    def set_qdin(self, hub: int, token: int, value: float) -> None:
+        self._qdin[(hub, token)] = float(value)
+
+    def set_qdout(self, ctx: int, hub: int, value: float) -> None:
+        self._qdout[(ctx, hub)] = float(value)
+
+    def _hub_mask(self, node: int) -> List[int]:
+        return self._hub_bits.get(node, [0] * self.config.hub_window)
+
+    def _enumerate_hubs(self, ctx: int, token: Optional[int]) -> List[int]:
+        candidates: List[int] = []
         if token is None:
-            return np.zeros(1, dtype=float), False
-        entry = self._store.get((ctx, token))
-        if entry is None:
-            return np.zeros(1, dtype=float), False
-        guard_ok = entry.guard.check()
-        return entry.value, guard_ok
+            return candidates
+        bits_ctx = self._hub_mask(ctx)
+        bits_token = self._hub_mask(token)
+        for word_index in range(self.config.hub_window):
+            mask = bits_ctx[word_index] & bits_token[word_index]
+            base = word_index * 64
+            while mask and len(candidates) < self.config.candidate_bound:
+                lowest = mask & -mask
+                # Map lowest set bit to its index using branchless bit_length.
+                bit_index = (lowest.bit_length() - 1) & 0x3F
+                candidates.append(base + bit_index)
+                mask &= mask - 1
+        return candidates
 
-    def gate(self, base: float, bridge_val: np.ndarray, guard: bool) -> float:
+    def _best_route(
+        self, ctx: int, token: Optional[int]
+    ) -> Tuple[Optional[int], float]:
+        if token is None:
+            return None, float("inf")
+        best_cost = float("inf")
+        best_hub: Optional[int] = None
+        for hub in self._enumerate_hubs(ctx, token):
+            din = self._qdin.get((hub, token), float("inf"))
+            dout = self._qdout.get((ctx, hub), float("inf"))
+            cost = din + dout
+            if cost < best_cost:
+                best_cost = cost
+                best_hub = hub
+        return best_hub, best_cost
+
+    def read(self, ctx: int, token: Optional[int]) -> Tuple[np.ndarray, bool, bytes]:
+        if token is None:
+            proof = BridgeProof(
+                hub=0,
+                margin=0.0,
+                leg_bound_in=0.0,
+                leg_bound_out=0.0,
+                eps_row=0.0,
+                best_cost=float("inf"),
+                guard_pass=False,
+                ctx=ctx,
+                token=0,
+            ).pack()
+            return np.zeros(1, dtype=float), False, proof
+
+        entry = self._store.get((ctx, token))
+        best_hub, best_cost = self._best_route(ctx, token)
+        guard_record = entry.guard if entry is not None else None
+        guard_ok = (
+            bool(guard_record.check()) and best_hub is not None
+            if guard_record is not None
+            else False
+        )
+
+        if entry is not None and guard_ok:
+            value = entry.value
+        else:
+            fallback = best_cost if math.isfinite(best_cost) else 0.0
+            value = np.array([fallback], dtype=float)
+
+        proof = BridgeProof(
+            hub=best_hub or 0,
+            margin=guard_record.margin if guard_record is not None else 0.0,
+            leg_bound_in=guard_record.leg_bound_in if guard_record is not None else 0.0,
+            leg_bound_out=guard_record.leg_bound_out if guard_record is not None else 0.0,
+            eps_row=guard_record.eps_row if guard_record is not None else 0.0,
+            best_cost=best_cost,
+            guard_pass=guard_ok,
+            ctx=ctx,
+            token=token,
+        ).pack()
+
+        return value, guard_ok, proof
+
+    def gate(
+        self,
+        base: float,
+        bridge_val: np.ndarray,
+        guard: bool,
+        witness_quality: float = 1.0,
+    ) -> float:
         guard_weight = float(bool(guard))
-        beta_mid = self.config.beta_min + (self.config.beta_max - self.config.beta_min) / 2.0
-        beta = guard_weight * beta_mid
+        s_q = min(max(float(witness_quality), 0.0), 1.0)
+        beta_span = self.config.beta_max - self.config.beta_min
+        beta = guard_weight * (self.config.beta_min + beta_span * s_q)
         alpha = 1.0 - beta
-        return alpha * base + beta * float(np.mean(bridge_val))
+        return alpha * float(base) + beta * float(np.mean(bridge_val))
 
     def advance_generation(self, generation: int) -> None:
         self._generation = generation
@@ -1649,7 +1823,25 @@ class BridgeState:
             f"{ctx}:{token}": entry.manifest()
             for (ctx, token), entry in sorted(self._store.items())
         }
-        return {"generation": self._generation, "entries": entries}
+        hubs = {
+            str(node): [int(word) for word in words]
+            for node, words in sorted(self._hub_bits.items())
+        }
+        qdin = {
+            f"{hub}:{token}": float(value)
+            for (hub, token), value in sorted(self._qdin.items())
+        }
+        qdout = {
+            f"{ctx}:{hub}": float(value)
+            for (ctx, hub), value in sorted(self._qdout.items())
+        }
+        return {
+            "generation": self._generation,
+            "entries": entries,
+            "hub_bits": hubs,
+            "qDin": qdin,
+            "qDout": qdout,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1965,6 +2157,7 @@ class SeraDiagnostics:
     bridge_hits: int = 0
     bridge_misses: int = 0
     tree_simulations: int = 0
+    bridge_last_proof: bytes = field(default=b"", repr=False)
 
 
 @dataclass
@@ -2086,12 +2279,14 @@ class Sera:
 
             bridge_val = np.zeros(1, dtype=float)
             guard = False
+            proof = bytes(BridgeProof._SCHEMA.size)
             if bridge_ctx is not None:
-                bridge_val, guard = self.bridge.read(bridge_ctx, bridge_token)
+                bridge_val, guard, proof = self.bridge.read(bridge_ctx, bridge_token)
                 if guard:
                     self.diagnostics.bridge_hits += 1
                 else:
                     self.diagnostics.bridge_misses += 1
+            self.diagnostics.bridge_last_proof = proof
             bridged = self.bridge.gate(gated, bridge_val, guard)
 
             self.tree_search.maybe_select()
@@ -2125,8 +2320,7 @@ class Sera:
     # ------------------------------------------------------------------
 
     def bridge_read(self, ctx: int, token: Optional[int] = None) -> Dict[str, object]:
-        value, guard = self.bridge.read(ctx, token)
-        proof = struct.pack("<Q", len(value))
+        value, guard, proof = self.bridge.read(ctx, token)
         guard_record = self.bridge.guard_record(ctx, token)
         guard_blob: Optional[Dict[str, float]] = None
         if guard_record is not None:
@@ -2212,6 +2406,9 @@ class Sera:
         record = dataclasses.asdict(self.diagnostics)
         if math.isinf(record["attention_den_min"]):
             record["attention_den_min"] = None
+        proof_blob = record.get("bridge_last_proof")
+        if isinstance(proof_blob, (bytes, bytearray)):
+            record["bridge_last_proof"] = bytes(proof_blob).hex()
         return record
 
     # ------------------------------------------------------------------
