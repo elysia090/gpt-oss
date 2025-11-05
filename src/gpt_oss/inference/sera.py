@@ -110,6 +110,106 @@ def _coerce_dataclass_config(
     raise TypeError(f"Expected {cls.__name__} or dict, got {type(value)!r}")
 
 
+@dataclass(frozen=True)
+class _MPHEntry:
+    key_hash: int
+    token_id: int
+    piece: bytes
+
+
+class _MPHTable:
+    """Two-level minimal perfect hash for tokenizer lookups (spec §4.4)."""
+
+    __slots__ = ("size", "seeds", "entries")
+
+    def __init__(self, size: int, seeds: List[int], entries: List[Optional[_MPHEntry]]):
+        self.size = size
+        self.seeds = seeds
+        self.entries = entries
+
+    @staticmethod
+    def build(pieces: List[Tuple[bytes, int]]) -> "_MPHTable":
+        if not pieces:
+            return _MPHTable(0, [], [])
+        key_records: List[Tuple[int, int, bytes]] = []
+        for piece, token_id in pieces:
+            key_hash = _hash_bytes(piece)
+            key_records.append((key_hash, token_id, piece))
+        size = max(1, math.ceil(1.23 * len(key_records)))
+        seeds = [0 for _ in range(size)]
+        entries: List[Optional[_MPHEntry]] = [None for _ in range(size)]
+        occupied = [False for _ in range(size)]
+        buckets: Dict[int, List[Tuple[int, int, bytes]]] = {}
+        for record in key_records:
+            bucket = _mix64(record[0]) % size
+            buckets.setdefault(bucket, []).append(record)
+        # Deterministic processing order for reproducibility.
+        for bucket in sorted(buckets.keys(), key=lambda b: (len(buckets[b]), b), reverse=True):
+            items = sorted(buckets[bucket], key=lambda rec: (rec[0], rec[1], rec[2]))
+            seed, assignment = _MPHTable._find_seed(items, occupied, size)
+            seeds[bucket] = seed
+            for rec, position in zip(items, assignment):
+                entries[position] = _MPHEntry(*rec)
+                occupied[position] = True
+        return _MPHTable(size, seeds, entries)
+
+    @staticmethod
+    def _find_seed(
+        items: List[Tuple[int, int, bytes]], occupied: List[bool], size: int
+    ) -> Tuple[int, List[int]]:
+        if not items:
+            return 0, []
+        for seed in range(0, 1 << 16):
+            options: List[Tuple[int, int]] = []
+            for key_hash, _token_id, _piece in items:
+                pos0 = _mix64(key_hash, seed) % size
+                pos1 = _mix64(key_hash, seed + 1) % size
+                options.append((pos0, pos1))
+            assignment = _MPHTable._assign_positions(options, occupied)
+            if assignment is not None:
+                return seed, assignment
+        raise RuntimeError("Unable to construct tokenizer minimal perfect hash (seed cap exceeded)")
+
+    @staticmethod
+    def _assign_positions(
+        options: List[Tuple[int, int]], occupied: List[bool]
+    ) -> Optional[List[int]]:
+        assignment: List[int] = []
+        used: Set[int] = set()
+
+        def backtrack(idx: int) -> bool:
+            if idx == len(options):
+                return True
+            candidates = sorted(set(options[idx]))
+            for pos in candidates:
+                if occupied[pos] or pos in used:
+                    continue
+                used.add(pos)
+                assignment.append(pos)
+                if backtrack(idx + 1):
+                    return True
+                assignment.pop()
+                used.remove(pos)
+            return False
+
+        if backtrack(0):
+            return assignment.copy()
+        return None
+
+    def lookup(self, key_hash: int, candidate: bytes) -> Tuple[Optional[int], int]:
+        if self.size == 0:
+            return None, 0
+        bucket = _mix64(key_hash) % self.size
+        seed = self.seeds[bucket]
+        probes = 0
+        for offset in (0, 1):
+            position = _mix64(key_hash, seed + offset) % self.size
+            entry = self.entries[position]
+            probes += 1
+            if entry is not None and entry.key_hash == key_hash and entry.piece == candidate:
+                return entry.token_id, probes
+        return None, probes
+
 # ---------------------------------------------------------------------------
 # Tokenizer (spec section 2)
 # ---------------------------------------------------------------------------
@@ -154,6 +254,7 @@ class TokenizerEncodeStats:
     normalized_bytes: int
     tokens_out: int
     max_probes: int
+    table_probes: int
 
 
 @dataclass
@@ -163,11 +264,20 @@ class TokenizerState:
     config: TokenizerConfig
     _id_to_bytes: Dict[int, bytes] = field(init=False)
     _last_stats: Optional[TokenizerEncodeStats] = field(init=False, default=None)
+    _hash_powers: List[int] = field(init=False)
+    _mph_tables: Dict[int, _MPHTable] = field(init=False)
+    _sp_trace: List[Tuple[int, Tuple[bytes, ...]]] = field(init=False)
+    _sp_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
         self._id_to_bytes = {idx: piece for piece, idx in self.config.vocabulary.items()}
         if len(self._id_to_bytes) != len(self.config.vocabulary):
             raise ValueError("Vocabulary ids must be unique")
+        self._hash_powers = [1]
+        for _ in range(1, self.config.max_piece_length + 1):
+            self._hash_powers.append((self._hash_powers[-1] * _HASH_BASE) & _HASH_MASK)
+        self._mph_tables = self._build_mph_tables()
+        self._sp_trace, self._sp_digest = self._build_sp_trace()
 
     # -- Normaliser -----------------------------------------------------
 
@@ -177,6 +287,11 @@ class TokenizerState:
         if not data:
             return data
         text = data.decode("utf-8", errors="strict")
+        for codepoint in map(ord, text):
+            if codepoint in _DISALLOWED_UNICODE_POINTS:
+                raise ValueError(
+                    "Input contains disallowed Unicode control character"
+                )
         # The NFC transform used here has a finite lookahead that is bounded by
         # the Unicode specification.  For our tests this is sufficient to meet
         # the requirement L_norm<=4 in the spec.
@@ -191,42 +306,8 @@ class TokenizerState:
         normalised = self._normalise_bytes(data)
         if len(normalised) > self.config.max_event_bytes:
             raise BudgetError("Tokenizer byte budget exceeded")
-        output: List[int] = []
-        i = 0
-        max_len = self.config.max_piece_length
-        vocab = self.config.vocabulary
-        max_probe = 0
-        while i < len(normalised):
-            remaining = len(normalised) - i
-            probe_count = 0
-            for length in range(min(max_len, remaining), 0, -1):
-                probe_count += 1
-                if probe_count > max_len:
-                    raise BudgetError("Tokenizer probe budget exceeded")
-                window = normalised[i : i + length]
-                token_id = vocab.get(window)
-                if token_id is not None:
-                    output.append(token_id)
-                    i += length
-                    break
-            else:
-                # Fallback to single-byte atom per spec §2.4.
-                byte = normalised[i : i + 1]
-                token_id = vocab.get(byte)
-                if token_id is None:
-                    raise KeyError(f"Byte {byte!r} missing from vocabulary")
-                output.append(token_id)
-                i += 1
-            max_probe = max(max_probe, probe_count)
-            if len(output) > self.config.max_event_tokens:
-                raise BudgetError("Tokenizer token budget exceeded")
-        self._last_stats = TokenizerEncodeStats(
-            bytes_in=len(data),
-            normalized_bytes=len(normalised),
-            tokens_out=len(output),
-            max_probes=max_probe,
-        )
-        return output
+        tokens = self._encode_from_normalised(normalised, len(data), update_stats=True)
+        return tokens
 
     # -- Decoder --------------------------------------------------------
 
@@ -248,6 +329,206 @@ class TokenizerState:
         """Return diagnostics from the most recent :meth:`encode` call."""
 
         return self._last_stats
+
+    @property
+    def sp_trace(self) -> Sequence[Tuple[int, Tuple[bytes, ...]]]:
+        """Expose the Sardinas–Patterson witness trace (spec §4.2)."""
+
+        return tuple(self._sp_trace)
+
+    @property
+    def sp_digest(self) -> str:
+        """Return the SHA-256 digest of the minimal SP witness."""
+
+        return self._sp_digest
+
+    def retokenize_window(
+        self,
+        normalised: bytes,
+        tokens: Sequence[int],
+        edit_start: int,
+        edit_end: int,
+        replacement: bytes,
+    ) -> Tuple[List[int], Tuple[int, int], bytes]:
+        """Retokenize a local edit inside the radius ``W_edit`` (spec §2.6).
+
+        ``normalised`` and ``replacement`` must already satisfy the Unicode
+        normalisation policy enforced by :meth:`encode`.  ``edit_start`` and
+        ``edit_end`` are byte offsets in ``normalised`` describing the replaced
+        span.  The method retokenizes only the affected window and returns the
+        replacement tokens, the token index range to splice, and the updated
+        normalised byte string.
+        """
+
+        if edit_start < 0 or edit_end < edit_start or edit_end > len(normalised):
+            raise ValueError("Invalid edit span for retokenization")
+        if self.decode(tokens) != normalised:
+            raise ValueError("Token sequence does not match the provided bytes")
+        if replacement != self._normalise_bytes(replacement):
+            raise ValueError("Replacement bytes must already be normalised")
+        radius = self.config.edit_window
+        window_start = max(0, edit_start - radius)
+        window_end_before = min(len(normalised), edit_end + radius)
+        edit_replacement_end = edit_start + len(replacement)
+        new_normalised = normalised[:edit_start] + replacement + normalised[edit_end:]
+        window_end_after = min(len(new_normalised), edit_replacement_end + radius)
+        token_start, token_end = self._token_window(tokens, window_start, window_end_before)
+        segment = new_normalised[window_start:window_end_after]
+        new_tokens = self._encode_from_normalised(segment, len(segment), update_stats=False)
+        return new_tokens, (token_start, token_end), new_normalised
+
+    def _encode_from_normalised(
+        self, normalised: bytes, bytes_in: int, update_stats: bool
+    ) -> List[int]:
+        if len(normalised) > self.config.max_event_bytes:
+            raise BudgetError("Tokenizer byte budget exceeded")
+        prefix_hash = [0] * (len(normalised) + 1)
+        for i, byte in enumerate(normalised):
+            prefix_hash[i + 1] = (
+                (prefix_hash[i] * _HASH_BASE + byte) & _HASH_MASK
+            )
+        output: List[int] = []
+        i = 0
+        max_len = self.config.max_piece_length
+        max_probe = 0
+        total_table_probes = 0
+        while i < len(normalised):
+            remaining = len(normalised) - i
+            attempts = 0
+            matched = False
+            for length in range(min(max_len, remaining), 0, -1):
+                table = self._mph_tables.get(length)
+                if table is None:
+                    continue
+                attempts += 1
+                key_hash = self._substring_hash(prefix_hash, i, length)
+                candidate = normalised[i : i + length]
+                token_id, probes = table.lookup(key_hash, candidate)
+                total_table_probes += probes
+                if token_id is not None:
+                    output.append(token_id)
+                    i += length
+                    matched = True
+                    break
+            if not matched:
+                # Fallback to single-byte atom per spec §2.4.
+                table = self._mph_tables.get(1)
+                if table is None:
+                    raise KeyError("Single-byte vocabulary missing")
+                key_hash = self._substring_hash(prefix_hash, i, 1)
+                candidate = normalised[i : i + 1]
+                token_id, probes = table.lookup(key_hash, candidate)
+                total_table_probes += probes
+                if token_id is None:
+                    raise KeyError(f"Byte {candidate!r} missing from vocabulary")
+                output.append(token_id)
+                i += 1
+                attempts += 1
+            if attempts > self.config.max_piece_length:
+                raise BudgetError("Tokenizer probe budget exceeded")
+            max_probe = max(max_probe, attempts)
+            if len(output) > self.config.max_event_tokens:
+                raise BudgetError("Tokenizer token budget exceeded")
+        if update_stats:
+            self._last_stats = TokenizerEncodeStats(
+                bytes_in=bytes_in,
+                normalized_bytes=len(normalised),
+                tokens_out=len(output),
+                max_probes=max_probe,
+                table_probes=total_table_probes,
+            )
+        return output
+
+    def _substring_hash(
+        self, prefix_hash: Sequence[int], start: int, length: int
+    ) -> int:
+        end = start + length
+        value = (
+            prefix_hash[end]
+            - (prefix_hash[start] * self._hash_powers[length])
+        ) & _HASH_MASK
+        return value
+
+    def _token_window(
+        self, tokens: Sequence[int], start_byte: int, end_byte: int
+    ) -> Tuple[int, int]:
+        if start_byte >= end_byte:
+            return len(tokens), len(tokens)
+        offsets: List[Tuple[int, int]] = []
+        offset = 0
+        for token in tokens:
+            piece = self._id_to_bytes.get(int(token))
+            if piece is None:
+                raise KeyError(f"Unknown token id {token}")
+            next_offset = offset + len(piece)
+            offsets.append((offset, next_offset))
+            offset = next_offset
+        start_idx = len(tokens)
+        end_idx = len(tokens)
+        for idx, (start, end) in enumerate(offsets):
+            if start_idx == len(tokens) and end > start_byte:
+                start_idx = idx
+            if end >= end_byte:
+                end_idx = idx + 1
+                break
+        return start_idx, end_idx
+
+    def _build_mph_tables(self) -> Dict[int, _MPHTable]:
+        tables: Dict[int, _MPHTable] = {}
+        pieces_by_length: Dict[int, List[Tuple[bytes, int]]] = {}
+        for piece, token_id in self.config.vocabulary.items():
+            pieces_by_length.setdefault(len(piece), []).append((piece, token_id))
+        for length, pieces in pieces_by_length.items():
+            tables[length] = _MPHTable.build(pieces)
+        return tables
+
+    def _build_sp_trace(self) -> Tuple[List[Tuple[int, Tuple[bytes, ...]]], str]:
+        vocab = [piece for piece in self.config.vocabulary.keys()]
+        trace: List[Tuple[int, Tuple[bytes, ...]]] = []
+        visited: Set[Tuple[bytes, ...]] = set()
+        current: Set[bytes] = set()
+        for x in vocab:
+            for y in vocab:
+                if x == y:
+                    continue
+                if x.startswith(y):
+                    remainder = x[len(y) :]
+                    if not remainder:
+                        raise ValueError("Vocabulary fails Sardinas–Patterson (epsilon witness)")
+                    current.add(remainder)
+        while current:
+            if b"" in current:
+                raise ValueError("Vocabulary fails Sardinas–Patterson (epsilon witness)")
+            snapshot = tuple(sorted(current))
+            trace.append((len(trace) + 1, snapshot))
+            visited.add(snapshot)
+            next_set: Set[bytes] = set()
+            for word in current:
+                for piece in vocab:
+                    if word.startswith(piece):
+                        remainder = word[len(piece) :]
+                        if remainder:
+                            next_set.add(remainder)
+                        else:
+                            raise ValueError("Vocabulary fails Sardinas–Patterson (epsilon witness)")
+                    if piece.startswith(word):
+                        remainder = piece[len(word) :]
+                        if remainder:
+                            next_set.add(remainder)
+                        else:
+                            raise ValueError("Vocabulary fails Sardinas–Patterson (epsilon witness)")
+            canonical = tuple(sorted(next_set))
+            if canonical in visited:
+                break
+            current = next_set
+        digest_payload = bytearray()
+        for level, sequences in trace:
+            digest_payload.extend(level.to_bytes(2, "big"))
+            for remainder in sequences:
+                digest_payload.extend(len(remainder).to_bytes(2, "big"))
+                digest_payload.extend(remainder)
+        digest = hashlib.sha256(bytes(digest_payload)).hexdigest()
+        return trace, digest
 
 
 # ---------------------------------------------------------------------------
@@ -1177,6 +1458,7 @@ class SeraDiagnostics:
     tok_bytes_in: int = 0
     tok_emitted: int = 0
     tokenizer_probe_max: int = 0
+    tokenizer_table_probes: int = 0
     tokens_emitted: int = 0
     attention_updates: int = 0
     attention_clip_rate: float = 0.0
@@ -1261,6 +1543,7 @@ class Sera:
                     diag.tokenizer_probe_max = max(
                         diag.tokenizer_probe_max, stats.max_probes
                     )
+                    diag.tokenizer_table_probes += stats.table_probes
                     diag.tokens_emitted = diag.tok_emitted
 
             y_att = None
@@ -1463,3 +1746,38 @@ __all__ = [
     "SeraConfig",
 ]
 
+_HASH_BASE = 257
+_HASH_MASK = (1 << 64) - 1
+_SPLITMIX64_GAMMA = 0x9E3779B97F4A7C15
+_BIDI_CONTROL_CODEPOINTS: Set[int] = {
+    0x202A,
+    0x202B,
+    0x202C,
+    0x202D,
+    0x202E,
+    0x2066,
+    0x2067,
+    0x2068,
+    0x2069,
+}
+_DISALLOWED_UNICODE_POINTS: Set[int] = set(_BIDI_CONTROL_CODEPOINTS)
+_DISALLOWED_UNICODE_POINTS.add(0x200D)  # ZERO WIDTH JOINER
+
+
+def _mix64(value: int, seed: int = 0) -> int:
+    """Deterministic 64-bit mixer derived from splitmix64 (spec §4.3)."""
+
+    x = (value + seed * _SPLITMIX64_GAMMA) & _HASH_MASK
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9 & _HASH_MASK
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EB & _HASH_MASK
+    x ^= x >> 31
+    return x & _HASH_MASK
+
+
+def _hash_bytes(data: bytes) -> int:
+    """Compute the rolling hash RH_n for a byte sequence (spec §4.3)."""
+
+    h = 0
+    for byte in data:
+        h = ((h * _HASH_BASE) + byte) & _HASH_MASK
+    return h

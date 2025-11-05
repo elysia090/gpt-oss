@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import pathlib
 import importlib.util
@@ -22,6 +23,7 @@ BudgetError = _SERA_MODULE.BudgetError
 Sera = _SERA_MODULE.Sera
 SeraConfig = _SERA_MODULE.SeraConfig
 TokenizerConfig = _SERA_MODULE.TokenizerConfig
+TokenizerState = _SERA_MODULE.TokenizerState
 
 
 def test_tokenizer_enforces_event_budgets() -> None:
@@ -86,3 +88,35 @@ def test_sera_config_provides_fresh_defaults() -> None:
     assert config_a is not config_b
     assert config_a.attention is not config_b.attention
     assert config_a.linear is not config_b.linear
+
+
+def test_tokenizer_sp_trace_and_digest() -> None:
+    tokenizer = TokenizerState(TokenizerConfig())
+
+    assert tokenizer.sp_trace == ()
+    assert tokenizer.sp_digest == hashlib.sha256(b"").hexdigest()
+
+
+def test_tokenizer_retokenize_window_within_radius() -> None:
+    config = TokenizerConfig(edit_window=8, max_piece_length=4)
+    tokenizer = TokenizerState(config)
+    original = b"hello world"
+    tokens = tokenizer.encode(original)
+    normalised = tokenizer._normalise_bytes(original)
+    replacement = tokenizer._normalise_bytes(b"there")
+
+    new_tokens, token_range, new_normalised = tokenizer.retokenize_window(
+        normalised, tokens, 6, 11, replacement
+    )
+
+    assert new_normalised == tokenizer._normalise_bytes(b"hello there")
+    stitched = tokens[: token_range[0]] + new_tokens + tokens[token_range[1] :]
+    assert tokenizer.decode(stitched) == new_normalised
+
+
+@pytest.mark.parametrize("payload", ["a\u200db", "a\u202E b"])
+def test_tokenizer_rejects_disallowed_unicode(payload: str) -> None:
+    tokenizer = TokenizerState(TokenizerConfig())
+
+    with pytest.raises(ValueError):
+        tokenizer.encode(payload.encode("utf-8"))
