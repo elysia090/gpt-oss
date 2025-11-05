@@ -8,7 +8,10 @@ import sys
 import pytest
 
 
-pytest.importorskip("numpy")
+try:  # pragma: no cover - mirrors module fallback for test envs
+    import numpy as np
+except ModuleNotFoundError:  # pragma: no cover - deterministic fallback
+    from gpt_oss._compat import numpy_stub as np
 
 
 _SERA_PATH = pathlib.Path(__file__).resolve().parents[2] / "src" / "gpt_oss" / "inference" / "sera.py"
@@ -25,6 +28,9 @@ SeraConfig = _SERA_MODULE.SeraConfig
 TokenizerConfig = _SERA_MODULE.TokenizerConfig
 TokenizerState = _SERA_MODULE.TokenizerState
 SparseLinearConfig = _SERA_MODULE.SparseLinearConfig
+CCRConfig = _SERA_MODULE.CCRConfig
+CCRState = _SERA_MODULE.CCRState
+CCRResult = _SERA_MODULE.CCRResult
 
 
 def test_tokenizer_enforces_event_budgets() -> None:
@@ -166,3 +172,44 @@ def test_sparse_linear_tau_freeze() -> None:
         model.linear.update([(1, 1.0)], target=0.0)
     capacity = model.linear.manifest()["capacity"]
     assert capacity["frozen"] is True
+
+
+def test_ccr_small_block_precomputation() -> None:
+    state = CCRState(CCRConfig())
+    blocks = state.blocks
+
+    assert blocks.dim == 2
+    assert len(blocks.B_blocks) == 3
+    assert len(blocks.W_blocks) == 3
+    assert blocks.h.shape == (2, 2)
+    assert blocks.h_series.shape == (2, 2)
+    assert blocks.pi.shape == (2,)
+    assert float(sum(blocks.pi.tolist())) == pytest.approx(1.0)
+
+
+def test_ccr_correct_constructs_residual_and_output() -> None:
+    state = CCRState(CCRConfig())
+    locals_vec = np.array([3.0, 1.0], dtype=float)
+
+    result = state.correct(locals_vec)
+
+    assert isinstance(result, CCRResult)
+    assert result.residual.shape == (2,)
+    assert float(sum(result.residual.tolist())) == pytest.approx(0.0)
+    assert result.correction.shape == (2,)
+    assert result.corrected_locals.shape == (2,)
+    assert result.y == pytest.approx(float(np.mean(result.corrected_locals)))
+
+
+def test_step_exposes_ccr_outputs() -> None:
+    model = Sera(SeraConfig())
+
+    outputs = model.step()
+
+    residual = outputs["ccr_residual"]
+    correction = outputs["ccr_correction"]
+
+    assert isinstance(residual, np.ndarray)
+    assert residual.shape == (2,)
+    assert isinstance(correction, np.ndarray)
+    assert correction.shape == (2,)
