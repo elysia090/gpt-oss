@@ -219,6 +219,33 @@ trust_gate:{M, k, b_bits, p_prime, B_floor, pi0, H, O, psi, rho, d_trust, salts_
 search:{A_max, A_cap, H_sel, H_roll, c_puct, epsilon, vloss}
 capacity:{lambda_hat, T_rb_ms, slack, margin}
 salts:{mphf_salt_digest, key_salt_digest}
+
+15.1 Tokenizer section
+The tokenizer record fixes all finite-state and vocabulary bounds that control streaming tokenization. ``L_tok`` captures the maximum token length and sets upper limits for rolling hashes and normalization lookahead. ``S_norm`` and ``L_norm`` define the deterministic normalizer, while ``P_gen`` caps the number of generator proposals considered at runtime. The manifest stores ``sp_cert_digest`` (Sardinas–Patterson or prefix proof) and ``unicode_policy_version`` so that a reader can verify normalization and encoding rules before accepting a new generation.
+
+15.2 PRF section
+The ``prf`` stanza records the random feature configuration for attention. It pins the feature count ``r``, the temperature ``tau``, clipping threshold ``clip_c`` for norm control, and the whitening epsilon ``whitening_eps`` used when computing ``phi_w``. Persisting these constants allows deterministic reproduction of the kernel approximation and guarantees that whitening remains well conditioned across generations.
+
+15.3 Denominator section
+The denominator record specifies the stability parameters for attention ratio evaluations. ``beta_floor`` is the certified lower bound on denominators and ``lambda_star_schedule_digest`` names the published digest for the predictable floor schedule. This ensures that a loader can confirm Lipschitz guarantees and the exact schedule chosen when the generation was produced.
+
+15.4 Memory section
+The memory stanza disambiguates which finite rational memory mode is active and all associated integer bounds. ``mode`` identifies SOS or ARMA operation, while ``L`` or ``(p,q)`` give the section counts or ARMA orders. ``T_phi`` and ``K`` capture lift sparsity and lag caps, and ``pole_radius_min`` provides the published spectral radius margin that downstream readers validate before accepting a snapshot.
+
+15.5 Overlays section
+The overlays record documents the auxiliary adjustments applied to the PRF readout. ``P`` limits the number of overlay entries per type, ``k_max`` the maximum rank for Type-C corrections, and ``r_v`` the value dimension. Publishing these counts constrains the algebraic correction budget and guarantees constant time evaluation in the restored model.
+
+15.6 Bridge section
+The bridge stanza enumerates all constants governing the external reference bridge. ``K`` and ``W`` bound candidate enumeration and hub windows, while ``Proj_shape`` and ``Proj_digest`` describe the fixed projection matrix. The manifest also includes ``beta_min``/``beta_max`` gating limits, guard policies (``margin_policy``, ``eps_row_policy``), store limits (``load_max``, ``stash_max``, ``kick_max``), and a ``route_proof_schema_digest``. Together these fields allow auditors to replay guard decisions and confirm dictionary O(0) eligibility.
+
+15.7 Search section
+The ``search`` record captures bounded tree-search parameters. ``A_max`` and ``A_cap`` set branching and widening caps, ``H_sel``/``H_roll`` bound depth, ``c_puct`` tunes selection pressure, and ``epsilon``/``vloss`` describe the stochastic policy mix and value loss clamps. Logging these numbers ensures that the hot-path simulation workload remains within its fixed per-event budget.
+
+15.8 Capacity section
+The capacity stanza exposes the shared-store scheduling snapshot. ``lambda_hat`` is the observed high-percentile insert rate, ``T_rb_ms`` the rebuild wall-time budget, and ``slack``/``margin`` show remaining headroom. The inequality in Section 4.4 is verified against these values during publication to guarantee that inserts halt before violating capacity guarantees.
+
+15.9 Salts section
+The ``salts`` record stores digests for keyed randomness used across the model. ``mphf_salt_digest`` authenticates the minimal perfect hash construction used by the exact linear store, and ``key_salt_digest`` records the rotating bridge and module key salt digest. Trust-gate salts are tracked separately via the ``trust_gate`` section to preserve compartmentalization while still providing auditable evidence of rotation.
 	16.	Complexity and fixed budgets
 Tokenizer: <=L_tok probes per normalized byte; pending<=L_tok−1; O(1) amortized retokenization if W_edit>=L_tok
 Attention ingest: O(rd) for PRF features; updates O(rd_v) and O(r); whitening O(r)
