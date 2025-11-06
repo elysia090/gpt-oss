@@ -21,11 +21,21 @@ import importlib.util
 import json
 import os
 import pickle
+import struct
 import sys
 import time
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Optional, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Iterable,
+    Mapping,
+    Optional,
+    Sequence,
+    Dict,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import only used for type checkers
     from gpt_oss.inference.sera import Sera
@@ -37,6 +47,20 @@ DEFAULT_STATE_FILENAMES: Sequence[str] = (
 )
 
 OPTIONAL_TOOLS: Sequence[str] = ("browser", "python")
+
+
+_ARRAY_HEADER_STRUCT = struct.Struct("<I H H 5Q Q Q Q I I")
+_DTYPE_CODES: Dict[int, str] = {
+    1: "f64",
+    2: "f32",
+    3: "i32",
+    4: "i16",
+    5: "i8",
+    6: "u8",
+    7: "q8_8",
+    8: "q4_12",
+    9: "bf16",
+}
 
 
 def _format_float(value: Optional[object]) -> str:
@@ -79,8 +103,12 @@ def _format_dashboard(
     capacity_margin = diagnostics.get("capacity_margin")
     capacity_frozen = diagnostics.get("capacity_frozen", False)
 
+    tokens_per_sec = diagnostics.get("tokens_per_sec")
+
     summary = (
-        f"[diag g={generation}] turn_tokens={turn_tokens} total_emitted={_format_int(tokens_emitted)} "
+        f"[diag g={generation}] turn_tokens={turn_tokens} "
+        f"tokens/sec={_format_float(tokens_per_sec)} "
+        f"total_emitted={_format_int(tokens_emitted)} "
         f"bridge={bridge_hits}/{bridge_misses} ({_format_float(bridge_guard)}) "
         f"p99(store/stash/kick)={_format_float(store_p99)}/"
         f"{_format_float(stash_p99)}/{_format_float(kick_p99)} "
@@ -140,12 +168,16 @@ class DiagnosticsDashboard:
         self.refresh_interval = max(0.0, float(self.refresh_interval))
         self._last_render: float = 0.0
         self._log_file = None
+        self._last_line_len = 0
         if self.log_path is not None:
             log_path = self.log_path.expanduser()
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_file = log_path.open("a", encoding="utf-8")
 
     def close(self) -> None:
+        if self.refresh_interval > 0.0 and self._last_line_len:
+            print()
+            self._last_line_len = 0
         if self._log_file is not None:
             self._log_file.close()
             self._log_file = None
@@ -178,14 +210,19 @@ class DiagnosticsDashboard:
             self._log_file.flush()
 
         if self._should_render():
-            print(
-                _format_dashboard(
-                    diagnostics,
-                    generation=generation,
-                    turn_tokens=turn_tokens,
-                    verbose=self.verbose,
-                )
+            line = _format_dashboard(
+                diagnostics,
+                generation=generation,
+                turn_tokens=turn_tokens,
+                verbose=self.verbose,
             )
+            if self.refresh_interval <= 0.0:
+                print(line)
+            else:
+                padding = max(0, self._last_line_len - len(line))
+                sys.stdout.write("\r" + line + (" " * padding))
+                sys.stdout.flush()
+                self._last_line_len = len(line)
 
 
 def _load_sera_class():
@@ -196,7 +233,7 @@ def _load_sera_class():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    return module.Sera
+    return module.Sera, getattr(module, "SeraConfig")
 
 
 def _strip_private_fields(blob):
@@ -280,13 +317,83 @@ def _load_state(path: Path):
     raise RuntimeError(f"Unsupported snapshot format: {path}")
 
 
+def _parse_array_header(values: Sequence[int]) -> Dict[str, object]:
+    magic = int(values[0])
+    if magic != 0x53455241:
+        raise ValueError("Invalid Sera array header magic")
+    dtype_code = int(values[1])
+    rank = int(values[2])
+    dims = tuple(int(dim) for dim in values[3:8])
+    shape = tuple(dim for dim in dims[:rank]) if rank > 0 else tuple()
+    header = {
+        "magic": magic,
+        "dtype_code": dtype_code,
+        "dtype": _DTYPE_CODES.get(dtype_code, f"code{dtype_code}"),
+        "rank": rank,
+        "dims": dims,
+        "shape": shape,
+        "byte_len": int(values[8]),
+        "crc32c": int(values[9]),
+        "sha256_low64": int(values[10]),
+        "flags": int(values[11]),
+        "reserved": int(values[12]),
+    }
+    return header
+
+
+def _load_array_file(path: Path) -> tuple[Dict[str, object], bytes]:
+    with path.open("rb") as fh:
+        header_raw = fh.read(_ARRAY_HEADER_STRUCT.size)
+        if len(header_raw) != _ARRAY_HEADER_STRUCT.size:
+            raise ValueError(f"Array file {path} is truncated")
+        values = _ARRAY_HEADER_STRUCT.unpack(header_raw)
+        payload = fh.read()
+    header = _parse_array_header(values)
+    if len(payload) != header["byte_len"]:
+        raise ValueError(
+            f"Array payload length mismatch for {path}: "
+            f"expected {header['byte_len']}, got {len(payload)}"
+        )
+    return header, payload
+
+
+def _load_manifest_arrays(
+    manifest_dir: Path, artefacts: Optional[Mapping[str, Mapping[str, object]]]
+) -> Dict[str, Dict[str, object]]:
+    if not artefacts or not isinstance(artefacts, Mapping):
+        return {}
+    arrays_dir = manifest_dir / "arrays"
+    loaded: Dict[str, Dict[str, object]] = {}
+    for name, record in sorted(artefacts.items()):
+        array_path = arrays_dir / f"{name}.bin"
+        if not array_path.exists():
+            raise FileNotFoundError(f"Required array {array_path} is missing")
+        header, payload = _load_array_file(array_path)
+        expected_sha = record.get("sha256") if isinstance(record, Mapping) else None
+        if expected_sha:
+            digest = hashlib.sha256(payload).hexdigest()
+            if digest != expected_sha:
+                raise ValueError(
+                    f"Array {array_path} failed SHA-256 validation: "
+                    f"expected {expected_sha}, got {digest}"
+                )
+        loaded[name] = {
+            "dtype": header["dtype"],
+            "shape": header["shape"],
+            "byte_len": header["byte_len"],
+        }
+    return loaded
+
+
 def _run_turn(
     model: "Sera",
     prompt: str,
-    response_token: int,
     dashboard: DiagnosticsDashboard,
 ) -> str:
+    start = time.perf_counter()
     result = model.step(bytes_data=prompt.encode("utf-8"))
+    elapsed = max(time.perf_counter() - start, 1e-6)
+
     tokens = result.get("tokens", [])
     try:
         user_text = model.tokenizer.decode(tokens)
@@ -294,16 +401,37 @@ def _run_turn(
         user_text = b""
     user_text = _decode_text(user_text)
 
-    response_bytes = model.tokenizer.decode([int(response_token)])
-    response_text = _decode_text(response_bytes)
+    generated_ids = result.get("generated") or result.get("response_tokens")
+    if not generated_ids:
+        generated_ids = tokens
 
     print(f"User ({len(tokens)} tokens): {user_text}")
-    print(f"Sera: {response_text}")
-    diagnostics = model.diagnostics_record()
+    print("Sera: ", end="", flush=True)
+
+    fragments: list[str] = []
+    for token_id in generated_ids:
+        try:
+            fragment = model.tokenizer.decode([int(token_id)])
+        except Exception:  # pragma: no cover - defensive against tokenizer errors
+            fragment = b""
+        text = _decode_text(fragment)
+        fragments.append(text)
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    print()
+
+    response_text = "".join(fragments)
+
+    if "y_out" in result:
+        print(f"Logit y_out: {_format_float(result['y_out'])}")
+
+    diagnostics = dict(model.diagnostics_record())
+    turn_tokens = len(generated_ids)
+    diagnostics["tokens_per_sec"] = turn_tokens / elapsed if turn_tokens else 0.0
     dashboard.update(
         diagnostics,
         generation=getattr(model, "generation", 0),
-        turn_tokens=len(tokens),
+        turn_tokens=turn_tokens,
     )
     return response_text
 
@@ -326,12 +454,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--prompt",
         type=str,
         help="Optional prompt to run in single-shot mode and exit",
-    )
-    parser.add_argument(
-        "--response-token",
-        type=int,
-        default=65,
-        help="Token id to use for the placeholder model response",
     )
     parser.add_argument(
         "--tool",
@@ -367,8 +489,23 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     manifest_dir = _resolve_manifest_dir(args.manifest)
     state_path = _locate_state_file(manifest_dir, args.state_file)
     state_blob = _strip_private_fields(_load_state(state_path))
-    Sera = _load_sera_class()
-    model = Sera.restore(state_blob)
+
+    arrays = _load_manifest_arrays(manifest_dir, state_blob.get("artefacts"))
+    if arrays:
+        state_blob.setdefault("arrays", arrays)
+
+    Sera, SeraConfig = _load_sera_class()
+    if "config" in state_blob:
+        model = Sera.restore(state_blob)
+    else:
+        if SeraConfig is None:  # pragma: no cover - defensive fallback
+            raise RuntimeError("Sera runtime does not expose SeraConfig")
+        config_blob = state_blob.get("model_config")
+        if isinstance(config_blob, Mapping):
+            config = SeraConfig(**config_blob)
+        else:
+            config = SeraConfig()
+        model = Sera(config)
 
     dashboard = DiagnosticsDashboard(
         refresh_interval=args.stats_refresh,
@@ -378,6 +515,17 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     enabled_tools = sorted(set(args.tools or []))
     print(f"Loaded Sera manifest from {manifest_dir}")
+    if arrays:
+        preview = ", ".join(
+            f"{name}:{info['dtype']}@{info['shape']}"
+            for name, info in list(arrays.items())[:3]
+        )
+        if len(arrays) > 3:
+            preview += ", ..."
+        print(
+            f"Loaded {len(arrays)} arrays from {manifest_dir / 'arrays'}"
+            + (f" [{preview}]" if preview else "")
+        )
     if enabled_tools:
         print("Enabled tools: " + ", ".join(enabled_tools))
     else:
@@ -385,7 +533,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     try:
         if args.prompt is not None:
-            _run_turn(model, args.prompt, args.response_token, dashboard)
+            _run_turn(model, args.prompt, dashboard)
             return 0
 
         print("Type your message and press enter (Ctrl+C to exit).")
@@ -393,7 +541,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             prompt = input("You: ")
             if not prompt:
                 continue
-            _run_turn(model, prompt, args.response_token, dashboard)
+            _run_turn(model, prompt, dashboard)
     except KeyboardInterrupt:
         print("\nExiting.")
     finally:
