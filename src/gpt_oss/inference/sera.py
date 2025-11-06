@@ -1248,6 +1248,29 @@ class TrustGateDecision:
     beta_min: float
     beta_cap: float
 
+    def verdict(self) -> Optional[bool]:
+        """Translate the integer decision into the spec tri-state verdict."""
+
+        if self.decision > 0:
+            return True
+        if self.decision < 0:
+            return False
+        return None
+
+    def as_dict(self) -> Dict[str, object]:
+        """Return a JSON-friendly representation of the trust gate result."""
+
+        return {
+            "decision": self.decision,
+            "m": self.m,
+            "llr": float(self.llr),
+            "gamma": float(self.gamma),
+            "consistent": bool(self.consistent),
+            "audit": self.audit,
+            "beta_min": float(self.beta_min),
+            "beta_cap": float(self.beta_cap),
+        }
+
 
 class TrustGateState:
     """Deterministic verifier implementing the trust gate (spec §6.4)."""
@@ -3249,6 +3272,12 @@ class Sera:
             diag.trust_audit = trust.audit
             diag.trust_beta_min = float(trust.beta_min)
             diag.trust_beta_cap = float(trust.beta_cap)
+            trust_record = trust.as_dict()
+            audit_blob = trust_record.get("audit")
+            if isinstance(audit_blob, (bytes, bytearray)):
+                trust_record["audit_hex"] = bytes(audit_blob).hex()
+            else:
+                trust_record["audit_hex"] = ""
 
             bridge_val = np.zeros(self.bridge.config.value_dim, dtype=float)
             guard = False
@@ -3337,6 +3366,8 @@ class Sera:
                 "ccr_correction": ccr_result.correction,
                 "y_bridge": bridged,
                 "y_cfr": cfr_result.y_cfr,
+                "trust_decision": trust.verdict(),
+                "trust": trust_record,
             }
 
     def pin_generation(self) -> GenerationPin:

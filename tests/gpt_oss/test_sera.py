@@ -249,6 +249,19 @@ def test_step_exposes_ccr_outputs() -> None:
     assert correction.shape == (2,)
 
 
+def test_step_includes_trust_outputs() -> None:
+    model = Sera(SeraConfig())
+
+    outputs = model.step()
+
+    assert "trust_decision" in outputs
+    assert outputs["trust_decision"] in {True, False, None}
+    assert "trust" in outputs
+    trust_blob = outputs["trust"]
+    assert trust_blob["decision"] in (-1, 0, 1)
+    assert "audit_hex" in trust_blob
+
+
 def test_trust_gate_adjusts_beta_caps() -> None:
     trust_config = TrustGateConfig(
         dimension=6,
