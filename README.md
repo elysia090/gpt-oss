@@ -441,6 +441,37 @@ codex -p oss
 
 ## Tools
 
+### Sera conversion and chat CLI
+
+The repository ships with a Sera Transfer tool that deterministically converts a
+checkpoint into the [Sera runtime](docs/specs/Sera-Transfer.txt) artefacts and a
+companion chat CLI for quick experiments.
+
+1. Convert the original model (example for `gpt-oss-20b`):
+
+   ```bash
+   python -m gpt_oss.tools.sera_transfer \
+       --source /path/to/gpt-oss-20b \
+       --output /path/to/gpt-oss-sera-20b \
+       --r 512 \
+       --rv 12 \
+       --topL 12
+   ```
+
+   The command writes `sera_manifest.bin`, binary array artefacts, and a
+   `sera_state.pkl` snapshot that can be restored via
+   :func:`gpt_oss.inference.sera.Sera.restore`.
+
+2. Launch the Sera chat CLI:
+
+   ```bash
+   gpt-oss-sera-chat --artifacts /path/to/gpt-oss-sera-20b
+   ```
+
+   You can also set ``GPT_OSS_SERA_ARTIFACTS`` to point at the artefact directory
+   and run ``gpt-oss-sera-chat`` without arguments. For automated smoke tests the
+   CLI exposes ``--prompt`` to execute a single turn and exit.
+
 ### Browser
 
 > [!WARNING]
