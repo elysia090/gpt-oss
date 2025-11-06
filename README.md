@@ -369,8 +369,11 @@ flags. Common examples:
   transcript (use `json` for structured logs).
 - `--chat-arg --plain` — skip the TUI and stay in the legacy prompt.
 
-Run `python tools/sera_quickstart.py --help` for the full list of supported
-flags and environment variables.
+Run `gpt-oss-sera-quickstart --help` (or `python -m gpt_oss.tools.sera_quickstart --help`
+if the console script is unavailable) for the full list of supported flags and
+environment variables. The underlying `gpt-oss-sera-chat` CLI exposes the
+`--tui` (default) and `--plain` switches directly, so there is no separate
+`--chat` flag to look for on the helper.
 
 ## Download the model
 
