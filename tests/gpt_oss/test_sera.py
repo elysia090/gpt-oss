@@ -33,6 +33,7 @@ CCRState = _SERA_MODULE.CCRState
 CCRResult = _SERA_MODULE.CCRResult
 TrustGateConfig = _SERA_MODULE.TrustGateConfig
 BridgeConfig = _SERA_MODULE.BridgeConfig
+BridgeState = _SERA_MODULE.BridgeState
 
 
 def test_tokenizer_enforces_event_budgets() -> None:
@@ -152,6 +153,37 @@ def test_sparse_linear_manifest_includes_mph_and_cuckoo() -> None:
     assert "slack" in capacity
 
 
+def test_bridge_manifest_includes_config_metadata() -> None:
+    bridge_config = BridgeConfig(
+        projection=((0.0, 1.0), (1.0, 0.0)),
+        margin_policy=0.1,
+        eps_row_policy=0.05,
+        load_max=0.75,
+        stash_max=0.5,
+        kick_max=4.0,
+    )
+    config = SeraConfig(bridge=bridge_config)
+    model = Sera(config)
+
+    manifest = model.bridge.manifest()
+    bridge_blob = manifest["config"]
+
+    assert bridge_blob["hub_window"] == config.bridge.hub_window
+    assert bridge_blob["candidate_bound"] == config.bridge.candidate_bound
+    projection_blob = bridge_blob["projection"]
+    expected_shape = (len(config.bridge.projection), config.bridge.value_dim)
+    assert tuple(projection_blob["shape"]) == expected_shape
+    assert projection_blob["digest"] == config.bridge.projection_digest
+    guard_blob = bridge_blob["guard"]
+    assert guard_blob["margin_policy"] == pytest.approx(config.bridge.margin_policy)
+    assert guard_blob["eps_row_policy"] == pytest.approx(config.bridge.eps_row_policy)
+    limits = bridge_blob["store_limits"]
+    assert limits["load_max"] == pytest.approx(config.bridge.load_max)
+    assert limits["stash_max"] == pytest.approx(config.bridge.stash_max)
+    assert limits["kick_max"] == pytest.approx(config.bridge.kick_max)
+    assert bridge_blob["route_proof_schema_digest"] == config.bridge.route_proof_schema_digest
+
+
 def test_sparse_linear_tau_freeze() -> None:
     config = SeraConfig(
         linear=SparseLinearConfig(
@@ -260,3 +292,29 @@ def test_trust_gate_adjusts_beta_caps() -> None:
     assert diag.trust_decision == -1
     assert diag.trust_beta_cap == pytest.approx(0.0)
     assert diag.trust_beta_min == pytest.approx(0.0)
+
+
+def test_bridge_promote_respects_guard_policies() -> None:
+    config = BridgeConfig(margin_policy=0.25, eps_row_policy=0.1)
+    bridge = BridgeState(config)
+
+    with pytest.raises(ValueError):
+        bridge.promote(1, 1, np.array([0.0]), guard_margin=0.2)
+
+    with pytest.raises(ValueError):
+        bridge.promote(1, 1, np.array([0.0]), guard_margin=0.25, guard_eps_row=0.05)
+
+    bridge.promote(1, 1, np.array([0.0]), guard_margin=0.3, guard_eps_row=0.1)
+
+
+def test_bridge_gate_projects_values() -> None:
+    config = BridgeConfig(beta_min=0.2, beta_max=0.6, projection=((0.0, 1.0),))
+    bridge = BridgeState(config)
+
+    base = 2.0
+    value = np.array([3.0, 5.0])
+    result = bridge.gate(base, value, guard=True, witness_quality=0.5)
+
+    beta = config.beta_min + (config.beta_max - config.beta_min) * 0.5
+    expected = (1.0 - beta) * base + beta * 5.0
+    assert result == pytest.approx(expected)

@@ -1890,6 +1890,15 @@ class BridgeConfig:
     candidate_bound: int = 4
     beta_min: float = 0.1
     beta_max: float = 0.9
+    projection: Sequence[Sequence[float]] = ((1.0,),)
+    load_max: float = 1.0
+    stash_max: float = 1.0
+    kick_max: float = 8.0
+    margin_policy: float = 0.0
+    eps_row_policy: float = 0.0
+    route_proof_schema_digest: str = ""
+    projection_digest: str = field(init=False)
+    value_dim: int = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.hub_window <= 0:
@@ -1898,6 +1907,40 @@ class BridgeConfig:
             raise ValueError("candidate_bound must be positive")
         if not 0.0 <= self.beta_min <= self.beta_max <= 1.0:
             raise ValueError("beta range must satisfy 0 <= beta_min <= beta_max <= 1")
+        if self.load_max <= 0.0:
+            raise ValueError("load_max must be positive")
+        if self.stash_max <= 0.0:
+            raise ValueError("stash_max must be positive")
+        if self.kick_max <= 0.0:
+            raise ValueError("kick_max must be positive")
+        if self.margin_policy < 0.0:
+            raise ValueError("margin_policy must be non-negative")
+        if self.eps_row_policy < 0.0:
+            raise ValueError("eps_row_policy must be non-negative")
+
+        rows = []
+        width = None
+        for row in self.projection:
+            row_tuple = tuple(float(v) for v in row)
+            if width is None:
+                width = len(row_tuple)
+            elif len(row_tuple) != width:
+                raise ValueError("projection rows must have a consistent width")
+            rows.append(row_tuple)
+        if not rows or width is None or width == 0:
+            raise ValueError("projection must be a non-empty 2D matrix")
+        object.__setattr__(self, "projection", tuple(rows))
+        object.__setattr__(self, "value_dim", width)
+
+        digest = hashlib.sha256()
+        for row in rows:
+            for value in row:
+                digest.update(struct.pack("<d", float(value)))
+        object.__setattr__(self, "projection_digest", digest.hexdigest())
+
+        if not self.route_proof_schema_digest:
+            schema_digest = hashlib.sha256(BridgeProof._SCHEMA.format.encode("ascii")).hexdigest()
+            object.__setattr__(self, "route_proof_schema_digest", schema_digest)
 
 
 @dataclass
@@ -1981,6 +2024,16 @@ class BridgeState:
     _qdin: Dict[Tuple[int, int], float] = field(default_factory=dict)
     _qdout: Dict[Tuple[int, int], float] = field(default_factory=dict)
     _generation: int = 0
+    _projection: np.ndarray = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        matrix_data = [list(row) for row in self.config.projection]
+        matrix = np.asarray(matrix_data, dtype=float)
+        if matrix.ndim != 2:
+            raise ValueError("Bridge projection must be two-dimensional")
+        if matrix.shape[1] != self.config.value_dim:
+            raise ValueError("Projection width must match BridgeConfig value_dim")
+        self._projection = matrix
 
     def promote(
         self,
@@ -2003,7 +2056,12 @@ class BridgeState:
             leg_bound_out,
             tuple(float(b) for b in (competitor_bounds or ())),
         )
-        self._store[(ctx, token)] = BridgeEntry(value, guard, self._generation)
+        if guard.margin < self.config.margin_policy:
+            raise ValueError("Guard margin is below configured policy")
+        if guard.eps_row < self.config.eps_row_policy:
+            raise ValueError("Guard eps_row is below configured policy")
+        value_vec = self._coerce_value(value)
+        self._store[(ctx, token)] = BridgeEntry(value_vec, guard, self._generation)
         self._hub_bits.setdefault(ctx, [0] * self.config.hub_window)
         self._hub_bits.setdefault(token, [0] * self.config.hub_window)
 
@@ -2084,7 +2142,7 @@ class BridgeState:
                 ctx=ctx,
                 token=0,
             ).pack()
-            return np.zeros(1, dtype=float), False, proof
+            return self._empty_value(), False, proof
 
         entry = self._store.get((ctx, token))
         best_hub, best_cost = self._best_route(ctx, token)
@@ -2096,10 +2154,10 @@ class BridgeState:
         )
 
         if entry is not None and guard_ok:
-            value = entry.value
+            value = entry.value.copy()
         else:
             fallback = best_cost if math.isfinite(best_cost) else 0.0
-            value = np.array([fallback], dtype=float)
+            value = np.full(self.config.value_dim, float(fallback), dtype=float)
 
         proof = BridgeProof(
             hub=best_hub or 0,
@@ -2134,7 +2192,43 @@ class BridgeState:
         beta_span = max(beta_cap - beta_min, 0.0)
         beta = guard_weight * (beta_min + beta_span * s_q)
         alpha = 1.0 - beta
-        return alpha * float(base) + beta * float(np.mean(bridge_val))
+        target = float(np.mean(self._project_value(bridge_val)))
+        return alpha * float(base) + beta * target
+
+    def _project_value(self, bridge_val: Sequence[float]) -> np.ndarray:
+        vector = self._coerce_value(bridge_val)
+        return self._projection @ vector
+
+    def _coerce_value(self, value: Sequence[float]) -> np.ndarray:
+        arr = np.asarray(value, dtype=float)
+        raw = arr.tolist()
+
+        flat: List[float] = []
+
+        def _flatten(item: object) -> None:
+            if isinstance(item, list):
+                for sub in item:
+                    _flatten(sub)
+            else:
+                flat.append(float(item))
+
+        if isinstance(raw, list):
+            _flatten(raw)
+        else:
+            flat.append(float(raw))
+
+        if not flat:
+            flat.append(0.0)
+
+        if len(flat) < self.config.value_dim:
+            flat.extend([0.0] * (self.config.value_dim - len(flat)))
+        elif len(flat) > self.config.value_dim:
+            flat = flat[: self.config.value_dim]
+
+        return np.asarray(flat, dtype=float)
+
+    def _empty_value(self) -> np.ndarray:
+        return np.zeros(self.config.value_dim, dtype=float)
 
     def advance_generation(self, generation: int) -> None:
         self._generation = generation
@@ -2148,6 +2242,26 @@ class BridgeState:
         return entry.guard
 
     def manifest(self) -> Dict[str, object]:
+        config_blob = {
+            "hub_window": int(self.config.hub_window),
+            "candidate_bound": int(self.config.candidate_bound),
+            "beta_min": float(self.config.beta_min),
+            "beta_max": float(self.config.beta_max),
+            "projection": {
+                "shape": list(self._projection.shape),
+                "digest": self.config.projection_digest,
+            },
+            "guard": {
+                "margin_policy": float(self.config.margin_policy),
+                "eps_row_policy": float(self.config.eps_row_policy),
+            },
+            "store_limits": {
+                "load_max": float(self.config.load_max),
+                "stash_max": float(self.config.stash_max),
+                "kick_max": float(self.config.kick_max),
+            },
+            "route_proof_schema_digest": self.config.route_proof_schema_digest,
+        }
         entries = {
             f"{ctx}:{token}": entry.manifest()
             for (ctx, token), entry in sorted(self._store.items())
@@ -2166,6 +2280,7 @@ class BridgeState:
         }
         return {
             "generation": self._generation,
+            "config": config_blob,
             "entries": entries,
             "hub_bits": hubs,
             "qDin": qdin,
