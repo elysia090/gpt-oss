@@ -17,7 +17,10 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 import sys
 
-from safetensors import safe_open
+try:  # pragma: no cover - exercised indirectly in environments with safetensors
+    from safetensors import safe_open
+except ModuleNotFoundError:  # pragma: no cover - exercised in environments without safetensors
+    safe_open = None  # type: ignore[assignment]
 
 def _load_sera_runtime():
     sera_path = Path(__file__).resolve().parents[1] / "inference" / "sera.py"
@@ -360,6 +363,11 @@ class ModelConfig:
 
 
 def load_tensors(path: Path) -> Dict[str, List]:
+    if safe_open is None:
+        raise ModuleNotFoundError(
+            "The `safetensors` package is required to load model checkpoints. "
+            "Install it via `pip install safetensors` or provide a preloaded tensor map."
+        )
     tensors: Dict[str, List] = {}
     with safe_open(path, framework="python") as f:
         for key in f.keys():

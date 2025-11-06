@@ -8,9 +8,20 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("safetensors")
-
 from gpt_oss.tools import sera_transfer
+
+
+class DummyConfig:
+    def __init__(self):
+        self.value = 1
+
+
+class DummySera:
+    def __init__(self, config):
+        self.config = config
+
+    def snapshot(self):
+        return {"config": {}}
 
 
 @pytest.fixture(autouse=True)
@@ -67,17 +78,6 @@ def patch_conversion_dependencies(monkeypatch):
     )
     monkeypatch.setattr(sera_transfer, "write_array", lambda *args, **kwargs: b"")
     monkeypatch.setattr(sera_transfer, "write_manifest", lambda *args, **kwargs: None)
-
-    class DummyConfig:
-        def __init__(self):
-            self.value = 1
-
-    class DummySera:
-        def __init__(self, config):
-            self.config = config
-
-        def snapshot(self):
-            return {"config": {}}
 
     monkeypatch.setattr(
         sera_transfer,
