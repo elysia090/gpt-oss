@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import textwrap
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -117,6 +118,8 @@ class _ManifestSummary:
 
 class SeraTUI:
     """Prompt-toolkit powered TUI for ``gpt-oss-sera-chat``."""
+
+    _OPERATIONS_PANEL_WIDTH = 32
 
     def __init__(
         self,
@@ -328,28 +331,79 @@ class SeraTUI:
     def _refresh_operations(self) -> None:
         if self._operations_area is None:
             return
-        lines = [
-            f"Tools: {', '.join(sorted(self._enabled_tools)) if self._enabled_tools else 'none'}",
-            "",
-            "Hotkeys:",
-        ]
-        for key, tool in sorted(self._tool_key_map.items()):
-            status = "ON" if tool in self._enabled_tools else "OFF"
-            lines.append(f"  [{key.upper()}] Toggle {tool} ({status})")
-        lines.append("  [F9] View manifest metadata")
-        lines.append("  [F10] Export diagnostics")
-        lines.append("  [Ctrl+C] Exit")
-        if self.metrics_mode != "off":
-            lines.append(f"Metrics mode: {self.metrics_mode}")
-        lines.append(f"Manifest dir: {self.manifest_summary.directory}")
-        if self._last_export_path is not None:
-            lines.append(f"Last export: {self._last_export_path}")
+        lines: List[str] = []
+        lines.extend(self._format_tools_section())
+        lines.append("")
+        lines.append("Hotkeys:")
+        lines.extend(self._format_hotkey_lines())
+        metadata_lines = self._format_metadata_lines()
+        if metadata_lines:
+            lines.append("")
+            lines.extend(metadata_lines)
         new_text = "\n".join(lines)
         self._operations_area.text = new_text
         if hasattr(self._operations_area, "buffer"):
             self._operations_area.buffer.text = new_text
             self._operations_area.buffer.cursor_position = 0
         self._invalidate()
+
+    def _format_tools_section(self) -> List[str]:
+        if not self._enabled_tools:
+            return ["Tools: none"]
+        lines = ["Tools:"]
+        for tool in sorted(self._enabled_tools):
+            lines.append(f"  • {tool}")
+        return lines
+
+    def _format_hotkey_lines(self) -> List[str]:
+        entries: List[tuple[str, str, str]] = []
+        for key, tool in sorted(self._tool_key_map.items()):
+            status = "ON" if tool in self._enabled_tools else "OFF"
+            entries.append((key.upper(), f"Toggle {tool}", f"({status})"))
+        entries.extend(
+            [
+                ("F9", "View manifest metadata", ""),
+                ("F10", "Export diagnostics", ""),
+                ("Ctrl+C", "Exit", ""),
+            ]
+        )
+        key_width = max((len(entry[0]) for entry in entries), default=0)
+        lines: List[str] = []
+        for key, description, suffix in entries:
+            padded_key = key.ljust(key_width)
+            line = f"  [{padded_key}] {description}"
+            if suffix:
+                line = f"{line} {suffix}"
+            lines.append(line)
+        return lines
+
+    def _format_metadata_lines(self) -> List[str]:
+        lines: List[str] = []
+        if self.metrics_mode != "off":
+            lines.append(f"Metrics mode: {self.metrics_mode}")
+        lines.extend(
+            self._wrap_label_value("Manifest dir:", str(self.manifest_summary.directory))
+        )
+        if self._last_export_path is not None:
+            lines.extend(self._wrap_label_value("Last export:", str(self._last_export_path)))
+        return lines
+
+    def _wrap_label_value(self, label: str, value: str) -> List[str]:
+        width = max(8, self._OPERATIONS_PANEL_WIDTH - len(label) - 1)
+        wrapped = textwrap.wrap(
+            value,
+            width=width,
+            break_long_words=True,
+            break_on_hyphens=False,
+        )
+        if not wrapped:
+            return [label.rstrip()]
+        first, *rest = wrapped
+        lines = [f"{label} {first}"]
+        indent = " " * (len(label) + 1)
+        for chunk in rest:
+            lines.append(f"{indent}{chunk}")
+        return lines
 
     def _invalidate(self) -> None:
         if self._app is not None:
