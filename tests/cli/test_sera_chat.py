@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import dataclasses
-import importlib
+import hashlib
 import importlib.util
 import pickle
 import json
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -47,12 +48,35 @@ def sera_manifest(tmp_path: Path) -> Path:
     model = Sera(SeraConfig())
     snapshot = model.snapshot()
     snapshot["config"] = _config_to_dict(model.config)
+    payload = b"\x01\x02\x03\x04"
+    header = struct.pack(
+        "<I H H 5Q Q Q Q I I",
+        0x53455241,
+        6,
+        1,
+        len(payload),
+        1,
+        1,
+        1,
+        1,
+        len(payload),
+        0,
+        0,
+        1,
+        0,
+    )
     state_path = tmp_path / "sera_state.pkl"
+    arrays_dir = tmp_path / "arrays"
+    arrays_dir.mkdir()
+    array_path = arrays_dir / "toy.bin"
+    array_path.write_bytes(header + payload)
+    snapshot["artefacts"] = {
+        "toy": {"sha256": hashlib.sha256(payload).hexdigest()},
+    }
     with state_path.open("wb") as fh:
         pickle.dump(snapshot, fh)
     manifest_path = tmp_path / "sera_manifest.bin"
     manifest_path.write_bytes(b"SERM")
-    (tmp_path / "arrays").mkdir()
     return tmp_path
 
 
@@ -65,8 +89,6 @@ def test_single_turn_prompt(sera_manifest: Path) -> None:
         str(sera_manifest),
         "--prompt",
         "hello",
-        "--response-token",
-        "65",
         "--tool",
         "python",
         "--stats-refresh",
@@ -76,9 +98,10 @@ def test_single_turn_prompt(sera_manifest: Path) -> None:
     proc = subprocess.run(script, capture_output=True, text=True, env=env, check=True)
     assert "Loaded Sera manifest" in proc.stdout
     assert "Enabled tools: python" in proc.stdout
-    assert "Sera" in proc.stdout
-    assert "A" in proc.stdout
-    assert "[diag g=" in proc.stdout
+    assert "Loaded 1 arrays" in proc.stdout
+    assert "Sera: hello" in proc.stdout
+    assert "Logit y_out:" in proc.stdout
+    assert "tokens/sec=" in proc.stdout
 
 
 def test_manifest_env_fallback(sera_manifest: Path) -> None:
@@ -99,8 +122,8 @@ def test_manifest_env_fallback(sera_manifest: Path) -> None:
     }
     proc = subprocess.run(script, capture_output=True, text=True, env=env, check=True)
     assert "Enabled tools: none" in proc.stdout
-    assert "Sera" in proc.stdout
-    assert "[diag g=" in proc.stdout
+    assert "Sera: ping" in proc.stdout
+    assert "tokens/sec=" in proc.stdout
 
 
 def test_dashboard_formatter_snapshot() -> None:
@@ -141,7 +164,7 @@ def test_dashboard_formatter_snapshot() -> None:
         verbose=True,
     )
     expected = (
-        "[diag g=3] turn_tokens=6 total_emitted=42 bridge=7/3 (0.70) "
+        "[diag g=3] turn_tokens=6 tokens/sec=n/a total_emitted=42 bridge=7/3 (0.70) "
         "p99(store/stash/kick)=0.93/0.12/2.50 trust=1 (consistent=False) llr=0.12 "
         "capacity(load/slack/margin)=0.40/0.60/0.10 frozen=True\n"
         "  attention: updates=11 clip=0.33 min_den=0.02 lambda*=0.90 tree_sims=5\n"
