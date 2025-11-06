@@ -276,6 +276,8 @@ an interactive chat session is:
 git clone https://github.com/openai/gpt-oss.git
 cd gpt-oss
 pip install -e .
+pip install huggingface-hub  # provides huggingface_hub.snapshot_download
+huggingface-cli login        # if you have not authenticated this machine yet
 python tools/sera_quickstart.py --chat
 ```
 
