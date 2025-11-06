@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
-from gpt_oss.tools import sera_transfer
+from . import sera_transfer
 
 DEFAULT_REPO_ID = "openai/gpt-oss-20b"
 DEFAULT_DOWNLOAD_DIR = Path("gpt-oss-20b")
