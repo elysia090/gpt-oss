@@ -607,6 +607,9 @@ The repository ships with a Sera Transfer tool that deterministically converts a
 checkpoint into the [Sera runtime](docs/specs/Sera-Transfer.txt) artefacts and a
 companion chat CLI for quick experiments.
 
+Before running the converter make sure the optional dependencies are installed,
+for example via `pip install "gpt-oss[torch]"` or `pip install safetensors`.
+
 1. Convert the original model (example for `gpt-oss-20b`):
 
    ```bash

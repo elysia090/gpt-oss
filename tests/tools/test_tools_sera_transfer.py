@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import builtins
+import importlib
 import hashlib
 import json
 import os
@@ -100,6 +102,36 @@ def _create_openai_checkpoint(root: Path) -> Path:
     tensors["tok_embeddings.weight"] = _create_matrix(config["vocab_size"], config["d_model"], rng)
     save_file(tensors, source / "model.safetensors")
     return source
+
+
+def test_load_tensors_requires_safetensors(monkeypatch):
+    for name in list(sys.modules):
+        if name == "safetensors" or name.startswith("safetensors."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+
+    module_name = "gpt_oss.tools.sera_transfer"
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    original_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "safetensors" or name.startswith("safetensors."):
+            raise ModuleNotFoundError("No module named 'safetensors'")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    module = importlib.import_module(module_name)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        module.load_tensors(Path("/tmp/nonexistent.safetensors"))
+
+    message = str(excinfo.value)
+    assert "pip install safetensors" in message
+
+    monkeypatch.undo()
+    sys.modules[module_name] = module
+    importlib.reload(module)
 
 
 def test_model_config_accepts_hf_config_fields() -> None:
