@@ -1,7 +1,7 @@
 import datetime
 import asyncio
 
-from gpt_oss.tokenizer import get_tokenizer
+from gpt_oss.core.tokenization import get_tokenizer
 
 from openai_harmony import (
     Conversation,

@@ -14,7 +14,7 @@ import sys
 from types import ModuleType
 from typing import Dict, Iterable, Optional
 
-_TARGET_PACKAGE = "gpt_oss.api.responses"
+_TARGET_PACKAGE = "gpt_oss.interfaces.api.responses"
 
 # Submodules that existed in the legacy layout.  They are exposed lazily
 # so ``import gpt_oss.responses_api.<name>`` continues to work.
