@@ -5,6 +5,7 @@ description = "A collection of reference inference implementations for gpt-oss b
 dependencies = [
   "openai-harmony",
   "tiktoken>=0.9.0",
+  "huggingface-hub>=0.26.0",
   "aiohttp>=3.12.14",
   "chz>=0.3.0",
   "docker>=7.1.0",

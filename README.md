@@ -264,6 +264,26 @@ git clone https://github.com/openai/gpt-oss.git
 GPTOSS_BUILD_METAL=1 pip install -e ".[metal]"
 ```
 
+### Quickstart: Sera terminal chat
+
+To experiment with the lightweight Sera runtime without juggling multiple
+commands you can use the `tools/sera_quickstart.py` helper. The script requires
+Python 3.12, `pip`, and access to the Hugging Face Hub (run `huggingface-cli
+login` beforehand if necessary). A minimal sequence from an empty directory to
+an interactive chat session is:
+
+```shell
+git clone https://github.com/openai/gpt-oss.git
+cd gpt-oss
+pip install -e .
+python tools/sera_quickstart.py --chat
+```
+
+The helper downloads `openai/gpt-oss-20b`, stages Sera artefacts under
+`./gpt-oss-sera-20b`, and launches the `gpt-oss-sera-chat` CLI. Pass `--force-clean`
+to remove any previous downloads or `--chat-arg --tool --chat-arg python` to
+enable optional tools in the chat session.
+
 ## Download the model
 
 You can download the model weights from the [Hugging Face Hub](https://huggingface.co/collections/openai/gpt-oss-68911959590a1634ba11c7a4) directly from Hugging Face CLI:
@@ -361,6 +381,10 @@ We also include two system tools for the model: browsing and python container. C
 ### Terminal Chat
 
 The terminal chat application is a basic example of how to use the harmony format together with the PyTorch, Triton, and vLLM implementations. It also exposes both the python and browser tool as optional tools that can be used.
+
+If you just want to try the Sera runtime, run the quickstart helper described in
+[Quickstart: Sera terminal chat](#quickstart-sera-terminal-chat). It handles the
+download, conversion, and launches `gpt-oss-sera-chat` for you.
 
 ```bash
 usage: python -m gpt_oss.cli.chat_cli [-h] [-r REASONING_EFFORT] [-a] [-b] [--show-browser-results] [-p] [--developer-message DEVELOPER_MESSAGE] [-c CONTEXT] [--raw] [--backend {triton,torch,vllm}] FILE
