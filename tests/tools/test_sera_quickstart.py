@@ -10,20 +10,35 @@ from pathlib import Path
 from typing import Sequence
 
 ROOT = Path(__file__).resolve().parents[2]
+SRC = ROOT / "src"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
+sys.modules.pop("safetensors", None)
+sys.modules.pop("safetensors.numpy", None)
+
+_safetensors_spec = importlib.util.spec_from_file_location(
+    "safetensors", ROOT / "safetensors" / "__init__.py"
+)
+assert _safetensors_spec is not None and _safetensors_spec.loader is not None
+_safetensors_module = importlib.util.module_from_spec(_safetensors_spec)
+sys.modules["safetensors"] = _safetensors_module
+_safetensors_spec.loader.exec_module(_safetensors_module)
+
+import gpt_oss.tools.sera_quickstart as quickstart
 import pytest
-from safetensors.numpy import save_file
 
-
-def _load_quickstart_module():
-    module_path = ROOT / "tools" / "sera_quickstart.py"
-    spec = importlib.util.spec_from_file_location("sera_quickstart", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+_safetensors_numpy_spec = importlib.util.spec_from_file_location(
+    "safetensors.numpy", ROOT / "safetensors" / "numpy.py"
+)
+assert _safetensors_numpy_spec is not None and _safetensors_numpy_spec.loader is not None
+_safetensors_numpy = importlib.util.module_from_spec(_safetensors_numpy_spec)
+sys.modules.setdefault("safetensors.numpy", _safetensors_numpy)
+_safetensors_numpy_spec.loader.exec_module(_safetensors_numpy)
+save_file = _safetensors_numpy.save_file
+quickstart.sera_transfer.safe_open = _safetensors_module.safe_open  # type: ignore[attr-defined]
 
 
 def _create_matrix(rows: int, cols: int, rng: random.Random) -> list[list[float]]:
@@ -74,8 +89,6 @@ def _create_checkpoint(tmp_path: Path) -> Path:
 
 @pytest.mark.parametrize("launch_chat", [False, True])
 def test_quickstart_pipeline(tmp_path: Path, monkeypatch, launch_chat: bool) -> None:
-    quickstart = _load_quickstart_module()
-
     checkpoint_dir = _create_checkpoint(tmp_path)
     download_dir = tmp_path / "download"
     output_dir = tmp_path / "sera"
@@ -141,8 +154,6 @@ def test_quickstart_pipeline(tmp_path: Path, monkeypatch, launch_chat: bool) -> 
 
 
 def test_quickstart_missing_checkpoint(tmp_path: Path, capsys) -> None:
-    quickstart = _load_quickstart_module()
-
     argv = [
         "--checkpoint-dir",
         str(tmp_path / "missing"),
