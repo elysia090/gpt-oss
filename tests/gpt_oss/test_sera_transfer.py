@@ -38,7 +38,7 @@ def patch_conversion_dependencies(monkeypatch):
     )
     dummy_cfg = SimpleNamespace(d_model=16, vocab_size=8, layers=[dummy_layer])
 
-    def fake_from_dict(data):  # noqa: ARG001 - signature kept for compatibility
+    def fake_from_dict(data, tensors=None):  # noqa: ARG001 - signature kept for compatibility
         return dummy_cfg
 
     monkeypatch.setattr(sera_transfer.ModelConfig, "from_dict", staticmethod(fake_from_dict))
@@ -126,7 +126,7 @@ def test_convert_finds_files_in_original(tmp_path: Path, monkeypatch):
     )
     dummy_cfg = SimpleNamespace(d_model=16, vocab_size=8, layers=[dummy_layer])
 
-    def fake_from_dict(data):  # noqa: ARG001 - compatibility with signature
+    def fake_from_dict(data, tensors=None):  # noqa: ARG001 - compatibility with signature
         captured_config["data"] = data
         return dummy_cfg
 
@@ -174,7 +174,7 @@ def test_convert_honours_original_subdir(tmp_path: Path, monkeypatch):
     )
     dummy_cfg = SimpleNamespace(d_model=16, vocab_size=8, layers=[dummy_layer])
 
-    def fake_from_dict(data):  # noqa: ARG001 - compatibility with signature
+    def fake_from_dict(data, tensors=None):  # noqa: ARG001 - compatibility with signature
         captured_config["data"] = data
         return dummy_cfg
 
