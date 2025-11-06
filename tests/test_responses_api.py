@@ -2,14 +2,17 @@ import time
 
 import pytest
 from fastapi.testclient import TestClient
-from openai_harmony import (
-    HarmonyEncodingName,
-    load_harmony_encoding,
-)
+from openai_harmony import HarmonyEncodingName, HarmonyError, load_harmony_encoding
 
 from gpt_oss.api.responses.api_server import create_api_server
 
-encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+try:
+    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+except HarmonyError:  # pragma: no cover - offline environments
+    encoding = None
+
+if encoding is None:  # pragma: no cover - offline environments
+    pytest.skip("Harmony encoding unavailable", allow_module_level=True)
 
 fake_tokens = encoding.encode(
     "<|channel|>final<|message|>Hey there<|return|>", allowed_special="all"
@@ -31,6 +34,8 @@ def stub_infer_next_token(
 
 @pytest.fixture
 def test_client():
+    if encoding is None:
+        pytest.skip("Harmony encoding unavailable")
     return TestClient(
         create_api_server(infer_next_token=stub_infer_next_token, encoding=encoding)
     )
