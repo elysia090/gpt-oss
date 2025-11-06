@@ -267,9 +267,9 @@ GPTOSS_BUILD_METAL=1 pip install -e ".[metal]"
 ### Quickstart: Sera terminal chat
 
 The [Sera runtime](docs/sera.md) ships with an interactive terminal client that
-can be launched via the `tools/sera_quickstart.py` helper. This script wraps the
-common setup steps—downloading model weights, preparing the runtime artefacts,
-and invoking the chat CLI—so you can focus on testing the experience.
+can be launched via the `tools/sera_quickstart.py` helper. The helper downloads
+the published checkpoint, prepares the lightweight Sera artefacts, and finally
+invokes the chat experience so you land directly in an interactive session.
 
 **Prerequisites**
 
@@ -278,6 +278,9 @@ and invoking the chat CLI—so you can focus on testing the experience.
   login`)
 - An environment able to install the project in editable mode (build tools,
   virtual environment, etc.)
+- [`prompt_toolkit`](https://python-prompt-toolkit.readthedocs.io/) for the TUI
+  (`pip install prompt_toolkit`). Without it the helper falls back to the plain
+  text interface.
 
 **Run the helper**
 
@@ -286,20 +289,36 @@ git clone https://github.com/elysia/gpt-oss.git
 cd gpt-oss
 python -m venv .venv && source .venv/bin/activate  # optional but recommended
 pip install -e .
-pip install huggingface-hub  # provides huggingface_hub.snapshot_download
-huggingface-cli login        # skip if this machine is already authenticated
+pip install huggingface-hub prompt_toolkit  # runtime + TUI dependency
+huggingface-cli login                       # skip if this machine is already authenticated
 python tools/sera_quickstart.py --chat
 ```
 
-By default the script downloads `openai/gpt-oss-20b`, caches the Sera artefacts
-under `./gpt-oss-sera-20b`, and launches the `gpt-oss-sera-chat` CLI. Useful
-options include:
+The command downloads `openai/gpt-oss-20b`, caches the Sera artefacts under
+`./gpt-oss-sera-20b`, and launches the default **Sera terminal UI (TUI)**. When
+the UI opens you will see three panels:
 
-- `--force-clean` — delete any cached artefacts before downloading
-- `--chat-arg --tool --chat-arg python` — enable the Python tool inside the
-  chat session
-- `--chat-arg --metrics --chat-arg plain` — stream trust decisions and latency
-  diagnostics in plain text (use `json` for structured logs)
+- **Conversation** — the running transcript of the chat session.
+- **Operations** — currently enabled tools, hotkeys, and manifest metadata.
+- **Diagnostics** — live metrics refreshed according to `--stats-refresh`.
+
+Key bindings that are always available in the TUI include:
+
+| Key      | Action |
+|----------|--------|
+| `F2`, `F3` | Toggle optional tools (`browser`, `python`) |
+| `F9`     | Print manifest metadata into the transcript |
+| `F10`    | Export the latest diagnostics snapshot to `sera_diagnostics_*.json` |
+| `Ctrl+C` / `Esc` | Exit the session |
+
+Need to tweak the session? The helper forwards arguments with repeated
+`--chat-arg` flags. Popular combinations are:
+
+- `--force-clean` — delete any cached artefacts before downloading.
+- `--chat-arg --tool --chat-arg python` — pre-enable the Python tool.
+- `--chat-arg --metrics --chat-arg plain` — show per-turn metrics in the
+  transcript (use `json` for structured logs).
+- `--chat-arg --plain` — skip the TUI entirely and stay in the legacy prompt.
 
 Run `python tools/sera_quickstart.py --help` for the full list of supported
 flags and environment variables.
