@@ -266,64 +266,37 @@ GPTOSS_BUILD_METAL=1 pip install -e ".[metal]"
 
 ### Quickstart: Sera terminal chat
 
-The [Sera runtime](docs/sera.md) ships with an interactive terminal client that
-is now exposed as the `gpt-oss-sera-quickstart` console script. The helper
-downloads the published checkpoint, prepares the lightweight Sera artefacts, and
-finally invokes the chat experience so you land directly in an interactive
-session with minimal ceremony.
+The [Sera runtime](docs/sera.md) includes a full-featured terminal interface
+exposed through the `gpt-oss-sera-quickstart` console script. The helper takes
+care of downloading the published checkpoint, preparing the lightweight Sera
+artefacts, and starting an interactive session for you.
 
-#### One-command launch (recommended)
+Follow the manual setup below to install the helper and launch the chat from a
+local environment.
 
-Copy/paste the following one-liner and you will land straight in the terminal
-chat after the assets download:
+#### Working from a local checkout
 
-```shell
-# Replace hf_************************ with your Hugging Face token. You can also
-# export HUGGING_FACE_HUB_TOKEN ahead of time or rely on `huggingface-cli login`.
-HUGGING_FACE_HUB_TOKEN=hf_************************ pipx run --spec gpt-oss gpt-oss-sera-quickstart --chat
-```
+Follow the manual setup if you intend to clone the repository, make local
+changes, or control the virtual environment explicitly.
 
-- `pipx run` creates (or reuses) an isolated environment for `gpt-oss`, installs
-  the package if necessary, and immediately executes `gpt-oss-sera-quickstart`.
-- Inline the `HUGGING_FACE_HUB_TOKEN` environment variable so the helper can
-  authenticate with Hugging Face during the download.
-- The first run prints messages such as `Downloading openai/gpt-oss-20b...` and
-  `Sera artefacts written to ./gpt-oss-sera-20b`. Expect the checkpoint to land
-  in `./gpt-oss-20b` and the converted artefacts in `./gpt-oss-sera-20b` next to
-  the directory where you launched the command. Subsequent invocations reuse
-  these directories unless `--force-clean` is provided.
-- `pipx` keeps its transient virtual environment under
-  `~/.local/pipx/venvs/gpt-oss`, so rerunning the command does not reinstall the
-  package.
+##### Prerequisites
 
-Prefer `uvx`? Swap the prefix for `uvx gpt-oss-sera-quickstart --chat` (and pass
-through `HUGGING_FACE_HUB_TOKEN` the same way) to get the same experience with
-`uv`'s runner.
-
-#### Advanced/manual setup
-
-Follow these steps if you want to clone the repository, work from a local
-checkout, or customise the environment.
-
-##### Prerequisites checklist
-
-Make sure the following are ready before you run the helper:
+Confirm the following before you begin:
 
 - Python **3.12** (or newer) with `pip` available on your `$PATH`.
-- A Hugging Face account with an access token stored locally
-  (`huggingface-cli login`). First-time users can create a token from the
-  [Hugging Face settings page](https://huggingface.co/settings/tokens).
-- A development environment able to build wheels (virtual environment,
+- A Hugging Face access token stored locally (`huggingface-cli login`). Tokens
+  can be generated from the [Hugging Face settings
+  page](https://huggingface.co/settings/tokens).
+- A development environment capable of building wheels (virtual environment,
   compiler toolchain, `git`, etc.).
-- [`prompt_toolkit`](https://python-prompt-toolkit.readthedocs.io/) if you want
-  the rich TUI. Without it the helper gracefully falls back to a plain-text
+- [`prompt_toolkit`](https://python-prompt-toolkit.readthedocs.io/) for the
+  richer terminal UI. Without it the helper gracefully falls back to a plain
   prompt.
 
-> **Tip:** When running on a shared machine, create a dedicated virtual
-> environment so that the editable install and auxiliary dependencies remain
-> isolated.
+> **Tip:** On shared machines, create a dedicated virtual environment so the
+> editable install and helper dependencies remain isolated.
 
-##### 1. Clone and set up the project
+##### Step 1 — clone and install
 
 ```shell
 git clone https://github.com/elysia/gpt-oss.git
@@ -334,42 +307,41 @@ pip install huggingface-hub prompt_toolkit         # runtime + TUI dependency
 huggingface-cli login                              # skip if already authenticated
 ```
 
-##### 2. Launch the chat experience
+##### Step 2 — start the chat
 
 ```shell
 gpt-oss-sera-quickstart --chat
 ```
 
-On the first run the command downloads `openai/gpt-oss-20b`, caches the Sera
-artefacts under `./gpt-oss-sera-20b`, and launches the default **Sera terminal
-UI (TUI)**. Subsequent runs reuse the cached artefacts unless you request a
-clean start.
+The first invocation downloads `openai/gpt-oss-20b`, caches the Sera artefacts
+under `./gpt-oss-sera-20b`, and opens the default **Sera terminal UI (TUI)**.
+Later runs reuse the cached artefacts unless you request a clean slate.
 
-When the TUI opens you will see three panels:
+When the TUI appears it presents three panels:
 
-- **Conversation** — the running transcript of the chat session.
-- **Operations** — currently enabled tools, hotkeys, and manifest metadata.
-- **Diagnostics** — live metrics refreshed according to `--stats-refresh`.
+- **Conversation** – running transcript of the session.
+- **Operations** – enabled tools, hotkeys, and manifest metadata.
+- **Diagnostics** – live metrics refreshed according to `--stats-refresh`.
 
-Key bindings that are always available in the TUI include:
+Common key bindings include:
 
-| Key        | Action |
-|------------|--------|
-| `F2`, `F3` | Toggle optional tools (`browser`, `python`) |
-| `F9`       | Print manifest metadata into the transcript |
-| `F10`      | Export the latest diagnostics snapshot to `sera_diagnostics_*.json` |
+| Key            | Action |
+|----------------|--------|
+| `F2`, `F3`     | Toggle optional tools (`browser`, `python`) |
+| `F9`           | Print manifest metadata into the transcript |
+| `F10`          | Export the latest diagnostics snapshot to `sera_diagnostics_*.json` |
 | `Ctrl+C` / `Esc` | Exit the session |
 
-#### Power-user flags
+#### Additional flags
 
-Need to tweak the session? Pass repeated `--chat-arg` flags to forward options
-directly to the chat CLI. Popular combinations include:
+You can forward arguments directly to the chat CLI with repeated `--chat-arg`
+flags. Common examples:
 
-- `--force-clean` — delete any cached artefacts before downloading.
+- `--force-clean` — delete cached artefacts before downloading.
 - `--chat-arg --tool --chat-arg python` — pre-enable the Python tool.
 - `--chat-arg --metrics --chat-arg plain` — show per-turn metrics in the
   transcript (use `json` for structured logs).
-- `--chat-arg --plain` — skip the TUI entirely and stay in the legacy prompt.
+- `--chat-arg --plain` — skip the TUI and stay in the legacy prompt.
 
 Run `python tools/sera_quickstart.py --help` for the full list of supported
 flags and environment variables.
