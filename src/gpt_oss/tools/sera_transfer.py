@@ -7,6 +7,8 @@ import hashlib
 import importlib.util
 import io
 import json
+import logging
+import os
 import pickle
 import math
 import struct
@@ -74,6 +76,9 @@ def _config_to_dict(config):
     if isinstance(config, (list, tuple)):
         return [_config_to_dict(value) for value in config]
     return config
+
+logger = logging.getLogger(__name__)
+
 
 __all__ = [
     "ArrayHeader",
@@ -1300,6 +1305,7 @@ def convert(
     r_v: int = 8,
     top_l: int = 8,
     original_subdir: str | Path | None = None,
+    verbose: bool = False,
 ) -> None:
     """Convert a checkpoint directory into a Sera Transfer Kit artefact.
 
@@ -1310,6 +1316,16 @@ def convert(
     explicit ``original_subdir`` to search an arbitrary additional location.
     """
 
+    source = source.resolve()
+    output = output.resolve()
+
+    if verbose and not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO)
+
+    if verbose:
+        logger.info("Resolved source path: %s", source)
+        logger.info("Resolved output path: %s", output)
+
     search_roots: List[Path] = []
 
     def add_root(candidate: Path | str) -> None:
@@ -1318,6 +1334,8 @@ def convert(
             path = source / path
         if path not in search_roots:
             search_roots.append(path)
+            if verbose:
+                logger.info("Registered search root: %s", path)
 
     add_root(source)
     if original_subdir is not None:
@@ -1334,144 +1352,173 @@ def convert(
     def find_file(filename: str) -> Path:
         for root in search_roots:
             candidate = root / filename
+            if verbose:
+                logger.info("Probing %s", candidate)
             if candidate.exists():
+                if verbose:
+                    logger.info("Located %s at %s", filename, candidate)
                 return candidate
         search_list = ", ".join(str(root) for root in search_roots)
-        raise FileNotFoundError(
-            f"Unable to locate {filename!r}; searched: {search_list or source}"
-        )
+        message = f"Unable to locate {filename!r}; searched: {search_list or source}"
+        if verbose:
+            logger.error(message)
+        raise FileNotFoundError(message)
 
-    config_path = find_file("config.json")
-    model_path = find_file("model.safetensors")
-    config_data = json.loads(config_path.read_text())
-    tensors = load_tensors(model_path)
-    cfg = ModelConfig.from_dict(config_data, tensors=tensors)
+    def _convert_inner() -> None:
+        config_path = find_file("config.json")
+        model_path = find_file("model.safetensors")
+        if verbose:
+            logger.info("Reading model configuration from %s", config_path)
+        config_data = json.loads(config_path.read_text())
+        if verbose and isinstance(config_data, dict):
+            config_keys = ", ".join(sorted(config_data)) or "<none>"
+            logger.info("Model config keys: %s", config_keys)
+        tensors = load_tensors(model_path)
+        cfg = ModelConfig.from_dict(config_data, tensors=tensors)
 
-    r = min(r, cfg.d_model)
-    r_v = min(r_v, r)
+        local_r = min(r, cfg.d_model)
+        local_r_v = min(r_v, local_r)
 
-    arrays_dir = output / "arrays"
-    arrays_dir.mkdir(parents=True, exist_ok=True)
+        arrays_dir = output / "arrays"
+        arrays_dir.mkdir(parents=True, exist_ok=True)
 
-    artefact_payloads: Dict[str, bytes] = {}
-    artefact_records: Dict[str, Dict[str, object]] = {}
-    metadata: Dict[str, object] = {}
+        artefact_payloads: Dict[str, bytes] = {}
+        artefact_records: Dict[str, Dict[str, object]] = {}
+        metadata: Dict[str, object] = {}
 
-    def store_array(name: str, data, dtype: str) -> None:
-        path = arrays_dir / f"{name}.bin"
-        payload = write_array(path, data, dtype)
-        artefact_payloads[name] = payload
-        artefact_records[name] = {
-            "path": str(path),
-            "dtype": dtype,
-            "shape": _infer_shape(data),
-            "sha256": hashlib.sha256(payload).hexdigest(),
+        def store_array(name: str, data, dtype: str) -> None:
+            path = arrays_dir / f"{name}.bin"
+            payload = write_array(path, data, dtype)
+            artefact_payloads[name] = payload
+            artefact_records[name] = {
+                "path": str(path),
+                "dtype": dtype,
+                "shape": _infer_shape(data),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+
+        tokenizer_data, tokenizer_meta = tokenizer_arrays(cfg, tensors)
+        for name, data in tokenizer_data.items():
+            store_array(name, data, "u8")
+        metadata["tokenizer"] = tokenizer_meta
+
+        prf = compute_prf(cfg, tensors, local_r)
+        for name, data in prf.items():
+            store_array(name, data, "f32")
+        metadata["attention"] = {
+            "features": local_r,
+            "tau": getattr(cfg, "tau", 1.0),
+            "whitening_sig2": prf.get("whitening_sig2", []),
         }
 
-    tokenizer_data, tokenizer_meta = tokenizer_arrays(cfg, tensors)
-    for name, data in tokenizer_data.items():
-        store_array(name, data, "u8")
-    metadata["tokenizer"] = tokenizer_meta
+        overlays = compute_overlays(cfg, tensors, local_r, local_r_v)
+        for name, data in overlays.items():
+            store_array(name, data, "f32")
+        metadata["overlays"] = {
+            "rank": local_r,
+            "rank_value": local_r_v,
+            "rows": len(overlays.get("overlays_H", [])),
+            "cols": len(overlays.get("overlays_U", [])),
+        }
 
-    prf = compute_prf(cfg, tensors, r)
-    for name, data in prf.items():
-        store_array(name, data, "f32")
-    metadata["attention"] = {
-        "features": r,
-        "tau": getattr(cfg, "tau", 1.0),
-        "whitening_sig2": prf.get("whitening_sig2", []),
-    }
+        linear_data, linear_meta = collapse_ffn(cfg, tensors, top_l)
+        store_array("linear_mphf", linear_data["linear_mphf"], "u8")
+        store_array("linear_keys", linear_data["linear_keys"], "u8")
+        store_array("linear_weights", linear_data["linear_weights"], "f32")
+        store_array("linear_bias", linear_data["linear_bias"], "f32")
+        store_array("cuckoo_delta", linear_data["cuckoo_delta"], "u8")
+        metadata["linear"] = linear_meta
 
-    overlays = compute_overlays(cfg, tensors, r, r_v)
-    for name, data in overlays.items():
-        store_array(name, data, "f32")
-    metadata["overlays"] = {
-        "rank": r,
-        "rank_value": r_v,
-        "rows": len(overlays.get("overlays_H", [])),
-        "cols": len(overlays.get("overlays_U", [])),
-    }
+        memory_data, memory_meta = memory_coefficients(cfg)
+        store_array("memory_coeff", memory_data["memory_coeff"], "f64")
+        store_array("delaybuf_init", memory_data["delaybuf_init"], "f32")
+        metadata["memory"] = memory_meta
 
-    linear_data, linear_meta = collapse_ffn(cfg, tensors, top_l)
-    store_array("linear_mphf", linear_data["linear_mphf"], "u8")
-    store_array("linear_keys", linear_data["linear_keys"], "u8")
-    store_array("linear_weights", linear_data["linear_weights"], "f32")
-    store_array("linear_bias", linear_data["linear_bias"], "f32")
-    store_array("cuckoo_delta", linear_data["cuckoo_delta"], "u8")
-    metadata["linear"] = linear_meta
+        bridge_data, bridge_meta = bridge_records(cfg, tensors, cfg.vocab_size)
+        store_array("bridge_hubs", bridge_data["bridge_hubs"], "u8")
+        store_array("bridge_qDin", bridge_data["bridge_qDin"], "i16")
+        store_array("bridge_qDout", bridge_data["bridge_qDout"], "i16")
+        store_array("peer_scores", bridge_data["peer_scores"], "i16")
+        metadata["bridge"] = bridge_meta
 
-    memory_data, memory_meta = memory_coefficients(cfg)
-    store_array("memory_coeff", memory_data["memory_coeff"], "f64")
-    store_array("delaybuf_init", memory_data["delaybuf_init"], "f32")
-    metadata["memory"] = memory_meta
+        write_manifest(
+            output / "sera_manifest.bin",
+            cfg,
+            artefact_payloads,
+            r=local_r,
+            r_v=local_r_v,
+            vocab_size=cfg.vocab_size or 16,
+        )
 
-    bridge_data, bridge_meta = bridge_records(cfg, tensors, cfg.vocab_size)
-    store_array("bridge_hubs", bridge_data["bridge_hubs"], "u8")
-    store_array("bridge_qDin", bridge_data["bridge_qDin"], "i16")
-    store_array("bridge_qDout", bridge_data["bridge_qDout"], "i16")
-    store_array("peer_scores", bridge_data["peer_scores"], "i16")
-    metadata["bridge"] = bridge_meta
+        sera_cls, sera_config_cls = _load_sera_runtime()
+        try:
+            base_config = sera_config_cls()
+        except Exception:  # pragma: no cover - extremely defensive
+            base_config = None
 
-    write_manifest(output / "sera_manifest.bin", cfg, artefact_payloads, r=r, r_v=r_v, vocab_size=cfg.vocab_size or 16)
+        if base_config is not None and dataclasses.is_dataclass(base_config):
+            pieces = tokenizer_meta.get("pieces", [])
+            tokenizer_vocab = {piece: token for piece, token in pieces}
+            max_piece_length = tokenizer_meta.get(
+                "max_piece_length", base_config.tokenizer.max_piece_length
+            )
+            tokenizer_config = dataclasses.replace(
+                base_config.tokenizer,
+                vocabulary=tokenizer_vocab,
+                max_piece_length=max_piece_length,
+            )
+            whitening_sig2 = metadata["attention"].get("whitening_sig2") or [1.0]
+            beta_floor = max(1e-3, min(float(value) for value in whitening_sig2))
+            value_dim = len(overlays.get("overlays_U", [])) or cfg.d_model
+            attention_config = dataclasses.replace(
+                base_config.attention,
+                dim=cfg.d_model,
+                value_dim=value_dim,
+                features=local_r,
+                tau=getattr(cfg, "tau", base_config.attention.tau),
+                beta_floor=beta_floor,
+            )
+            linear_capacity = max(
+                len(linear_meta.get("keys", [])), base_config.linear.capacity
+            )
+            linear_config = dataclasses.replace(base_config.linear, capacity=linear_capacity)
+            bridge_config = dataclasses.replace(
+                base_config.bridge,
+                hub_window=max(
+                    base_config.bridge.hub_window, bridge_meta.get("legs", 0) * 4
+                ),
+            )
+            sera_config = dataclasses.replace(
+                base_config,
+                tokenizer=tokenizer_config,
+                attention=attention_config,
+                linear=linear_config,
+                bridge=bridge_config,
+            )
+            sera_model = sera_cls(sera_config)
+            runtime_snapshot = sera_model.snapshot()
+        else:
+            config_instance = base_config if base_config is not None else object()
+            sera_model = sera_cls(config_instance)
+            runtime_snapshot = sera_model.snapshot()
 
-    sera_cls, sera_config_cls = _load_sera_runtime()
+        snapshot_path = output / "sera_state.pkl"
+        snapshot = {
+            "model_config": _config_to_dict(cfg),
+            "artefacts": artefact_records,
+            "metadata": metadata,
+            "manifest_path": str(output / "sera_manifest.bin"),
+            "sera_snapshot": runtime_snapshot,
+        }
+        with snapshot_path.open("wb") as fh:
+            pickle.dump(snapshot, fh)
+
     try:
-        base_config = sera_config_cls()
-    except Exception:  # pragma: no cover - extremely defensive
-        base_config = None
-
-    if base_config is not None and dataclasses.is_dataclass(base_config):
-        pieces = tokenizer_meta.get("pieces", [])
-        tokenizer_vocab = {piece: token for piece, token in pieces}
-        max_piece_length = tokenizer_meta.get(
-            "max_piece_length", base_config.tokenizer.max_piece_length
-        )
-        tokenizer_config = dataclasses.replace(
-            base_config.tokenizer,
-            vocabulary=tokenizer_vocab,
-            max_piece_length=max_piece_length,
-        )
-        whitening_sig2 = metadata["attention"].get("whitening_sig2") or [1.0]
-        beta_floor = max(1e-3, min(float(value) for value in whitening_sig2))
-        value_dim = len(overlays.get("overlays_U", [])) or cfg.d_model
-        attention_config = dataclasses.replace(
-            base_config.attention,
-            dim=cfg.d_model,
-            value_dim=value_dim,
-            features=r,
-            tau=getattr(cfg, "tau", base_config.attention.tau),
-            beta_floor=beta_floor,
-        )
-        linear_capacity = max(len(linear_meta.get("keys", [])), base_config.linear.capacity)
-        linear_config = dataclasses.replace(base_config.linear, capacity=linear_capacity)
-        bridge_config = dataclasses.replace(
-            base_config.bridge,
-            hub_window=max(base_config.bridge.hub_window, bridge_meta.get("legs", 0) * 4),
-        )
-        sera_config = dataclasses.replace(
-            base_config,
-            tokenizer=tokenizer_config,
-            attention=attention_config,
-            linear=linear_config,
-            bridge=bridge_config,
-        )
-        sera_model = sera_cls(sera_config)
-        runtime_snapshot = sera_model.snapshot()
-    else:
-        config_instance = base_config if base_config is not None else object()
-        sera_model = sera_cls(config_instance)
-        runtime_snapshot = sera_model.snapshot()
-
-    snapshot_path = output / "sera_state.pkl"
-    snapshot = {
-        "model_config": _config_to_dict(cfg),
-        "artefacts": artefact_records,
-        "metadata": metadata,
-        "manifest_path": str(output / "sera_manifest.bin"),
-        "sera_snapshot": runtime_snapshot,
-    }
-    with snapshot_path.open("wb") as fh:
-        pickle.dump(snapshot, fh)
+        _convert_inner()
+    except (ValueError, RuntimeError, FileNotFoundError) as exc:
+        if verbose:
+            logger.error("Conversion failed: %s", exc)
+        raise
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1487,11 +1534,36 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional subdirectory that contains config.json and model.safetensors",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--verbose",
+        dest="verbose",
+        action="store_true",
+        default=None,
+        help="Enable verbose logging (can also set SERA_TRANSFER_VERBOSE=1)",
+    )
+    parser.add_argument(
+        "--quiet",
+        dest="verbose",
+        action="store_false",
+        help="Disable verbose logging",
+    )
+
+    args = parser.parse_args(argv)
+
+    if args.verbose is None:
+        env_value = os.environ.get("SERA_TRANSFER_VERBOSE")
+        if env_value is None:
+            args.verbose = False
+        else:
+            args.verbose = env_value.lower() not in {"", "0", "false", "no"}
+
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
+    if args.verbose:
+        logging.basicConfig(level=logging.INFO)
     convert(
         args.source,
         args.output,
@@ -1499,6 +1571,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         r_v=args.rv,
         top_l=args.topL,
         original_subdir=args.original_subdir,
+        verbose=args.verbose,
     )
 
 
