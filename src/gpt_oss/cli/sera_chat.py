@@ -79,6 +79,29 @@ def _format_int(value: Optional[object]) -> str:
         return "0"
 
 
+def _coerce_number(value: Optional[object]) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):  # pragma: no cover - defensive fallback
+        return None
+
+
+def _format_metrics_line(metrics: Mapping[str, object]) -> str:
+    latency = _format_float(metrics.get("latency_ms"))
+    tokens_per_sec = _format_float(metrics.get("tokens_per_sec"))
+    trust_decision = metrics.get("trust_decision", 0)
+    trust_llr = _format_float(metrics.get("trust_llr"))
+    turn_tokens = _format_int(metrics.get("turn_tokens"))
+    return (
+        f"[metrics] latency_ms={latency} tokens/sec={tokens_per_sec} "
+        f"trust={trust_decision} llr={trust_llr} turn_tokens={turn_tokens}"
+    )
+
+
 def _format_dashboard(
     diagnostics: Mapping[str, object],
     *,
@@ -95,6 +118,7 @@ def _format_dashboard(
     trust_consistent = diagnostics.get("trust_consistent", True)
     trust_llr = diagnostics.get("trust_llr", 0.0)
     tokens_emitted = diagnostics.get("tokens_emitted", 0)
+    latency_ms = diagnostics.get("latency_ms")
     store_p99 = diagnostics.get("store_load_p99")
     stash_p99 = diagnostics.get("stash_occ_p99")
     kick_p99 = diagnostics.get("kick_len_p99")
@@ -108,6 +132,7 @@ def _format_dashboard(
     summary = (
         f"[diag g={generation}] turn_tokens={turn_tokens} "
         f"tokens/sec={_format_float(tokens_per_sec)} "
+        f"latency_ms={_format_float(latency_ms)} "
         f"total_emitted={_format_int(tokens_emitted)} "
         f"bridge={bridge_hits}/{bridge_misses} ({_format_float(bridge_guard)}) "
         f"p99(store/stash/kick)={_format_float(store_p99)}/"
@@ -389,6 +414,8 @@ def _run_turn(
     model: "Sera",
     prompt: str,
     dashboard: DiagnosticsDashboard,
+    *,
+    metrics_mode: str = "off",
 ) -> str:
     start = time.perf_counter()
     result = model.step(bytes_data=prompt.encode("utf-8"))
@@ -406,33 +433,62 @@ def _run_turn(
         generated_ids = tokens
 
     print(f"User ({len(tokens)} tokens): {user_text}")
-    print("Sera: ", end="", flush=True)
+    diagnostics = dict(model.diagnostics_record())
+    turn_tokens = len(generated_ids)
+    diagnostics["tokens_per_sec"] = turn_tokens / elapsed if turn_tokens else 0.0
+    diagnostics["latency_ms"] = elapsed * 1000.0
 
-    fragments: list[str] = []
-    for token_id in generated_ids:
+    trust_decision = diagnostics.get("trust_decision", 0)
+    trust_llr = diagnostics.get("trust_llr")
+    latency_text = _format_float(diagnostics.get("latency_ms"))
+    tokens_per_sec_text = _format_float(diagnostics.get("tokens_per_sec"))
+    response_text = (
+        "trust="
+        + str(trust_decision)
+        + f" llr={_format_float(trust_llr)} latency_ms={latency_text}"
+        + f" tokens/sec={tokens_per_sec_text}"
+    )
+
+    response_tokens = []
+    try:
+        response_tokens = model.tokenizer.encode(response_text.encode("utf-8"))
+    except Exception:  # pragma: no cover - fallback if tokenizer encode fails
+        response_tokens = [ord(ch) for ch in response_text]
+
+    print("Sera: ", end="", flush=True)
+    for token_id in response_tokens:
         try:
             fragment = model.tokenizer.decode([int(token_id)])
         except Exception:  # pragma: no cover - defensive against tokenizer errors
-            fragment = b""
+            fragment = bytes([int(token_id) & 0xFF])
         text = _decode_text(fragment)
-        fragments.append(text)
         sys.stdout.write(text)
         sys.stdout.flush()
     print()
 
-    response_text = "".join(fragments)
-
     if "y_out" in result:
         print(f"Logit y_out: {_format_float(result['y_out'])}")
 
-    diagnostics = dict(model.diagnostics_record())
-    turn_tokens = len(generated_ids)
-    diagnostics["tokens_per_sec"] = turn_tokens / elapsed if turn_tokens else 0.0
     dashboard.update(
         diagnostics,
         generation=getattr(model, "generation", 0),
         turn_tokens=turn_tokens,
     )
+
+    metrics_payload = {
+        "latency_ms": _coerce_number(diagnostics.get("latency_ms")),
+        "tokens_per_sec": _coerce_number(diagnostics.get("tokens_per_sec")),
+        "trust_decision": int(trust_decision) if isinstance(trust_decision, (int, float)) else trust_decision,
+        "trust_llr": _coerce_number(trust_llr),
+        "turn_tokens": int(turn_tokens),
+    }
+
+    if metrics_mode == "plain":
+        print(_format_metrics_line(metrics_payload))
+    elif metrics_mode == "json":
+        json_payload = {k: v for k, v in metrics_payload.items()}
+        print("[metrics] " + json.dumps(json_payload, sort_keys=True))
+
     return response_text
 
 
@@ -479,6 +535,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         help="Write diagnostics to the given JSONL file for scripting",
     )
+    parser.add_argument(
+        "--metrics",
+        choices=("off", "plain", "json"),
+        default="off",
+        help="Render per-turn metrics after streaming tokens",
+    )
     return parser
 
 
@@ -489,14 +551,19 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     manifest_dir = _resolve_manifest_dir(args.manifest)
     state_path = _locate_state_file(manifest_dir, args.state_file)
     state_blob = _strip_private_fields(_load_state(state_path))
+    runtime_blob = state_blob.get("sera_snapshot")
+    if isinstance(runtime_blob, Mapping):
+        runtime_blob = _strip_private_fields(runtime_blob)
+    else:
+        runtime_blob = state_blob
 
     arrays = _load_manifest_arrays(manifest_dir, state_blob.get("artefacts"))
     if arrays:
         state_blob.setdefault("arrays", arrays)
 
     Sera, SeraConfig = _load_sera_class()
-    if "config" in state_blob:
-        model = Sera.restore(state_blob)
+    if "config" in runtime_blob:
+        model = Sera.restore(runtime_blob)
     else:
         if SeraConfig is None:  # pragma: no cover - defensive fallback
             raise RuntimeError("Sera runtime does not expose SeraConfig")
@@ -533,7 +600,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     try:
         if args.prompt is not None:
-            _run_turn(model, args.prompt, dashboard)
+            _run_turn(model, args.prompt, dashboard, metrics_mode=args.metrics)
             return 0
 
         print("Type your message and press enter (Ctrl+C to exit).")
@@ -541,7 +608,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             prompt = input("You: ")
             if not prompt:
                 continue
-            _run_turn(model, prompt, dashboard)
+            _run_turn(model, prompt, dashboard, metrics_mode=args.metrics)
     except KeyboardInterrupt:
         print("\nExiting.")
     finally:
