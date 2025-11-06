@@ -2289,6 +2289,290 @@ class BridgeState:
 
 
 # ---------------------------------------------------------------------------
+# Counterfactual replay module (Appendix A)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CFRConfig:
+    mode: str = "OFF"
+    gate_gain: float = 1.0
+    beta_cfr_max: float = 0.2
+    projector: Sequence[Sequence[float]] = ((1.0, 0.0, 0.0, 0.0),)
+    mem_excitation: Sequence[Tuple[int, float]] = ((0, 0.0),)
+    drift_epsilon: float = 1e-3
+    schedule_period: int = 16
+    policy_weights: Sequence[float] = (1.0, 0.0, 0.0, 0.0)
+    policy_alpha: float = 0.5
+    seed_attention: int = 0x1234_5678_9ABC_DEF0
+    seed_memory: int = 0x0FED_CBA9_8765_4321
+    seed_schedule: int = 0xCAFEBABE_DEADBEEF
+
+    def __post_init__(self) -> None:
+        mode = self.mode.upper().replace("_", "-")
+        if mode not in {"OFF", "CFR-REPLAY", "CFR-MIX"}:
+            if mode == "REPLAY":
+                mode = "CFR-REPLAY"
+            elif mode == "MIX":
+                mode = "CFR-MIX"
+            else:
+                raise ValueError("mode must be OFF, CFR-REPLAY, or CFR-MIX")
+        object.__setattr__(self, "mode", mode)
+
+        if not 0.0 <= self.gate_gain <= 1.0:
+            raise ValueError("gate_gain must lie in [0, 1]")
+        if not 0.0 <= self.beta_cfr_max <= 1.0:
+            raise ValueError("beta_cfr_max must lie in [0, 1]")
+        if self.drift_epsilon < 0.0:
+            raise ValueError("drift_epsilon must be non-negative")
+        if self.schedule_period <= 0:
+            raise ValueError("schedule_period must be positive")
+        if not 0.0 <= self.policy_alpha <= 1.0:
+            raise ValueError("policy_alpha must lie in [0, 1]")
+
+        rows: List[Tuple[float, ...]] = []
+        width = None
+        for row in self.projector:
+            row_tuple = tuple(float(v) for v in row)
+            if width is None:
+                width = len(row_tuple)
+            elif len(row_tuple) != width:
+                raise ValueError("projector rows must have a consistent width")
+            rows.append(row_tuple)
+        if not rows or width is None or width == 0:
+            raise ValueError("projector must be a non-empty 2D matrix")
+        object.__setattr__(self, "projector", tuple(rows))
+
+        excitations = []
+        for coord, weight in self.mem_excitation:
+            excitations.append((int(coord), float(weight)))
+        object.__setattr__(self, "mem_excitation", tuple(excitations))
+
+        policy = tuple(float(v) for v in self.policy_weights)
+        if not policy:
+            policy = (1.0,)
+        object.__setattr__(self, "policy_weights", policy)
+
+        def _mask_seed(seed: int) -> int:
+            return int(seed) & _HASH_MASK
+
+        object.__setattr__(self, "seed_attention", _mask_seed(self.seed_attention))
+        object.__setattr__(self, "seed_memory", _mask_seed(self.seed_memory))
+        object.__setattr__(self, "seed_schedule", _mask_seed(self.seed_schedule))
+
+
+@dataclass(frozen=True)
+class CFRComputation:
+    mode: str
+    cf_vector: np.ndarray
+    y_cfr: float
+    beta: float
+    y_mix: float
+    guard: bool
+    s_witness: float
+    health_ok: bool
+
+
+@dataclass
+class CFRState:
+    config: CFRConfig
+    _projector: np.ndarray = field(init=False, repr=False)
+    _mode: str = field(init=False, repr=False)
+    _enabled: bool = field(init=False, repr=False)
+    _gate_gain: float = field(init=False, repr=False)
+    _mem_excitation: Tuple[Tuple[int, float], ...] = field(init=False, repr=False)
+    _policy: Tuple[float, ...] = field(init=False, repr=False)
+    _policy_alpha: float = field(init=False, repr=False)
+    _seed_attn: int = field(init=False, repr=False)
+    _seed_mem: int = field(init=False, repr=False)
+    _seed_sched: int = field(init=False, repr=False)
+    _schedule_period: int = field(init=False, repr=False)
+    _generation: int = field(init=False, default=0)
+    _event_counter: int = 0
+    _last_beta: float = 0.0
+    _last_y_cfr: float = 0.0
+    _last_s_wit: float = 0.0
+
+    def __post_init__(self) -> None:
+        rows = [list(row) for row in self.config.projector]
+        matrix = np.asarray(rows, dtype=float)
+        if matrix.ndim == 1:
+            matrix = matrix.reshape(1, -1)
+        if matrix.ndim != 2:
+            raise ValueError("projector must be 2-dimensional")
+        self._projector = matrix
+        self._mode = self.config.mode
+        self._enabled = self._mode != "OFF"
+        self._gate_gain = float(self.config.gate_gain)
+        self._mem_excitation = self.config.mem_excitation
+        self._policy = self.config.policy_weights
+        self._policy_alpha = float(self.config.policy_alpha)
+        self._schedule_period = int(self.config.schedule_period)
+        self._reseed(0)
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    @property
+    def allows_linear_update(self) -> bool:
+        return self._mode != "CFR-REPLAY"
+
+    def _reseed(self, generation: int) -> None:
+        gen = int(generation)
+        mask = gen & _HASH_MASK
+        self._generation = gen
+        self._seed_attn = _mix64(self.config.seed_attention, mask)
+        self._seed_mem = _mix64(self.config.seed_memory, mask)
+        self._seed_sched = _mix64(self.config.seed_schedule, mask)
+        self._event_counter = 0
+
+    def _drift_vector(self, length: int) -> np.ndarray:
+        if length <= 0:
+            return np.zeros(0, dtype=float)
+        values = np.zeros(length, dtype=float)
+        base = (self._seed_attn + self._event_counter + 1) & _HASH_MASK
+        for idx in range(length):
+            hashed = _mix64(base + idx, self._seed_sched)
+            frac = (hashed & _HASH_MASK) / float(1 << 64)
+            values[idx] = (frac * 2.0 - 1.0) * self.config.drift_epsilon
+        return values
+
+    def _scheduled_excitation(self) -> float:
+        if not self._mem_excitation:
+            return 0.0
+        acc = 0.0
+        for coord, weight in self._mem_excitation:
+            hashed = _mix64(self._seed_mem + coord, self._event_counter + self._seed_sched)
+            frac = (hashed & _HASH_MASK) / float(1 << 64)
+            acc += weight * ((frac * 2.0) - 1.0) * self.config.drift_epsilon
+        if self._schedule_period > 1 and (self._event_counter % self._schedule_period) != 0:
+            acc *= 0.5
+        return acc
+
+    def _counterfactual_vector(
+        self,
+        phi_q: Optional[np.ndarray],
+        y_lin: float,
+        mem_value: float,
+        bridge_value: np.ndarray,
+        y_fus: float,
+    ) -> np.ndarray:
+        width = self._projector.shape[1]
+        vector = np.zeros(width, dtype=float)
+        phi_mean = 0.0
+        phi_norm = 0.0
+        if phi_q is not None and phi_q.size:
+            drift = self._drift_vector(phi_q.size)
+            phi = phi_q[: drift.size] + drift
+            phi_mean = float(np.mean(phi))
+            phi_norm = float(np.linalg.norm(phi))
+        else:
+            drift = self._drift_vector(max(width, 1))
+            if drift.size:
+                phi_mean = float(np.mean(drift[: width]))
+                phi_norm = float(np.linalg.norm(drift[: width]))
+        anchor = float(np.mean(bridge_value)) if bridge_value.size else 0.0
+        mem_adjust = mem_value + self._scheduled_excitation()
+        signals = [phi_mean, phi_norm, float(y_lin), float(mem_adjust), anchor, float(y_fus)]
+        for idx in range(width):
+            vector[idx] = signals[idx] if idx < len(signals) else signals[-1]
+        return vector
+
+    def run(
+        self,
+        *,
+        y_fus: float,
+        y_lin: float,
+        mem_value: float,
+        phi_q: Optional[np.ndarray],
+        bridge_value: np.ndarray,
+        guard_ok: bool,
+        trust_beta_min: float,
+        trust_beta_cap: float,
+    ) -> CFRComputation:
+        vector = self._counterfactual_vector(phi_q, y_lin, mem_value, bridge_value, y_fus)
+        projected = self._projector @ vector
+        if projected.ndim == 0:
+            y_cfr = float(projected)
+        else:
+            y_cfr = float(np.mean(projected))
+
+        s_wit = 1.0 if guard_ok else 0.0
+        beta_min = _clamp(float(trust_beta_min), 0.0, float(trust_beta_cap))
+        beta_cap = _clamp(float(trust_beta_cap), 0.0, 1.0)
+        beta_cap = min(beta_cap, self.config.beta_cfr_max)
+        beta_span = max(0.0, beta_cap - beta_min)
+
+        health_ok = guard_ok
+        beta = 0.0
+        y_mix = float(y_fus)
+        if self._mode == "CFR-MIX" and self._enabled and health_ok:
+            beta_target = beta_min + beta_span * s_wit
+            beta = _clamp(self._gate_gain * beta_target, 0.0, beta_cap)
+            if beta > 0.0:
+                y_mix = (1.0 - beta) * float(y_fus) + beta * y_cfr
+        elif self._mode == "CFR-REPLAY":
+            beta = 0.0
+
+        self._last_beta = beta
+        self._last_y_cfr = y_cfr
+        self._last_s_wit = s_wit
+        self._event_counter = (self._event_counter + 1) & _HASH_MASK
+
+        return CFRComputation(
+            mode=self._mode,
+            cf_vector=vector,
+            y_cfr=y_cfr,
+            beta=beta,
+            y_mix=y_mix,
+            guard=guard_ok,
+            s_witness=s_wit,
+            health_ok=health_ok,
+        )
+
+    def manifest(self) -> Dict[str, object]:
+        digest = hashlib.sha256()
+        for row in self._projector:
+            for value in row:
+                digest.update(struct.pack("<d", float(value)))
+        return {
+            "mode": self._mode,
+            "beta_cfr_max": float(self.config.beta_cfr_max),
+            "gate_gain": float(self._gate_gain),
+            "projector_shape": list(self._projector.shape),
+            "projector_digest": digest.hexdigest(),
+            "policy_weights": [float(v) for v in self._policy],
+            "policy_alpha": float(self._policy_alpha),
+            "event_counter": int(self._event_counter),
+        }
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "event_counter": int(self._event_counter),
+            "last_beta": float(self._last_beta),
+            "last_y_cfr": float(self._last_y_cfr),
+            "last_s_wit": float(self._last_s_wit),
+            "generation": int(self._generation),
+        }
+
+    @classmethod
+    def restore(cls, config: CFRConfig, blob: Optional[Dict[str, object]]) -> "CFRState":
+        state = cls(config)
+        if blob:
+            generation = int(blob.get("generation", 0))
+            state._reseed(generation)
+            state._event_counter = int(blob.get("event_counter", 0)) & _HASH_MASK
+            state._last_beta = float(blob.get("last_beta", 0.0))
+            state._last_y_cfr = float(blob.get("last_y_cfr", 0.0))
+            state._last_s_wit = float(blob.get("last_s_wit", 0.0))
+        return state
+
+    def advance_generation(self, generation: int) -> None:
+        self._reseed(generation)
+
+
+# ---------------------------------------------------------------------------
 # Tree search stub (spec section 11 – optional)
 # ---------------------------------------------------------------------------
 
@@ -2656,6 +2940,10 @@ def _default_bridge_config() -> BridgeConfig:
     return BridgeConfig()
 
 
+def _default_cfr_config() -> CFRConfig:
+    return CFRConfig()
+
+
 def _default_tree_search_config() -> TreeSearchConfig:
     return TreeSearchConfig()
 
@@ -2674,6 +2962,7 @@ class SeraConfig:
     trust: TrustGateConfig = field(default_factory=_default_trust_config)
     ccr: CCRConfig = field(default_factory=_default_ccr_config)
     bridge: BridgeConfig = field(default_factory=_default_bridge_config)
+    cfr: CFRConfig = field(default_factory=_default_cfr_config)
     tree_search: TreeSearchConfig = field(default_factory=_default_tree_search_config)
     lambda_floor: float = 0.05
     feature_budget: int = 32
@@ -2723,6 +3012,11 @@ class SeraConfig:
             self,
             "bridge",
             _coerce_dataclass_config(self.bridge, BridgeConfig, _default_bridge_config),
+        )
+        object.__setattr__(
+            self,
+            "cfr",
+            _coerce_dataclass_config(self.cfr, CFRConfig, _default_cfr_config),
         )
         object.__setattr__(
             self,
@@ -2800,6 +3094,11 @@ class SeraDiagnostics:
     trust_audit: bytes = field(default=b"", repr=False)
     trust_beta_min: float = 0.0
     trust_beta_cap: float = 0.0
+    cfr_mode: str = "OFF"
+    cfr_beta: float = 0.0
+    cfr_guard: bool = False
+    cfr_health_ok: bool = True
+    cfr_y_cfr: float = 0.0
 
     def __post_init__(self) -> None:
         if self.p99_window < 1:
@@ -2827,6 +3126,7 @@ class Sera:
     trust_gate: TrustGateState = field(init=False)
     ccr: CCRState = field(init=False)
     bridge: BridgeState = field(init=False)
+    cfr: CFRState = field(init=False)
     tree_search: TreeSearchState = field(init=False)
     diagnostics: SeraDiagnostics = field(default_factory=SeraDiagnostics)
     generation: int = field(init=False, default=0)
@@ -2841,8 +3141,10 @@ class Sera:
         object.__setattr__(self, "trust_gate", TrustGateState(self.config.trust))
         object.__setattr__(self, "ccr", CCRState(self.config.ccr))
         object.__setattr__(self, "bridge", BridgeState(self.config.bridge))
+        object.__setattr__(self, "cfr", CFRState(self.config.cfr))
         object.__setattr__(self, "tree_search", TreeSearchState(self.config.tree_search))
         self.bridge.advance_generation(self.generation)
+        self.cfr.advance_generation(self.generation)
         object.__setattr__(self, "_generation_pointer", GenerationPointer())
         self._generation_pointer.publish(self.manifest_record())
 
@@ -2925,7 +3227,7 @@ class Sera:
                     raise BudgetError("Feature budget exceeded")
                 features.append(feature)
             y_lin = self.linear.predict(features)
-            if target is not None:
+            if target is not None and self.cfr.allows_linear_update:
                 self.linear.update(features, target)
 
             mem_value = self.memory.accumulate((idx, val) for idx, val in features)
@@ -2944,14 +3246,33 @@ class Sera:
             diag.trust_beta_min = float(trust.beta_min)
             diag.trust_beta_cap = float(trust.beta_cap)
 
-            locals_vec = np.array([fused, gated], dtype=float)
-            ccr_result = self.ccr.correct(locals_vec)
-
-            bridge_val = np.zeros(1, dtype=float)
+            bridge_val = np.zeros(self.bridge.config.value_dim, dtype=float)
             guard = False
             proof = bytes(BridgeProof._SCHEMA.size)
             if bridge_ctx is not None:
                 bridge_val, guard, proof = self.bridge.read(bridge_ctx, bridge_token)
+
+            cfr_result = self.cfr.run(
+                y_fus=fused,
+                y_lin=y_lin,
+                mem_value=mem_value,
+                phi_q=phi_q,
+                bridge_value=bridge_val,
+                guard_ok=guard,
+                trust_beta_min=trust.beta_min,
+                trust_beta_cap=trust.beta_cap,
+            )
+            fused = float(cfr_result.y_mix)
+            diag.cfr_mode = cfr_result.mode
+            diag.cfr_beta = float(cfr_result.beta)
+            diag.cfr_guard = bool(cfr_result.guard)
+            diag.cfr_health_ok = bool(cfr_result.health_ok or bridge_ctx is None)
+            diag.cfr_y_cfr = float(cfr_result.y_cfr)
+
+            locals_vec = np.array([fused, gated], dtype=float)
+            ccr_result = self.ccr.correct(locals_vec)
+
+            if bridge_ctx is not None:
                 if guard:
                     diag.bridge_hits += 1
                 else:
@@ -2966,6 +3287,7 @@ class Sera:
                 gated,
                 bridge_val,
                 guard,
+                witness_quality=cfr_result.s_witness,
                 beta_min_override=trust.beta_min,
                 beta_cap_override=trust.beta_cap,
             )
@@ -3010,6 +3332,7 @@ class Sera:
                 "ccr_residual": ccr_result.residual,
                 "ccr_correction": ccr_result.correction,
                 "y_bridge": bridged,
+                "y_cfr": cfr_result.y_cfr,
             }
 
     def pin_generation(self) -> GenerationPin:
@@ -3051,6 +3374,7 @@ class Sera:
         return {
             "config": dataclasses.asdict(self.config),
             "linear_state": self.linear.snapshot(),
+            "cfr_state": self.cfr.snapshot(),
             "diagnostics": self.diagnostics_record(),
             "generation": self.generation,
             "manifest": self.manifest_record().as_dict(),
@@ -3078,6 +3402,10 @@ class Sera:
         model.generation = int(blob.get("generation", 0))
         model.linear.advance_generation(model.generation)
         model.bridge.advance_generation(model.generation)
+        cfr_blob = blob.get("cfr_state")
+        if cfr_blob is not None:
+            model.cfr = CFRState.restore(model.config.cfr, cfr_blob)
+        model.cfr.advance_generation(model.generation)
         model._generation_pointer.publish(model.manifest_record())
         return model
 
@@ -3089,12 +3417,14 @@ class Sera:
         self.generation += 1
         self.linear.advance_generation(self.generation)
         self.bridge.advance_generation(self.generation)
+        self.cfr.advance_generation(self.generation)
         self._generation_pointer.publish(self.manifest_record())
 
     def _manifest_sections(self) -> Dict[str, object]:
         return {
             "linear": self.linear.manifest(),
             "bridge": self.bridge.manifest(),
+            "cfr": self.cfr.manifest(),
             "ccr_proof": self.ccr.certificate.as_dict(),
             "diagnostics": self.diagnostics_record(),
         }
@@ -3152,6 +3482,7 @@ __all__ = [
     "ManifestRecord",
     "Sera",
     "SeraConfig",
+    "CFRConfig",
     "TrustGateConfig",
 ]
 
