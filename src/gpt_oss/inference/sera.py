@@ -1920,19 +1920,160 @@ class BridgeState:
 @dataclass(frozen=True)
 class TreeSearchConfig:
     enabled: bool = False
+    cpuct: float = 1.0
+    max_actions: int = 4
+    action_priors: Tuple[float, ...] = (0.4, 0.3, 0.2, 0.1)
+    action_rewards: Tuple[float, ...] = (0.2, 0.1, 0.05, -0.05)
+    selection_depth: int = 4
+    rollout_depth: int = 4
+    backup_depth: int = 4
+    discount: float = 0.9
+
+
+@dataclass
+class TreeNode:
+    action_index: Optional[int]
+    visits: int = 0
+    value_sum: float = 0.0
+    children: List["TreeNode"] = field(default_factory=list)
+
+    def q_value(self) -> float:
+        if self.visits == 0:
+            return 0.0
+        return self.value_sum / float(self.visits)
 
 
 @dataclass
 class TreeSearchState:
     config: TreeSearchConfig
     _simulations: int = 0
+    _root: TreeNode = field(init=False)
+    _priors: Tuple[float, ...] = field(init=False)
+    _rewards: Tuple[float, ...] = field(init=False)
+    _max_actions: int = field(init=False)
+    _selection_depth: int = field(init=False)
+    _rollout_depth: int = field(init=False)
+    _backup_depth: int = field(init=False)
+    _discount: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._max_actions = max(1, min(self.config.max_actions, 4))
+        self._selection_depth = max(1, min(self.config.selection_depth, 4))
+        self._rollout_depth = max(1, min(self.config.rollout_depth, 4))
+        self._backup_depth = max(1, min(self.config.backup_depth, 4))
+        self._discount = max(0.0, min(self.config.discount, 1.0))
+        priors = list(self.config.action_priors[: self._max_actions])
+        if not priors:
+            priors = [1.0]
+        while len(priors) < self._max_actions:
+            priors.append(1.0)
+        total = sum(priors)
+        if total <= 0.0:
+            priors = [1.0 for _ in priors]
+            total = float(len(priors))
+        self._priors = tuple(p / total for p in priors[: self._max_actions])
+
+        rewards = list(self.config.action_rewards[: self._max_actions])
+        if not rewards:
+            rewards = [0.0]
+        while len(rewards) < self._max_actions:
+            rewards.append(rewards[-1])
+        self._rewards = tuple(
+            max(-1.0, min(1.0, r)) for r in rewards[: self._max_actions]
+        )
+
+        self._root = TreeNode(action_index=None)
 
     def maybe_select(self) -> None:
         if not self.config.enabled:
             return
-        # The spec limits us to one simulation per event; we simply increment a
-        # counter so diagnostics can report whether the feature is active.
-        self._simulations = min(self._simulations + 1, 1)
+        self._simulate()
+        self._simulations = min(self._simulations + 1, 2**31 - 1)
+
+    # ------------------------------------------------------------------
+    # Internal helpers implementing best-of-two selection and bounded MCTS
+    # ------------------------------------------------------------------
+
+    def _allowed_children(self, node: TreeNode) -> int:
+        allowed = 1
+        if node.visits >= 2:
+            allowed += 1
+        if node.visits >= 4:
+            allowed += 1
+        return min(allowed, self._max_actions)
+
+    def _score(self, parent: TreeNode, child: TreeNode, index: int) -> float:
+        prior = self._priors[index]
+        q_val = child.q_value()
+        inv = 1.0 / (1.0 + float(child.visits))
+        explore = self.config.cpuct * prior * math.sqrt(float(parent.visits) + 1.0) * inv
+        return q_val + explore
+
+    def _best_of_two(self, parent: TreeNode, idx_a: int, idx_b: int) -> int:
+        child_a = parent.children[idx_a]
+        child_b = parent.children[idx_b]
+        score_a = self._score(parent, child_a, idx_a)
+        score_b = self._score(parent, child_b, idx_b)
+        if score_b > score_a or (score_a == score_b and idx_b < idx_a):
+            return idx_b
+        return idx_a
+
+    def _select(self) -> Tuple[List[Tuple[TreeNode, int, TreeNode]], TreeNode]:
+        node = self._root
+        path: List[Tuple[TreeNode, int, TreeNode]] = []
+        depth = 0
+        while depth < self._selection_depth:
+            allowed = self._allowed_children(node)
+            if len(node.children) < allowed:
+                index = len(node.children)
+                child = TreeNode(action_index=index)
+                node.children.append(child)
+                path.append((node, index, child))
+                return path, child
+            if not node.children:
+                break
+            allowed_indices = min(len(node.children), allowed)
+            best_index = 0
+            for candidate in range(1, allowed_indices):
+                best_index = self._best_of_two(node, best_index, candidate)
+            child = node.children[best_index]
+            path.append((node, best_index, child))
+            node = child
+            depth += 1
+        return path, node
+
+    def _rollout(self, leaf: TreeNode) -> float:
+        base_index = leaf.action_index or 0
+        reward = 0.0
+        discount = 1.0
+        for step in range(self._rollout_depth):
+            idx = (base_index + step) % len(self._rewards)
+            reward += discount * self._rewards[idx]
+            discount *= self._discount
+        return max(-1.0, min(1.0, reward))
+
+    def _backup(self, path: List[Tuple[TreeNode, int, TreeNode]], reward: float) -> None:
+        if not path:
+            self._root.visits = min(self._root.visits + 1, 2**31 - 1)
+            self._root.value_sum = max(
+                -float(self._root.visits),
+                min(float(self._root.visits), self._root.value_sum + reward),
+            )
+            return
+        steps = path[-min(len(path), self._backup_depth):]
+        for parent, index, child in reversed(steps):
+            child.visits = min(child.visits + 1, 2**31 - 1)
+            child.value_sum = max(-float(child.visits), min(float(child.visits), child.value_sum + reward))
+            parent.visits = min(parent.visits + 1, 2**31 - 1)
+            parent.value_sum = max(
+                -float(parent.visits),
+                min(float(parent.visits), parent.value_sum + reward),
+            )
+
+    def _simulate(self) -> None:
+        path, leaf = self._select()
+        reward = self._rollout(leaf)
+        self._backup(path, reward)
 
 
 # ---------------------------------------------------------------------------
