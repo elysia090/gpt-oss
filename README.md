@@ -307,6 +307,17 @@ pip install huggingface-hub prompt_toolkit         # runtime + TUI dependency
 huggingface-cli login                              # skip if already authenticated
 ```
 
+> **Working from a fork?** Use the commands that match your setup:
+>
+> | Situation | Command(s) |
+> | --- | --- |
+> | Fresh clone of your fork | <code>git clone https://github.com/&lt;your-username&gt;/gpt-oss.git</code> |
+> | Keep your fork in sync | <code>git remote add upstream https://github.com/openai/gpt-oss.git</code> (run once per clone) |
+> | Already cloned <code>openai/gpt-oss</code> but meant to use your fork | <code>git remote set-url origin https://github.com/&lt;your-username&gt;/gpt-oss.git</code> (no reclone needed) |
+>
+> After updating remotes you can `git fetch upstream` and `git merge upstream/main`
+> (or your preferred sync strategy) to bring your fork up to date.
+
 > **Windows tip:** Replace `source .venv/bin/activate` in the snippet above with
 > the activation command for your shell:
 >
