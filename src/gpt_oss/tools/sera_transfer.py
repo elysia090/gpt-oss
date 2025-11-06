@@ -12,6 +12,7 @@ import math
 import struct
 import textwrap
 import dataclasses
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -432,6 +433,21 @@ class LayerConfig:
     b2: str
 
 
+def _tensor_shape(tensor: object) -> Tuple[int, ...]:
+    shape = getattr(tensor, "shape", None)
+    if shape is not None:
+        try:
+            return tuple(int(dim) for dim in shape)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            pass
+    if isinstance(tensor, (list, tuple)):
+        try:
+            return _infer_shape(tensor)
+        except TypeError:  # pragma: no cover - defensive
+            return ()
+    return ()
+
+
 @dataclass
 class ModelConfig:
     d_model: int
@@ -443,30 +459,205 @@ class ModelConfig:
     rope_theta: float | None = None
 
     @staticmethod
-    def from_dict(data: Mapping[str, object]) -> "ModelConfig":
-        layers = []
-        for idx, layer in enumerate(data["layers"]):
-            layer_data = layer  # type: ignore[assignment]
+    def from_dict(
+        data: Mapping[str, object],
+        tensors: Mapping[str, object] | None = None,
+    ) -> "ModelConfig":
+        d_model = int(data["d_model"])
+        n_heads = int(data["n_heads"])
+        head_dim = int(data["head_dim"])
+        vocab_size = int(data.get("vocab_size", 0) or 0)
+        tau = float(data.get("tau", 1.0))
+        rope_theta = data.get("rope_theta")
+
+        layer_entries = list(data.get("layers", []) or [])
+        layers: List[LayerConfig]
+        if layer_entries:
+            layers = []
+            for idx, layer in enumerate(layer_entries):
+                layer_data = layer  # type: ignore[assignment]
+                layers.append(
+                    LayerConfig(
+                        name=str(layer_data.get("name", f"layer_{idx}")),
+                        w_k=str(layer_data["W_K"]),
+                        w_o=str(layer_data["W_O"]),
+                        w1=str(layer_data["FFN_W1"]),
+                        w2=str(layer_data["FFN_W2"]),
+                        b1=str(layer_data["FFN_B1"]),
+                        b2=str(layer_data["FFN_B2"]),
+                    )
+                )
+        else:
+            if tensors is None:
+                raise ValueError(
+                    "Model config is missing 'layers' and no tensor map was provided"
+                )
+            layers = ModelConfig._infer_layers_from_tensors(
+                tensors,
+                d_model=d_model,
+                n_heads=n_heads,
+                head_dim=head_dim,
+            )
+
+        return ModelConfig(
+            d_model=d_model,
+            n_heads=n_heads,
+            head_dim=head_dim,
+            vocab_size=vocab_size,
+            tau=tau,
+            layers=layers,
+            rope_theta=float(rope_theta) if rope_theta is not None else None,
+        )
+
+    @staticmethod
+    def _infer_layers_from_tensors(
+        tensors: Mapping[str, object],
+        *,
+        d_model: int,
+        n_heads: int,
+        head_dim: int,
+    ) -> List[LayerConfig]:
+        role_suffixes = {
+            "W_K": (
+                "attn.k.weight",
+                "attn.wk.weight",
+                "attn.k_proj.weight",
+                "attention.k.weight",
+                "attention.wk.weight",
+                "attention.k_proj.weight",
+                "self_attn.k_proj.weight",
+            ),
+            "W_O": (
+                "attn.o.weight",
+                "attn.wo.weight",
+                "attn.o_proj.weight",
+                "attention.o.weight",
+                "attention.wo.weight",
+                "attention.o_proj.weight",
+                "attention.out_proj.weight",
+                "self_attn.o_proj.weight",
+            ),
+            "FFN_W1": (
+                "ffn.w1.weight",
+                "mlp.w1.weight",
+                "ffn.gate_proj.weight",
+                "mlp.gate_proj.weight",
+                "ffn.up_proj.weight",
+                "mlp.up_proj.weight",
+                "feed_forward.w1.weight",
+                "feed_forward.up_proj.weight",
+            ),
+            "FFN_W2": (
+                "ffn.w2.weight",
+                "mlp.w2.weight",
+                "ffn.down_proj.weight",
+                "mlp.down_proj.weight",
+                "ffn.proj.weight",
+                "feed_forward.w2.weight",
+                "feed_forward.down_proj.weight",
+            ),
+            "FFN_B1": (
+                "ffn.w1.bias",
+                "mlp.w1.bias",
+                "ffn.gate_proj.bias",
+                "mlp.gate_proj.bias",
+                "ffn.up_proj.bias",
+                "mlp.up_proj.bias",
+                "feed_forward.w1.bias",
+                "feed_forward.up_proj.bias",
+            ),
+            "FFN_B2": (
+                "ffn.w2.bias",
+                "mlp.w2.bias",
+                "ffn.down_proj.bias",
+                "mlp.down_proj.bias",
+                "ffn.proj.bias",
+                "feed_forward.w2.bias",
+                "feed_forward.down_proj.bias",
+            ),
+        }
+
+        expected_proj = n_heads * head_dim
+        layer_map: Dict[str, Dict[str, str]] = {}
+
+        for name, tensor in tensors.items():
+            if not isinstance(name, str):
+                continue
+            lowered = name.lower()
+            shape = _tensor_shape(tensor)
+            for role, suffixes in role_suffixes.items():
+                matched = False
+                for suffix in suffixes:
+                    if lowered.endswith(suffix):
+                        if not ModelConfig._shape_allows_role(
+                            role, shape, expected_proj
+                        ):
+                            continue
+                        prefix = name[: len(name) - len(suffix)].rstrip(".")
+                        if not prefix:
+                            break
+                        layer_roles = layer_map.setdefault(prefix, {})
+                        layer_roles.setdefault(role, name)
+                        matched = True
+                        break
+                if matched:
+                    break
+
+        required_roles = {"W_K", "W_O", "FFN_W1", "FFN_W2", "FFN_B1", "FFN_B2"}
+        incomplete = [
+            prefix
+            for prefix, roles in layer_map.items()
+            if not required_roles.issubset(roles)
+        ]
+        if incomplete:
+            missing_details = {
+                prefix: sorted(required_roles - layer_map[prefix].keys())
+                for prefix in incomplete
+            }
+            raise ValueError(
+                "Unable to infer layer configuration from tensors; missing roles: "
+                f"{missing_details}"
+            )
+
+        if not layer_map:
+            raise ValueError("No transformer layers could be inferred from tensor names")
+
+        def sort_key(item: Tuple[str, Dict[str, str]]) -> Tuple[int, str]:
+            prefix, _ = item
+            match = re.search(r"(?:^|\.)(\d+)(?!.*\d)", prefix)
+            if match:
+                return (int(match.group(1)), prefix)
+            return (math.inf, prefix)
+
+        layers: List[LayerConfig] = []
+        for prefix, roles in sorted(layer_map.items(), key=sort_key):
             layers.append(
                 LayerConfig(
-                    name=str(layer_data.get("name", f"layer_{idx}")),
-                    w_k=str(layer_data["W_K"]),
-                    w_o=str(layer_data["W_O"]),
-                    w1=str(layer_data["FFN_W1"]),
-                    w2=str(layer_data["FFN_W2"]),
-                    b1=str(layer_data["FFN_B1"]),
-                    b2=str(layer_data["FFN_B2"]),
+                    name=prefix.replace(".", "_"),
+                    w_k=roles["W_K"],
+                    w_o=roles["W_O"],
+                    w1=roles["FFN_W1"],
+                    w2=roles["FFN_W2"],
+                    b1=roles["FFN_B1"],
+                    b2=roles["FFN_B2"],
                 )
             )
-        return ModelConfig(
-            d_model=int(data["d_model"]),
-            n_heads=int(data["n_heads"]),
-            head_dim=int(data["head_dim"]),
-            vocab_size=int(data.get("vocab_size", 0) or 0),
-            tau=float(data.get("tau", 1.0)),
-            layers=layers,
-            rope_theta=float(data.get("rope_theta")) if data.get("rope_theta") is not None else None,
-        )
+        return layers
+
+    @staticmethod
+    def _shape_allows_role(
+        role: str,
+        shape: Tuple[int, ...],
+        expected_proj: int,
+    ) -> bool:
+        if len(shape) < 2:
+            return True
+        rows, cols = shape[0], shape[1]
+        if role == "W_K":
+            return expected_proj in {rows, cols}
+        if role == "W_O":
+            return expected_proj in {rows, cols}
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -1083,8 +1274,9 @@ def convert(
 
     config_path = find_file("config.json")
     model_path = find_file("model.safetensors")
-    cfg = ModelConfig.from_dict(json.loads(config_path.read_text()))
+    config_data = json.loads(config_path.read_text())
     tensors = load_tensors(model_path)
+    cfg = ModelConfig.from_dict(config_data, tensors=tensors)
 
     r = min(r, cfg.d_model)
     r_v = min(r_v, r)

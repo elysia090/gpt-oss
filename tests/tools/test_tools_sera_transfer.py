@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -27,9 +29,9 @@ def _create_vector(length: int, rng: random.Random) -> list[float]:
     return [rng.uniform(-1.0, 1.0) for _ in range(length)]
 
 
-def _create_checkpoint(tmp_path: Path) -> Path:
-    source = tmp_path / "source"
-    source.mkdir()
+def _create_checkpoint(root: Path) -> Path:
+    source = root / "source"
+    source.mkdir(parents=True, exist_ok=True)
 
     config = {
         "d_model": 4,
@@ -68,6 +70,38 @@ def _create_checkpoint(tmp_path: Path) -> Path:
     return source
 
 
+def _create_openai_checkpoint(root: Path) -> Path:
+    source = root / "openai"
+    source.mkdir(parents=True, exist_ok=True)
+
+    config = {
+        "d_model": 4,
+        "n_heads": 2,
+        "head_dim": 2,
+        "vocab_size": 8,
+        "tau": 0.5,
+        "rope_theta": 10000.0,
+    }
+    (source / "config.json").write_text(json.dumps(config))
+
+    rng = random.Random(0)
+    tensors = {}
+    for idx in range(2):
+        prefix = f"model.layers.{idx}"
+        attn = f"{prefix}.attention"
+        mlp = f"{prefix}.mlp"
+        tensors[f"{attn}.k_proj.weight"] = _create_matrix(4, 4, rng)
+        tensors[f"{attn}.o_proj.weight"] = _create_matrix(4, 4, rng)
+        tensors[f"{mlp}.gate_proj.weight"] = _create_matrix(8, 4, rng)
+        tensors[f"{mlp}.down_proj.weight"] = _create_matrix(4, 8, rng)
+        tensors[f"{mlp}.gate_proj.bias"] = _create_vector(8, rng)
+        tensors[f"{mlp}.down_proj.bias"] = _create_vector(4, rng)
+
+    tensors["tok_embeddings.weight"] = _create_matrix(config["vocab_size"], config["d_model"], rng)
+    save_file(tensors, source / "model.safetensors")
+    return source
+
+
 def _read_header(path: Path) -> sera_transfer.ArrayHeader:
     raw = path.read_bytes()[:sera_transfer.ArrayHeader.HEADER_STRUCT.size]
     values = sera_transfer.ArrayHeader.HEADER_STRUCT.unpack(raw)
@@ -89,8 +123,32 @@ def _payload(path: Path) -> bytes:
     return data[sera_transfer.ArrayHeader.HEADER_STRUCT.size :]
 
 
-def test_cli_round_trip(tmp_path: Path) -> None:
-    source = _create_checkpoint(tmp_path)
+def test_model_config_infers_layers_from_openai_layout(tmp_path: Path) -> None:
+    source = _create_openai_checkpoint(tmp_path / "openai_infer")
+    config_data = json.loads((source / "config.json").read_text())
+    tensors = sera_transfer.load_tensors(source / "model.safetensors")
+
+    cfg = sera_transfer.ModelConfig.from_dict(config_data, tensors=tensors)
+    assert len(cfg.layers) == 2
+
+    first = cfg.layers[0]
+    assert first.w_k.endswith("attention.k_proj.weight")
+    assert first.w_o.endswith("attention.o_proj.weight")
+    assert first.w1.endswith("mlp.gate_proj.weight")
+    assert first.w2.endswith("mlp.down_proj.weight")
+    assert first.b1.endswith("mlp.gate_proj.bias")
+    assert first.b2.endswith("mlp.down_proj.bias")
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(_create_checkpoint, id="explicit-layout"),
+        pytest.param(_create_openai_checkpoint, id="openai-layout"),
+    ],
+)
+def test_cli_round_trip(tmp_path: Path, factory) -> None:
+    source = factory(tmp_path / factory.__name__)
     output = tmp_path / "output"
 
     cmd = [
@@ -131,7 +189,7 @@ def test_cli_round_trip(tmp_path: Path) -> None:
 
 
 def test_deterministic_conversion(tmp_path: Path) -> None:
-    source = _create_checkpoint(tmp_path)
+    source = _create_checkpoint(tmp_path / "deterministic")
     out_a = tmp_path / "out_a"
     out_b = tmp_path / "out_b"
 
@@ -152,12 +210,13 @@ def test_deterministic_conversion(tmp_path: Path) -> None:
 
 
 def test_written_arrays_match_reference(tmp_path: Path) -> None:
-    source = _create_checkpoint(tmp_path)
+    source = _create_checkpoint(tmp_path / "reference")
     output = tmp_path / "output"
     sera_transfer.convert(source, output, r=4, r_v=2, top_l=2)
 
-    cfg = sera_transfer.ModelConfig.from_dict(json.loads((source / "config.json").read_text()))
+    config_data = json.loads((source / "config.json").read_text())
     tensors = sera_transfer.load_tensors(source / "model.safetensors")
+    cfg = sera_transfer.ModelConfig.from_dict(config_data, tensors=tensors)
     arrays_dir = output / "arrays"
 
     tokenizer_data, tokenizer_meta = sera_transfer.tokenizer_arrays(cfg, tensors)
@@ -217,7 +276,7 @@ def test_written_arrays_match_reference(tmp_path: Path) -> None:
 
 
 def test_array_checksums_regression(tmp_path: Path) -> None:
-    source = _create_checkpoint(tmp_path)
+    source = _create_checkpoint(tmp_path / "checksums")
     output = tmp_path / "output"
     sera_transfer.convert(source, output, r=4, r_v=2, top_l=2)
 
