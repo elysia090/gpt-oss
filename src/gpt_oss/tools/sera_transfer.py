@@ -842,10 +842,10 @@ def convert(
 ) -> None:
     """Convert a checkpoint directory into a Sera Transfer Kit artefact.
 
-    The conversion expects a ``config.json`` and ``model.safetensors`` file.  When
-    these files are not present in ``source`` directly, the function probes a
-    small set of common Hugging Face layouts – ``source/original`` and
-    ``source/original/model`` – before failing.  Advanced users can supply an
+    The conversion expects a ``config.json`` and ``model.safetensors`` file. When
+    these files are missing from ``source`` directly, the function probes a small
+    set of common Hugging Face layouts – ``source/original`` and
+    ``source/original/model`` – before failing. Advanced users can supply an
     explicit ``original_subdir`` to search an arbitrary additional location.
     """
 
@@ -862,8 +862,13 @@ def convert(
     if original_subdir is not None:
         add_root(original_subdir)
     else:
-        add_root("original")
-        add_root(Path("original") / "model")
+        need_probe = any(
+            not (source / filename).exists()
+            for filename in ("config.json", "model.safetensors")
+        )
+        if need_probe:
+            add_root("original")
+            add_root(Path("original") / "model")
 
     def find_file(filename: str) -> Path:
         for root in search_roots:
