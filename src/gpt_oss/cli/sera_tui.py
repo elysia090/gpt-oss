@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Mapping, Optio
 try:  # pragma: no cover - executed at import time
     from prompt_toolkit.application import Application
     from prompt_toolkit.buffer import Buffer
+    from prompt_toolkit.document import Document
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.layout import HSplit, VSplit, Layout
     from prompt_toolkit.layout.dimension import Dimension
@@ -40,6 +41,11 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for environments with
         def reset(self) -> None:
             self.text = ""
             self.cursor_position = 0
+
+    class Document:  # type: ignore[override]
+        def __init__(self, text: str = "", cursor_position: int = 0) -> None:
+            self.text = text
+            self.cursor_position = cursor_position
 
     class TextArea:  # type: ignore[override]
         def __init__(self, text="", buffer: Optional[Buffer] = None, **_: object) -> None:
@@ -184,13 +190,12 @@ class SeraTUI:
         chat_area = TextArea(text="\n".join(self._chat_transcript), scrollbar=True, wrap_lines=True, read_only=True)
         diagnostics_area = TextArea(text="Awaiting diagnostics…", height=Dimension(min=3), read_only=True)
         operations_area = TextArea(read_only=True, width=Dimension(min=24, preferred=32))
-        input_buffer = Buffer(accept_handler=self._handle_submit)
         input_area = TextArea(
             height=1,
             prompt="You: ",
             multiline=False,
             wrap_lines=False,
-            buffer=input_buffer,
+            accept_handler=self._handle_submit,
         )
 
         body = HSplit(
@@ -274,9 +279,18 @@ class SeraTUI:
         self._chat_transcript.append(line)
         if self._chat_area is not None:
             new_text = "\n".join(self._chat_transcript)
-            self._chat_area.text = new_text
+            try:
+                self._chat_area.text = new_text
+            except Exception:  # pragma: no cover - prompt_toolkit read-only buffers
+                buffer = getattr(self._chat_area, "buffer", None)
+                if buffer is not None and hasattr(buffer, "set_document"):
+                    try:
+                        buffer.set_document(Document(new_text, len(new_text)), bypass_readonly=True)
+                    except TypeError:  # pragma: no cover - compatibility fallback
+                        buffer.document = Document(new_text, len(new_text))
+                else:
+                    self._chat_area.text = new_text
             if hasattr(self._chat_area, "buffer"):
-                self._chat_area.buffer.text = new_text
                 self._chat_area.buffer.cursor_position = len(new_text)
             self._invalidate()
 
@@ -290,9 +304,17 @@ class SeraTUI:
         elif self.metrics_mode == "json":
             lines.append("[metrics] " + json.dumps(turn.metrics_payload, sort_keys=True))
         new_text = "\n".join(lines)
-        self._diagnostics_area.text = new_text
-        if hasattr(self._diagnostics_area, "buffer"):
-            self._diagnostics_area.buffer.text = new_text
+        try:
+            self._diagnostics_area.text = new_text
+        except Exception:  # pragma: no cover - prompt_toolkit read-only buffers
+            buffer = getattr(self._diagnostics_area, "buffer", None)
+            if buffer is not None and hasattr(buffer, "set_document"):
+                try:
+                    buffer.set_document(Document(new_text, 0), bypass_readonly=True)
+                except TypeError:  # pragma: no cover - compatibility fallback
+                    buffer.document = Document(new_text, 0)
+            else:
+                self._diagnostics_area.text = new_text
         self._invalidate()
 
     def _toggle_tool(self, tool: str) -> None:
@@ -341,9 +363,18 @@ class SeraTUI:
             lines.append("")
             lines.extend(metadata_lines)
         new_text = "\n".join(lines)
-        self._operations_area.text = new_text
+        try:
+            self._operations_area.text = new_text
+        except Exception:  # pragma: no cover - prompt_toolkit read-only buffers
+            buffer = getattr(self._operations_area, "buffer", None)
+            if buffer is not None and hasattr(buffer, "set_document"):
+                try:
+                    buffer.set_document(Document(new_text, 0), bypass_readonly=True)
+                except TypeError:  # pragma: no cover - compatibility fallback
+                    buffer.document = Document(new_text, 0)
+            else:
+                self._operations_area.text = new_text
         if hasattr(self._operations_area, "buffer"):
-            self._operations_area.buffer.text = new_text
             self._operations_area.buffer.cursor_position = 0
         self._invalidate()
 

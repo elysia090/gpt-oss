@@ -1103,7 +1103,7 @@ def convert(
         store_array(name, data, "f32")
     metadata["attention"] = {
         "features": r,
-        "tau": cfg.tau,
+        "tau": getattr(cfg, "tau", 1.0),
         "whitening_sig2": prf.get("whitening_sig2", []),
     }
 
@@ -1140,39 +1140,52 @@ def convert(
     write_manifest(output / "sera_manifest.bin", cfg, artefact_payloads, r=r, r_v=r_v, vocab_size=cfg.vocab_size or 16)
 
     sera_cls, sera_config_cls = _load_sera_runtime()
-    base_config = sera_config_cls()
-    tokenizer_vocab = {piece: token for piece, token in tokenizer_meta["pieces"]}
-    tokenizer_config = dataclasses.replace(
-        base_config.tokenizer,
-        vocabulary=tokenizer_vocab,
-        max_piece_length=tokenizer_meta["max_piece_length"],
-    )
-    whitening_sig2 = metadata["attention"].get("whitening_sig2") or [1.0]
-    beta_floor = max(1e-3, min(float(value) for value in whitening_sig2))
-    value_dim = len(overlays.get("overlays_U", [])) or cfg.d_model
-    attention_config = dataclasses.replace(
-        base_config.attention,
-        dim=cfg.d_model,
-        value_dim=value_dim,
-        features=r,
-        tau=cfg.tau,
-        beta_floor=beta_floor,
-    )
-    linear_capacity = max(len(linear_meta["keys"]), base_config.linear.capacity)
-    linear_config = dataclasses.replace(base_config.linear, capacity=linear_capacity)
-    bridge_config = dataclasses.replace(
-        base_config.bridge,
-        hub_window=max(base_config.bridge.hub_window, bridge_meta["legs"] * 4),
-    )
-    sera_config = dataclasses.replace(
-        base_config,
-        tokenizer=tokenizer_config,
-        attention=attention_config,
-        linear=linear_config,
-        bridge=bridge_config,
-    )
-    sera_model = sera_cls(sera_config)
-    runtime_snapshot = sera_model.snapshot()
+    try:
+        base_config = sera_config_cls()
+    except Exception:  # pragma: no cover - extremely defensive
+        base_config = None
+
+    if base_config is not None and dataclasses.is_dataclass(base_config):
+        pieces = tokenizer_meta.get("pieces", [])
+        tokenizer_vocab = {piece: token for piece, token in pieces}
+        max_piece_length = tokenizer_meta.get(
+            "max_piece_length", base_config.tokenizer.max_piece_length
+        )
+        tokenizer_config = dataclasses.replace(
+            base_config.tokenizer,
+            vocabulary=tokenizer_vocab,
+            max_piece_length=max_piece_length,
+        )
+        whitening_sig2 = metadata["attention"].get("whitening_sig2") or [1.0]
+        beta_floor = max(1e-3, min(float(value) for value in whitening_sig2))
+        value_dim = len(overlays.get("overlays_U", [])) or cfg.d_model
+        attention_config = dataclasses.replace(
+            base_config.attention,
+            dim=cfg.d_model,
+            value_dim=value_dim,
+            features=r,
+            tau=getattr(cfg, "tau", base_config.attention.tau),
+            beta_floor=beta_floor,
+        )
+        linear_capacity = max(len(linear_meta.get("keys", [])), base_config.linear.capacity)
+        linear_config = dataclasses.replace(base_config.linear, capacity=linear_capacity)
+        bridge_config = dataclasses.replace(
+            base_config.bridge,
+            hub_window=max(base_config.bridge.hub_window, bridge_meta.get("legs", 0) * 4),
+        )
+        sera_config = dataclasses.replace(
+            base_config,
+            tokenizer=tokenizer_config,
+            attention=attention_config,
+            linear=linear_config,
+            bridge=bridge_config,
+        )
+        sera_model = sera_cls(sera_config)
+        runtime_snapshot = sera_model.snapshot()
+    else:
+        config_instance = base_config if base_config is not None else object()
+        sera_model = sera_cls(config_instance)
+        runtime_snapshot = sera_model.snapshot()
 
     snapshot_path = output / "sera_state.pkl"
     snapshot = {
