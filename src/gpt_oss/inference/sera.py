@@ -2352,6 +2352,32 @@ class SeraConfig:
         )
 
 
+def _append_window(samples: Tuple[float, ...], window: int, value: float) -> Tuple[float, ...]:
+    """Append a value to a bounded window represented as a tuple."""
+
+    limit = int(window)
+    if limit <= 0:
+        return tuple()
+    if limit == 1:
+        return (float(value),)
+    trimmed = list(samples[-(limit - 1) :]) if samples else []
+    trimmed.append(float(value))
+    if len(trimmed) > limit:
+        trimmed = trimmed[-limit:]
+    return tuple(trimmed)
+
+
+def _quantile(samples: Sequence[float], percentile: float) -> float:
+    """Compute the requested quantile for a bounded sample window."""
+
+    if not samples:
+        return 0.0
+    ordered = sorted(float(v) for v in samples)
+    rank = math.ceil(percentile * len(ordered)) - 1
+    rank = max(0, min(rank, len(ordered) - 1))
+    return float(ordered[rank])
+
+
 @dataclass
 class SeraDiagnostics:
     tok_bytes_in: int = 0
@@ -2367,6 +2393,29 @@ class SeraDiagnostics:
     bridge_misses: int = 0
     tree_simulations: int = 0
     bridge_last_proof: bytes = field(default=b"", repr=False)
+    p99_window: int = 128
+    store_load_samples: Tuple[float, ...] = field(default_factory=tuple, repr=False)
+    stash_occ_samples: Tuple[float, ...] = field(default_factory=tuple, repr=False)
+    kick_len_samples: Tuple[float, ...] = field(default_factory=tuple, repr=False)
+    store_load_p99: float = 0.0
+    stash_occ_p99: float = 0.0
+    kick_len_p99: float = 0.0
+    capacity_lambda_hat: float = 0.0
+    capacity_load: float = 0.0
+    capacity_slack: float = 0.0
+    capacity_margin: float = 0.0
+    capacity_frozen: bool = False
+    bridge_guard_rate: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.p99_window < 1:
+            self.p99_window = 1
+        self.store_load_samples = tuple(float(v) for v in self.store_load_samples[-self.p99_window :])
+        self.stash_occ_samples = tuple(float(v) for v in self.stash_occ_samples[-self.p99_window :])
+        self.kick_len_samples = tuple(float(v) for v in self.kick_len_samples[-self.p99_window :])
+        self.store_load_p99 = _quantile(self.store_load_samples, 0.99)
+        self.stash_occ_p99 = _quantile(self.stash_occ_samples, 0.99)
+        self.kick_len_p99 = _quantile(self.kick_len_samples, 0.99)
 
 
 @dataclass
@@ -2496,11 +2545,41 @@ class Sera:
                 else:
                     self.diagnostics.bridge_misses += 1
             self.diagnostics.bridge_last_proof = proof
+            total_guards = self.diagnostics.bridge_hits + self.diagnostics.bridge_misses
+            if total_guards:
+                self.diagnostics.bridge_guard_rate = self.diagnostics.bridge_hits / float(total_guards)
+            else:
+                self.diagnostics.bridge_guard_rate = 0.0
             bridged = self.bridge.gate(gated, bridge_val, guard)
 
             self.tree_search.maybe_select()
             self.diagnostics.tree_simulations = self.tree_search._simulations
             self.diagnostics.lambda_star = self.config.lambda_floor
+
+            store = self.linear._weights
+            diag = self.diagnostics
+            diag.store_load_samples = _append_window(
+                diag.store_load_samples, diag.p99_window, store.load_factor
+            )
+            diag.store_load_p99 = _quantile(diag.store_load_samples, 0.99)
+            stash_capacity = max(1, store.stash_capacity)
+            diag.stash_occ_samples = _append_window(
+                diag.stash_occ_samples,
+                diag.p99_window,
+                store.stash_load / float(stash_capacity),
+            )
+            diag.stash_occ_p99 = _quantile(diag.stash_occ_samples, 0.99)
+            diag.kick_len_samples = _append_window(
+                diag.kick_len_samples, diag.p99_window, store.max_kick_length
+            )
+            diag.kick_len_p99 = _quantile(diag.kick_len_samples, 0.99)
+
+            capacity_monitor = self.linear._capacity_monitor
+            diag.capacity_lambda_hat = capacity_monitor.lambda_hat
+            diag.capacity_load = capacity_monitor.load
+            diag.capacity_slack = capacity_monitor.slack
+            diag.capacity_margin = capacity_monitor.margin
+            diag.capacity_frozen = capacity_monitor.frozen
 
             return {
                 "tokens": tokens,
