@@ -73,3 +73,22 @@ def test_single_turn_prompt(sera_manifest: Path) -> None:
     assert "Enabled tools: python" in proc.stdout
     assert "Sera" in proc.stdout
     assert "A" in proc.stdout
+
+
+def test_manifest_env_fallback(sera_manifest: Path) -> None:
+    script = [
+        sys.executable,
+        "-m",
+        "gpt_oss.cli.sera_chat",
+        "--state-file",
+        "sera_state.pkl",
+        "--prompt",
+        "ping",
+    ]
+    env = {
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+        "GPT_OSS_SERA_MANIFEST": str(sera_manifest),
+    }
+    proc = subprocess.run(script, capture_output=True, text=True, env=env, check=True)
+    assert "Enabled tools: none" in proc.stdout
+    assert "Sera" in proc.stdout
