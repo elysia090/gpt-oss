@@ -1,9 +1,11 @@
-"""Interactive CLI for chatting with a Sera runtime snapshot.
+"""Interactive CLI for chatting with a Sera manifest snapshot.
 
-The CLI expects a directory containing a serialized :class:`~gpt_oss.inference.sera.Sera`
-snapshot (typically produced by the Sera transfer tooling).  The snapshot is
-loaded via :func:`gpt_oss.inference.sera.Sera.restore` and then used to run a
-simple read-eval-print loop.
+The CLI expects a directory containing a converted Sera manifest bundle as
+produced by :mod:`gpt_oss.tools.sera_transfer`. The directory must at least
+provide ``sera_manifest.bin`` and a serialised runtime snapshot (``.pkl`` or
+``.json``). The snapshot is restored with
+:meth:`gpt_oss.inference.sera.Sera.restore` and then used in a simple
+read–eval–print loop that mirrors the UX of :mod:`gpt_oss.cli.chat_cli`.
 
 For automated smoke tests a one-shot mode is provided via ``--prompt`` which
 executes a single turn and exits.
@@ -12,18 +14,24 @@ executes a single turn and exits.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import pickle
 import sys
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
-import importlib.util
-import sys
+DEFAULT_STATE_FILENAMES: Sequence[str] = (
+    "sera_state.pkl",
+    "sera_state.json",
+    "sera_state.msgpack",
+)
+
+OPTIONAL_TOOLS = {"browser", "python"}
 
 
-def _load_sera_runtime():
+def _load_sera_class():
     sera_path = Path(__file__).resolve().parents[1] / "inference" / "sera.py"
     spec = importlib.util.spec_from_file_location("_sera_runtime", sera_path)
     if spec is None or spec.loader is None:  # pragma: no cover - defensive
@@ -35,6 +43,8 @@ def _load_sera_runtime():
 
 
 def _strip_private_fields(blob):
+    """Remove private keys (prefixed with ``_``) from nested structures."""
+
     if isinstance(blob, dict):
         return {
             key: _strip_private_fields(value)
@@ -46,12 +56,11 @@ def _strip_private_fields(blob):
     return blob
 
 
-DEFAULT_STATE_FILENAMES: Iterable[str] = (
-    "sera_state.pkl",
-    "sera_state.json",
-    "sera_state.msgpack",
-    "sera_state.yaml",
-)
+def _decode_bytes(data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.hex()
 
 
 def _first_existing(*paths: Path) -> Optional[Path]:
@@ -61,63 +70,54 @@ def _first_existing(*paths: Path) -> Optional[Path]:
     return None
 
 
-def _detect_artifacts(path: Optional[str]) -> Path:
-    """Resolve the directory that contains the Sera snapshot."""
-
+def _resolve_manifest_dir(path: Optional[str]) -> Path:
     candidates: list[Path] = []
     if path:
-        candidates.append(Path(path).expanduser().resolve())
-    env_path = os.environ.get("GPT_OSS_SERA_ARTIFACTS")
+        candidates.append(Path(path).expanduser())
+    env_path = os.environ.get("GPT_OSS_SERA_MANIFEST")
     if env_path:
-        candidates.append(Path(env_path).expanduser().resolve())
-    candidates.append(Path.cwd() / "gpt-oss-sera-20b")
+        candidates.append(Path(env_path).expanduser())
     candidates.append(Path.cwd())
 
     for candidate in candidates:
-        if candidate.exists() and candidate.is_dir():
+        candidate = candidate.resolve()
+        manifest_file = candidate / "sera_manifest.bin"
+        if candidate.is_dir() and manifest_file.exists():
             return candidate
     raise FileNotFoundError(
-        "Unable to locate the Sera artifact directory. Provide --artifacts or "
-        "set GPT_OSS_SERA_ARTIFACTS."
+        "Unable to locate a Sera manifest directory. Provide --manifest or set "
+        "GPT_OSS_SERA_MANIFEST to a directory containing sera_manifest.bin."
     )
 
 
-def _load_state(artifacts: Path, state_file: Optional[str]) -> dict:
-    """Load the serialized Sera snapshot from disk."""
-
-    if state_file is not None:
-        state_path = Path(state_file).expanduser()
+def _locate_state(manifest_dir: Path, override: Optional[str]) -> Path:
+    if override is not None:
+        state_path = Path(override).expanduser()
         if not state_path.is_absolute():
-            state_path = (artifacts / state_path).resolve()
+            state_path = manifest_dir / state_path
+        state_path = state_path.resolve()
         if not state_path.exists():
             raise FileNotFoundError(f"State file {state_path} not found")
-    else:
-        candidate_paths = [artifacts / name for name in DEFAULT_STATE_FILENAMES]
-        state_path = _first_existing(*candidate_paths)
-        if state_path is None:
-            raise FileNotFoundError(
-                f"No Sera snapshot found in {artifacts}. Expected one of: "
-                + ", ".join(name for name in DEFAULT_STATE_FILENAMES)
-            )
+        return state_path
 
-    if state_path.suffix == ".json":
-        try:
-            with state_path.open("r", encoding="utf-8") as fh:
-                return json.load(fh)
-        except json.JSONDecodeError as exc:  # pragma: no cover - defensive
-            raise RuntimeError(f"Failed to parse Sera snapshot {state_path}: {exc}") from exc
-    elif state_path.suffix in {".pkl", ".pickle"}:
-        with state_path.open("rb") as fh:
+    candidate_paths = [manifest_dir / name for name in DEFAULT_STATE_FILENAMES]
+    state_path = _first_existing(*candidate_paths)
+    if state_path is None:
+        raise FileNotFoundError(
+            "No Sera runtime snapshot found alongside the manifest. Expected one "
+            "of: " + ", ".join(DEFAULT_STATE_FILENAMES)
+        )
+    return state_path
+
+
+def _load_state(path: Path):
+    if path.suffix in {".pkl", ".pickle"}:
+        with path.open("rb") as fh:
             return pickle.load(fh)
-    else:  # pragma: no cover - defensive
-        raise RuntimeError(f"Unsupported snapshot format for {state_path}")
-
-
-def _decode_bytes(data: bytes) -> str:
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return data.hex()
+    if path.suffix == ".json":
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    raise RuntimeError(f"Unsupported snapshot format: {path.suffix}")
 
 
 def _run_turn(model, prompt: str, response_token: int) -> str:
@@ -125,27 +125,34 @@ def _run_turn(model, prompt: str, response_token: int) -> str:
     tokens = result.get("tokens", [])
     try:
         normalised = model.tokenizer.decode(tokens)
-    except Exception:  # pragma: no cover - tokenizer failures are surfaced
+    except Exception:
         normalised = b""
+    if isinstance(normalised, (bytes, bytearray)):
+        user_text = _decode_bytes(bytes(normalised))
+    else:
+        user_text = str(normalised)
     response_bytes = model.tokenizer.decode([int(response_token)])
-    response_text = _decode_bytes(response_bytes)
+    if isinstance(response_bytes, (bytes, bytearray)):
+        response_text = _decode_bytes(bytes(response_bytes))
+    else:
+        response_text = str(response_bytes)
 
-    print(f"User ({len(tokens)} tokens): {_decode_bytes(normalised)}")
+    print(f"User ({len(tokens)} tokens): {user_text}")
     print(f"Sera: {response_text}")
     return response_text
 
 
-def main(argv: Optional[Iterable[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Interactive chat using Sera runtime snapshots")
+def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Interactive chat using Sera manifest artefacts")
     parser.add_argument(
-        "--artifacts",
+        "--manifest",
         type=str,
-        help="Directory containing the converted Sera artifact bundle",
+        help="Directory containing sera_manifest.bin and runtime snapshot",
     )
     parser.add_argument(
         "--state-file",
         type=str,
-        help="Explicit path (relative or absolute) to the serialized Sera snapshot",
+        help="Explicit path (relative to manifest dir) for the runtime snapshot",
     )
     parser.add_argument(
         "--prompt",
@@ -156,23 +163,40 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         "--response-token",
         type=int,
         default=65,
-        help="Token id to use for the default response when generating output",
+        help="Token id to use for the placeholder model response",
     )
+    parser.add_argument(
+        "--tool",
+        action="append",
+        dest="tools",
+        default=[],
+        choices=sorted(OPTIONAL_TOOLS),
+        help="Enable optional tools exposed in the interface",
+    )
+    return parser.parse_args(argv)
 
-    args = parser.parse_args(list(argv) if argv is not None else None)
 
-    artifacts = _detect_artifacts(args.artifacts)
-    state_blob = _load_state(artifacts, args.state_file)
-    if isinstance(state_blob, dict) and "config" in state_blob:
-        state_blob["config"] = _strip_private_fields(state_blob["config"])
-    Sera = _load_sera_runtime()
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    args = _parse_args(list(argv) if argv is not None else None)
+
+    manifest_dir = _resolve_manifest_dir(args.manifest)
+    state_path = _locate_state(manifest_dir, args.state_file)
+    state_blob = _strip_private_fields(_load_state(state_path))
+    Sera = _load_sera_class()
     model = Sera.restore(state_blob)
+
+    enabled_tools = sorted(set(args.tools or []))
+    print(f"Loaded Sera manifest from {manifest_dir}")
+    if enabled_tools:
+        print("Enabled tools: " + ", ".join(enabled_tools))
+    else:
+        print("Enabled tools: none")
 
     if args.prompt is not None:
         _run_turn(model, args.prompt, args.response_token)
         return 0
 
-    print("Loaded Sera runtime. Type your message and press enter (Ctrl+C to exit).")
+    print("Type your message and press enter (Ctrl+C to exit).")
     try:
         while True:
             prompt = input("You: ")
