@@ -231,6 +231,46 @@ def test_cli_round_trip(tmp_path: Path, factory) -> None:
     assert snapshot["metadata"]["attention"]["features"] == 4
 
 
+def test_cli_verbose_emits_search_hints(tmp_path: Path) -> None:
+    source = _create_openai_checkpoint(tmp_path / "verbose_logging")
+    output = tmp_path / "output"
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "gpt_oss.tools.sera_transfer",
+        "--source",
+        str(source),
+        "--output",
+        str(output),
+        "--verbose",
+    ]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join([str(ROOT / "src"), str(ROOT)])
+    completed = subprocess.run(
+        cmd,
+        check=True,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    log_output = completed.stdout
+    resolved_source = str(source.resolve())
+    config_path = str((source / "config.json").resolve())
+    weights_path = str((source / "model.safetensors").resolve())
+
+    assert "Resolved source path" in log_output
+    assert resolved_source in log_output
+    assert "Registered search root" in log_output
+    assert config_path in log_output
+    assert weights_path in log_output
+    assert "Probing" in log_output
+    assert "Model config keys" in log_output
+    assert "d_model" in log_output
+    assert "vocab_size" in log_output
+
 def test_deterministic_conversion(tmp_path: Path) -> None:
     source = _create_checkpoint(tmp_path / "deterministic")
     out_a = tmp_path / "out_a"
