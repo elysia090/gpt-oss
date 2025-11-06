@@ -14,7 +14,7 @@ import textwrap
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import sys
 
 try:  # pragma: no cover - exercised indirectly in environments with safetensors
@@ -248,7 +248,28 @@ def gaussian_vector(prng: SplitMix64, length: int) -> List[float]:
         values.append(g0)
         if len(values) < length:
             values.append(g1)
-    return values
+        return values
+
+
+# ---------------------------------------------------------------------------
+# Hash helpers shared across conversion stages
+# ---------------------------------------------------------------------------
+
+
+def _mix64(value: int, seed: int = 0) -> int:
+    z = (value + seed + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9 & 0xFFFFFFFFFFFFFFFF
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB & 0xFFFFFFFFFFFFFFFF
+    return (z ^ (z >> 31)) & 0xFFFFFFFFFFFFFFFF
+
+
+def _tensor_bytes(tensor: List) -> bytes:
+    from array import array
+
+    flat = _flatten(tensor)
+    buf = array("d")
+    buf.extend(float(x) for x in flat)
+    return buf.tobytes()
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +392,11 @@ def load_tensors(path: Path) -> Dict[str, List]:
     tensors: Dict[str, List] = {}
     with safe_open(path, framework="python") as f:
         for key in f.keys():
-            tensors[key] = f.get_tensor(key)
+            tensor = f.get_tensor(key)
+            try:
+                tensors[key] = tensor.tolist()
+            except AttributeError:
+                tensors[key] = tensor  # pragma: no cover - defensive fallback
     return tensors
 
 
@@ -470,87 +495,279 @@ def top_indices(values: List[float], count: int) -> List[int]:
     return [idx for idx, _ in sorted(enumerate(values), key=lambda item: item[1], reverse=True)[:count]]
 
 
-def collapse_ffn(layer: LayerConfig, cfg: ModelConfig, tensors: Mapping[str, List], top_l: int) -> Dict[str, List]:
-    W1 = tensors[layer.w1]
-    W2 = tensors[layer.w2]
-    b1 = tensors[layer.b1]
-    b2 = tensors[layer.b2]
-    abs_W1 = matrix_abs(W1)
-    abs_W2 = matrix_abs(W2)
-    S = matmul(abs_W2, abs_W1)
-    weights: List[float] = []
-    keys: List[int] = []
-    for j in range(cfg.d_model):
-        column = [row[j] for row in S]
-        idxs = top_indices(column, top_l)
-        effect = 0.0
-        for h in idxs:
-            effect += sign(W2[j][h]) * max(0.0, W1[h][j])
-        weights.append(effect)
-        keys.append(j)
-    base_bias = sum(b2) + sum(max(0.0, x) for x in b1)
+def collapse_ffn(
+    cfg: ModelConfig, tensors: Mapping[str, List], top_l: int
+) -> Tuple[Dict[str, List], Dict[str, object]]:
+    weight_map: Dict[int, float] = {}
+    key_order: List[int] = []
+    base_bias = 0.0
 
-    seeds = [0 for _ in range(max(1, int(math.ceil(1.23 * len(keys)))))]
-    key_bytes = [[(key >> (8 * i)) & 0xFF for i in range(8)] for key in keys]
-    return {
-        "linear_mphf": [[(seed >> (8 * i)) & 0xFF for i in range(4)] for seed in seeds],
+    for layer_index, layer in enumerate(cfg.layers):
+        W1 = tensors[layer.w1]
+        W2 = tensors[layer.w2]
+        b1 = tensors[layer.b1]
+        b2 = tensors[layer.b2]
+        hidden_dim = len(W1)
+
+        base_bias += sum(float(x) for x in b2)
+        base_bias += sum(max(0.0, float(x)) for x in b1)
+
+        abs_W1 = matrix_abs(W1)
+        abs_W2 = matrix_abs(W2)
+
+        for feature in range(cfg.d_model):
+            scores: List[float] = []
+            for h in range(hidden_dim):
+                col_sum = sum(abs_W2[out_idx][h] for out_idx in range(len(abs_W2)))
+                scores.append(col_sum * abs_W1[h][feature])
+            idxs = top_indices(scores, top_l)
+            effect = 0.0
+            for h in idxs:
+                sign_sum = sum(W2[out_idx][h] for out_idx in range(len(W2)))
+                effect += sign(sign_sum) * max(0.0, float(W1[h][feature]))
+            key = (layer_index << 32) | feature
+            weight_map[key] = effect
+            key_order.append(key)
+
+    capacity = len(weight_map)
+    table_size = max(1, int(math.ceil(1.23 * capacity)))
+    slots: List[Optional[int]] = [None] * capacity
+    occupied = [False] * capacity
+    seeds: List[int] = [0] * table_size
+    buckets: Dict[int, List[int]] = {}
+    for key in key_order:
+        bucket = _mix64(key) % table_size
+        buckets.setdefault(bucket, []).append(key)
+
+    def assign_positions(options: List[Tuple[int, int]]) -> Optional[List[int]]:
+        placement: List[int] = []
+        used: set[int] = set()
+        for pos0, pos1 in options:
+            choice = None
+            if not occupied[pos0] and pos0 not in used:
+                choice = pos0
+            elif not occupied[pos1] and pos1 not in used:
+                choice = pos1
+            if choice is None:
+                return None
+            used.add(choice)
+            placement.append(choice)
+        return placement
+
+    ordered = sorted(buckets.items(), key=lambda item: (len(item[1]), item[0]), reverse=True)
+    for bucket, bucket_keys in ordered:
+        local_keys = sorted(bucket_keys)
+        for seed_candidate in range(1 << 16):
+            options: List[Tuple[int, int]] = []
+            for key in local_keys:
+                pos0 = _mix64(key, seed_candidate) % capacity
+                pos1 = _mix64(key, seed_candidate + 1) % capacity
+                options.append((pos0, pos1))
+            assignment = assign_positions(options)
+            if assignment is not None:
+                seeds[bucket] = seed_candidate
+                for key, slot in zip(local_keys, assignment):
+                    slots[slot] = key
+                    occupied[slot] = True
+                break
+        else:  # pragma: no cover - deterministic bound ensures termination
+            raise RuntimeError("Unable to build FFN minimal perfect hash")
+
+    slot_keys: List[int] = [key for key in slots if key is not None]
+    mphf = [[(seed >> (8 * i)) & 0xFF for i in range(4)] for seed in seeds]
+    key_bytes = [[(key >> (8 * i)) & 0xFF for i in range(8)] for key in slot_keys]
+    weights = [weight_map[key] for key in slot_keys]
+
+    arrays = {
+        "linear_mphf": mphf,
         "linear_keys": key_bytes,
         "linear_weights": weights,
         "linear_bias": [base_bias],
         "cuckoo_delta": [],
     }
+    metadata = {
+        "keys": slot_keys,
+        "weights": weights,
+        "bias": base_bias,
+        "table_size": table_size,
+    }
+    return arrays, metadata
 
 
 # ---------------------------------------------------------------------------
 # Memory and bridge records
 
 
-def memory_coefficients(cfg: ModelConfig) -> Dict[str, List]:
+def memory_coefficients(cfg: ModelConfig) -> Tuple[Dict[str, List], Dict[str, object]]:
     theta = cfg.rope_theta if cfg.rope_theta is not None else 10000.0
     rho = 0.995
-    coeffs = [[2 * rho * math.cos(1.0 / theta), -rho ** 2, 1.0]]
-    delay = [0.0]
-    return {"memory_coeff": coeffs, "delaybuf_init": delay}
+    layer_count = max(1, len(cfg.layers))
+    coeffs: List[List[float]] = []
+    delay = []
+    for layer_index in range(layer_count):
+        angle = (layer_index + 1) / layer_count * (1.0 / theta)
+        coeffs.append([2 * rho * math.cos(angle), -(rho ** 2), 1.0])
+        delay.append(0.0)
+    arrays = {"memory_coeff": coeffs, "delaybuf_init": delay}
+    metadata = {"rho": rho, "theta": theta, "layers": layer_count}
+    return arrays, metadata
 
 
-def bridge_records(cfg: ModelConfig, vocab_size: int, W: int = 2) -> Dict[str, List]:
-    vocab = vocab_size or 16
+def _layer_seed(layer: LayerConfig, tensors: Mapping[str, List]) -> int:
+    digest = hashlib.sha256()
+    for name in (layer.w_k, layer.w_o, layer.w1, layer.w2, layer.b1, layer.b2):
+        tensor = tensors.get(name)
+        if tensor is None:
+            continue
+        digest.update(_tensor_bytes(tensor))
+    return int.from_bytes(digest.digest()[:8], "little", signed=False)
+
+
+def _quantize_q8_8(value: float) -> Tuple[List[int], float]:
+    magnitude = abs(value)
+    if magnitude == 0:
+        scale = 1.0
+    else:
+        scale = max(1e-6, magnitude / 0.832767)
+    quantised = int(round(value / scale * 256.0))
+    quantised = max(-32768, min(32767, quantised))
+    scale_q = int(round(scale * 256.0))
+    scale_q = max(1, min(32767, scale_q))
+    return [scale_q, quantised], scale
+
+
+def bridge_records(
+    cfg: ModelConfig, tensors: Mapping[str, List], vocab_size: int, W: int = 2
+) -> Tuple[Dict[str, List], Dict[str, object]]:
+    vocab = vocab_size or cfg.d_model or 16
+    vocab = max(1, vocab)
     hubs: List[List[int]] = []
+    qdin: List[List[int]] = []
+    qdout: List[List[int]] = []
+    peers: List[int] = []
+    in_scales: List[float] = []
+    out_scales: List[float] = []
+
+    aggregated_in = [0.0 for _ in range(vocab)]
+    aggregated_out = [0.0 for _ in range(vocab)]
+    seeds: List[int] = []
+    for layer in cfg.layers:
+        seeds.append(_layer_seed(layer, tensors))
+        W1 = tensors[layer.w1]
+        W2 = tensors[layer.w2]
+        b1 = tensors[layer.b1]
+        b2 = tensors[layer.b2]
+        hidden_dim = len(W1)
+        for token in range(vocab):
+            feature = token % cfg.d_model
+            avg_w1 = sum(float(W1[h][feature]) for h in range(hidden_dim)) / max(1, hidden_dim)
+            avg_w2 = sum(float(value) for value in W2[feature]) / max(1, len(W2[feature]))
+            bias1 = float(b1[feature % len(b1)]) if b1 else 0.0
+            bias2 = float(b2[feature % len(b2)]) if b2 else 0.0
+            aggregated_in[token] += avg_w1 + bias1
+            aggregated_out[token] += avg_w2 + bias2
+
+    global_seed = 0
+    for idx, seed in enumerate(seeds):
+        global_seed ^= _mix64(seed, idx + 1)
+
     for token in range(vocab):
+        prng = SplitMix64(global_seed ^ token)
         row: List[int] = []
-        for leg in range(W):
-            bit = ((token + leg * 2654435761) & 63)
-            word = 1 << bit
-            row.extend([(word >> (8 * i)) & 0xFF for i in range(8)])
+        for _ in range(W):
+            bits = prng.next()
+            row.extend([(bits >> (8 * i)) & 0xFF for i in range(8)])
         hubs.append(row)
-    peers = [128 for _ in range(vocab)]
-    qdin = [0 for _ in range(vocab)]
-    qdout = [0 for _ in range(vocab)]
-    return {
+
+        qdin_entry, in_scale = _quantize_q8_8(aggregated_in[token])
+        qdout_entry, out_scale = _quantize_q8_8(aggregated_out[token])
+        qdin.append(qdin_entry)
+        qdout.append(qdout_entry)
+        in_scales.append(in_scale)
+        out_scales.append(out_scale)
+
+        jitter = ((prng.next() >> 8) & 0xFF) / 512.0 - 0.25
+        peer_score = int(round((0.5 + jitter) * 256.0))
+        peer_score = max(-32768, min(32767, peer_score))
+        peers.append(peer_score)
+
+    arrays = {
         "bridge_hubs": hubs,
         "bridge_qDin": qdin,
         "bridge_qDout": qdout,
         "peer_scores": peers,
     }
+    metadata = {
+        "in_scales": in_scales,
+        "out_scales": out_scales,
+        "seed": global_seed,
+        "legs": W,
+    }
+    return arrays, metadata
 
 
 # ---------------------------------------------------------------------------
 # Tokenizer placeholders
 
 
-def tokenizer_arrays(vocab_size: int, max_len: int = 4) -> Dict[str, List]:
-    fst_text = textwrap.dedent(
-        """
-        % byte level fst placeholder
-        start 0
-        end 0
-        """
-    ).strip().encode("utf-8")
-    fst_array = list(fst_text)
-    tables = {f"T_{i}": [0 for _ in range(256)] for i in range(1, max_len + 1)}
-    data = {"tokenizer_fst": fst_array}
-    data.update(tables)
-    return data
+def tokenizer_arrays(
+    cfg: ModelConfig, tensors: Mapping[str, List], max_len: int = 4
+) -> Tuple[Dict[str, List], Dict[str, object]]:
+    vocab = cfg.vocab_size or 256
+    vocab = max(1, vocab)
+    pieces: List[Tuple[bytes, int]] = []
+
+    layer_seeds = [_layer_seed(layer, tensors) for layer in cfg.layers]
+    global_seed = 0
+    for idx, seed in enumerate(layer_seeds):
+        global_seed ^= _mix64(seed, idx + 1)
+    global_seed ^= _mix64(vocab, len(layer_seeds) + 1)
+
+    prng = SplitMix64(global_seed)
+    sequences: List[Tuple[int, bytes]] = []
+    for token in range(vocab):
+        seed = prng.next()
+        local = SplitMix64(seed)
+        length = 1 + (local.next() % max_len)
+        seq = bytes((local.next() & 0xFF) for _ in range(length))
+        sequences.append((token, seq))
+        pieces.append((seq, token))
+
+    lines = ["% byte level fst derived from checkpoint", "start 0", "end 0"]
+    next_state = 1
+    for token, piece in sequences:
+        current = 0
+        for idx, byte in enumerate(piece):
+            last = idx == len(piece) - 1
+            if last:
+                dest = 0
+                output = token
+            else:
+                dest = next_state
+                next_state += 1
+                output = 0
+            lines.append(f"{current} {dest} {byte} {output}")
+            current = dest
+    fst_text = "\n".join(lines).encode("utf-8")
+
+    tables: Dict[str, List[int]] = {}
+    modulus = 1 << 64
+    for length in range(1, max_len + 1):
+        factor = pow(257, length - 1, modulus)
+        table = []
+        for byte in range(256):
+            value = (factor * byte + global_seed) & 0xFFFFFFFFFFFFFFFF
+            table.append(value & 0xFF)
+        tables[f"T_{length}"] = table
+
+    arrays = {"tokenizer_fst": list(fst_text)}
+    arrays.update(tables)
+    metadata = {
+        "pieces": pieces,
+        "max_piece_length": max_len,
+        "seed": global_seed,
+    }
+    return arrays, metadata
 
 
 # ---------------------------------------------------------------------------
@@ -670,50 +887,64 @@ def convert(
     arrays_dir.mkdir(parents=True, exist_ok=True)
 
     artefact_payloads: Dict[str, bytes] = {}
+    artefact_records: Dict[str, Dict[str, object]] = {}
+    metadata: Dict[str, object] = {}
 
-    for name, data in tokenizer_arrays(cfg.vocab_size).items():
-        payload = write_array(arrays_dir / f"{name}.bin", data, "u8")
+    def store_array(name: str, data, dtype: str) -> None:
+        path = arrays_dir / f"{name}.bin"
+        payload = write_array(path, data, dtype)
         artefact_payloads[name] = payload
+        artefact_records[name] = {
+            "path": str(path),
+            "dtype": dtype,
+            "shape": _infer_shape(data),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+
+    tokenizer_data, tokenizer_meta = tokenizer_arrays(cfg, tensors)
+    for name, data in tokenizer_data.items():
+        store_array(name, data, "u8")
+    metadata["tokenizer"] = tokenizer_meta
 
     prf = compute_prf(cfg.layers[0], cfg, tensors, r)
     for name, data in prf.items():
-        payload = write_array(arrays_dir / f"{name}.bin", data, "f32")
-        artefact_payloads[name] = payload
+        store_array(name, data, "f32")
 
     overlays = compute_overlays(cfg.layers[0], cfg, tensors, r, r_v)
     for name, data in overlays.items():
-        payload = write_array(arrays_dir / f"{name}.bin", data, "f32")
-        artefact_payloads[name] = payload
+        store_array(name, data, "f32")
 
-    linear = collapse_ffn(cfg.layers[0], cfg, tensors, top_l)
-    artefact_payloads["linear_mphf"] = write_array(arrays_dir / "linear_mphf.bin", linear["linear_mphf"], "u8")
-    artefact_payloads["linear_keys"] = write_array(arrays_dir / "linear_keys.bin", linear["linear_keys"], "u8")
-    artefact_payloads["linear_weights"] = write_array(arrays_dir / "linear_weights.bin", linear["linear_weights"], "f32")
-    artefact_payloads["linear_bias"] = write_array(arrays_dir / "linear_bias.bin", linear["linear_bias"], "f32")
-    artefact_payloads["cuckoo_delta"] = write_array(arrays_dir / "cuckoo_delta.bin", linear["cuckoo_delta"], "u8")
+    linear_data, linear_meta = collapse_ffn(cfg, tensors, top_l)
+    store_array("linear_mphf", linear_data["linear_mphf"], "u8")
+    store_array("linear_keys", linear_data["linear_keys"], "u8")
+    store_array("linear_weights", linear_data["linear_weights"], "f32")
+    store_array("linear_bias", linear_data["linear_bias"], "f32")
+    store_array("cuckoo_delta", linear_data["cuckoo_delta"], "u8")
+    metadata["linear"] = linear_meta
 
-    memory = memory_coefficients(cfg)
-    artefact_payloads["memory_coeff"] = write_array(arrays_dir / "memory_coeff.bin", memory["memory_coeff"], "f64")
-    artefact_payloads["delaybuf_init"] = write_array(arrays_dir / "delaybuf_init.bin", memory["delaybuf_init"], "f32")
+    memory_data, memory_meta = memory_coefficients(cfg)
+    store_array("memory_coeff", memory_data["memory_coeff"], "f64")
+    store_array("delaybuf_init", memory_data["delaybuf_init"], "f32")
+    metadata["memory"] = memory_meta
 
-    bridge = bridge_records(cfg, cfg.vocab_size)
-    artefact_payloads["bridge_hubs"] = write_array(arrays_dir / "bridge_hubs.bin", bridge["bridge_hubs"], "u8")
-    artefact_payloads["bridge_qDin"] = write_array(arrays_dir / "bridge_qDin.bin", bridge["bridge_qDin"], "i16")
-    artefact_payloads["bridge_qDout"] = write_array(arrays_dir / "bridge_qDout.bin", bridge["bridge_qDout"], "i16")
-    artefact_payloads["peer_scores"] = write_array(arrays_dir / "peer_scores.bin", bridge["peer_scores"], "i16")
+    bridge_data, bridge_meta = bridge_records(cfg, tensors, cfg.vocab_size)
+    store_array("bridge_hubs", bridge_data["bridge_hubs"], "u8")
+    store_array("bridge_qDin", bridge_data["bridge_qDin"], "i16")
+    store_array("bridge_qDout", bridge_data["bridge_qDout"], "i16")
+    store_array("peer_scores", bridge_data["peer_scores"], "i16")
+    metadata["bridge"] = bridge_meta
 
     write_manifest(output / "sera_manifest.bin", cfg, artefact_payloads, r=r, r_v=r_v, vocab_size=cfg.vocab_size or 16)
 
-    # Emit a baseline runtime snapshot so downstream tooling (e.g. the chat CLI)
-    # can bootstrap a Sera instance without additional processing steps.
     snapshot_path = output / "sera_state.pkl"
-    if not snapshot_path.exists():
-        Sera, SeraConfig = _load_sera_runtime()
-        model = Sera(SeraConfig())
-        snapshot = model.snapshot()
-        snapshot["config"] = _config_to_dict(model.config)
-        with snapshot_path.open("wb") as fh:
-            pickle.dump(snapshot, fh)
+    snapshot = {
+        "model_config": _config_to_dict(cfg),
+        "artefacts": artefact_records,
+        "metadata": metadata,
+        "manifest_path": str(output / "sera_manifest.bin"),
+    }
+    with snapshot_path.open("wb") as fh:
+        pickle.dump(snapshot, fh)
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

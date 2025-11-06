@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import pickle
 import random
 import struct
 import subprocess
@@ -36,29 +38,31 @@ def _create_checkpoint(tmp_path: Path) -> Path:
         "vocab_size": 8,
         "tau": 0.5,
         "rope_theta": 10000.0,
-        "layers": [
-            {
-                "name": "layer0",
-                "W_K": "layers.0.attn.k.weight",
-                "W_O": "layers.0.attn.o.weight",
-                "FFN_W1": "layers.0.ffn.w1.weight",
-                "FFN_W2": "layers.0.ffn.w2.weight",
-                "FFN_B1": "layers.0.ffn.w1.bias",
-                "FFN_B2": "layers.0.ffn.w2.bias",
-            }
-        ],
     }
-    (source / "config.json").write_text(json.dumps(config))
-
+    layers = []
     rng = random.Random(0)
-    tensors = {
-        "layers.0.attn.k.weight": _create_matrix(4, 4, rng),
-        "layers.0.attn.o.weight": _create_matrix(4, 4, rng),
-        "layers.0.ffn.w1.weight": _create_matrix(8, 4, rng),
-        "layers.0.ffn.w2.weight": _create_matrix(4, 8, rng),
-        "layers.0.ffn.w1.bias": _create_vector(8, rng),
-        "layers.0.ffn.w2.bias": _create_vector(4, rng),
-    }
+    tensors = {}
+    for idx in range(2):
+        prefix = f"layers.{idx}"
+        layer = {
+            "name": f"layer{idx}",
+            "W_K": f"{prefix}.attn.k.weight",
+            "W_O": f"{prefix}.attn.o.weight",
+            "FFN_W1": f"{prefix}.ffn.w1.weight",
+            "FFN_W2": f"{prefix}.ffn.w2.weight",
+            "FFN_B1": f"{prefix}.ffn.w1.bias",
+            "FFN_B2": f"{prefix}.ffn.w2.bias",
+        }
+        layers.append(layer)
+        tensors[layer["W_K"]] = _create_matrix(4, 4, rng)
+        tensors[layer["W_O"]] = _create_matrix(4, 4, rng)
+        tensors[layer["FFN_W1"]] = _create_matrix(8, 4, rng)
+        tensors[layer["FFN_W2"]] = _create_matrix(4, 8, rng)
+        tensors[layer["FFN_B1"]] = _create_vector(8, rng)
+        tensors[layer["FFN_B2"]] = _create_vector(4, rng)
+
+    config["layers"] = layers
+    (source / "config.json").write_text(json.dumps(config))
     save_file(tensors, source / "model.safetensors")
     return source
 
@@ -133,3 +137,54 @@ def test_deterministic_conversion(tmp_path: Path) -> None:
 
     for file_a, file_b in zip(files_a, files_b):
         assert file_a.read_bytes() == file_b.read_bytes()
+
+
+def test_written_arrays_match_reference(tmp_path: Path) -> None:
+    source = _create_checkpoint(tmp_path)
+    output = tmp_path / "output"
+    sera_transfer.convert(source, output, r=4, r_v=2, top_l=2)
+
+    cfg = sera_transfer.ModelConfig.from_dict(json.loads((source / "config.json").read_text()))
+    tensors = sera_transfer.load_tensors(source / "model.safetensors")
+    arrays_dir = output / "arrays"
+
+    tokenizer_data, tokenizer_meta = sera_transfer.tokenizer_arrays(cfg, tensors)
+    fst_payload = _payload(arrays_dir / "tokenizer_fst.bin")
+    expected_fst = sera_transfer._pack_values(tokenizer_data["tokenizer_fst"], "B")
+    assert fst_payload == expected_fst
+    assert len(tokenizer_meta["pieces"]) == cfg.vocab_size
+
+    linear_data, linear_meta = sera_transfer.collapse_ffn(cfg, tensors, top_l=2)
+    assert set(linear_meta["keys"]) == {
+        (layer_idx << 32) | feature
+        for layer_idx in range(len(cfg.layers))
+        for feature in range(cfg.d_model)
+    }
+    assert len(linear_meta["weights"]) == cfg.d_model * len(cfg.layers)
+    assert _payload(arrays_dir / "linear_keys.bin") == sera_transfer._pack_values(
+        linear_data["linear_keys"], "B"
+    )
+    assert _payload(arrays_dir / "linear_weights.bin") == sera_transfer._pack_values(
+        linear_data["linear_weights"], "f"
+    )
+
+    memory_data, memory_meta = sera_transfer.memory_coefficients(cfg)
+    assert memory_meta["layers"] == len(cfg.layers)
+    assert _payload(arrays_dir / "memory_coeff.bin") == sera_transfer._pack_values(
+        memory_data["memory_coeff"], "d"
+    )
+
+    bridge_data, bridge_meta = sera_transfer.bridge_records(cfg, tensors, cfg.vocab_size)
+    assert bridge_meta["legs"] == 2
+    assert len(bridge_meta["in_scales"]) == cfg.vocab_size
+    assert _payload(arrays_dir / "bridge_qDin.bin") == sera_transfer._pack_values(
+        bridge_data["bridge_qDin"], "h"
+    )
+
+    snapshot = pickle.loads((output / "sera_state.pkl").read_bytes())
+    artefacts = snapshot["artefacts"]
+    assert "tokenizer_fst" in artefacts
+    for name, record in artefacts.items():
+        payload = _payload(arrays_dir / f"{name}.bin")
+        assert record["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert snapshot["metadata"]["tokenizer"]["max_piece_length"] == 4
