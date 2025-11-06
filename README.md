@@ -260,7 +260,7 @@ pip install gpt-oss[triton]
 If you want to modify the code or try the metal implementation set the project up locally:
 
 ```shell
-git clone https://github.com/openai/gpt-oss.git
+git clone https://github.com/elysia/gpt-oss.git
 GPTOSS_BUILD_METAL=1 pip install -e ".[metal]"
 ```
 
@@ -282,7 +282,7 @@ and invoking the chat CLI—so you can focus on testing the experience.
 **Run the helper**
 
 ```shell
-git clone https://github.com/openai/gpt-oss.git
+git clone https://github.com/elysia/gpt-oss.git
 cd gpt-oss
 python -m venv .venv && source .venv/bin/activate  # optional but recommended
 pip install -e .
