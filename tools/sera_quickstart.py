@@ -43,6 +43,7 @@ def _download_checkpoint(
     download_dir = download_dir.expanduser()
     download_dir.parent.mkdir(parents=True, exist_ok=True)
 
+    print(f"Downloading {repo_id} to {download_dir}...")
     snapshot_path = snapshot_download(
         repo_id=repo_id,
         revision=revision,
@@ -65,6 +66,10 @@ def _convert_checkpoint(
         raise QuickstartError(f"Checkpoint directory {source_dir} does not exist")
 
     output_dir = output_dir.expanduser().resolve()
+    print(
+        "Converting checkpoint at"
+        f" {source_dir} -> {output_dir} (r={r}, r_v={r_v}, top_l={top_l})"
+    )
     sera_transfer.convert(source_dir, output_dir, r=r, r_v=r_v, top_l=top_l)
     return output_dir
 
@@ -153,27 +158,32 @@ def _prepare_directories(args: argparse.Namespace) -> tuple[Path, Path]:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
-    args = _parse_args(list(argv) if argv is not None else None)
-    download_dir, output_dir = _prepare_directories(args)
+    try:
+        args = _parse_args(list(argv) if argv is not None else None)
+        download_dir, output_dir = _prepare_directories(args)
 
-    if args.checkpoint_dir is not None:
-        checkpoint_dir = Path(args.checkpoint_dir).expanduser().resolve()
-    else:
-        checkpoint_dir = _download_checkpoint(args.repo_id, args.revision, download_dir)
+        if args.checkpoint_dir is not None:
+            checkpoint_dir = Path(args.checkpoint_dir).expanduser().resolve()
+        else:
+            checkpoint_dir = _download_checkpoint(args.repo_id, args.revision, download_dir)
 
-    artifacts_dir = _convert_checkpoint(
-        checkpoint_dir,
-        output_dir,
-        r=args.r,
-        r_v=args.rv,
-        top_l=args.topL,
-    )
+        artifacts_dir = _convert_checkpoint(
+            checkpoint_dir,
+            output_dir,
+            r=args.r,
+            r_v=args.rv,
+            top_l=args.topL,
+        )
 
-    print(f"Sera artefacts written to {artifacts_dir}")
+        print(f"Sera artefacts written to {artifacts_dir}")
 
-    if args.chat:
-        return _launch_chat_cli(artifacts_dir, args.chat_arg)
-    return 0
+        if args.chat:
+            print("Launching sera_chat CLI...")
+            return _launch_chat_cli(artifacts_dir, args.chat_arg)
+        return 0
+    except QuickstartError as exc:
+        print(f"sera_quickstart: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point

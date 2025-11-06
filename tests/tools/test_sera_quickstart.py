@@ -138,3 +138,19 @@ def test_quickstart_pipeline(tmp_path: Path, monkeypatch, launch_chat: bool) -> 
     assert any(output_dir.glob("sera_state.*"))
     if launch_chat:
         assert chat_calls == [(output_dir.resolve(), tuple())]
+
+
+def test_quickstart_missing_checkpoint(tmp_path: Path, capsys) -> None:
+    quickstart = _load_quickstart_module()
+
+    argv = [
+        "--checkpoint-dir",
+        str(tmp_path / "missing"),
+        "--output-dir",
+        str(tmp_path / "sera"),
+    ]
+
+    exit_code = quickstart.main(argv)
+    assert exit_code == 1
+    stderr = capsys.readouterr().err
+    assert "sera_quickstart:" in stderr
