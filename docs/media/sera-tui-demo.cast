@@ -1,0 +1,10 @@
+{"version": 2, "width": 100, "height": 28, "timestamp": 1700000000, "env": {"SHELL": "/bin/bash", "TERM": "xterm-256color"}}
+[0.0, "o", "$ gpt-oss-sera-chat --manifest gpt-oss-sera-20b\r\n"]
+[0.2, "o", "┌──────────────────────── Conversation ────────────────────────┬──── Operations ────┐\r\n"]
+[0.2, "o", "│ You: hello                                                    │ Tools: browser     │\r\n"]
+[0.2, "o", "│ Sera: trust=1 llr=0.50 latency_ms=10.0 tokens/sec=120.0       │ [F2] browser (ON)  │\r\n"]
+[0.2, "o", "│ [metrics] latency_ms=10.0 tokens/sec=120.0 trust=1 llr=0.50   │ [F3] python  (OFF) │\r\n"]
+[0.2, "o", "├──────────────────────── Diagnostics ──────────────────────────┴────────────────────┤\r\n"]
+[0.2, "o", "│ [diag g=2] turn_tokens=8 tokens/sec=120.0 latency_ms=10.0 trust=1 llr=0.50        │\r\n"]
+[0.2, "o", "│ [F9] Manifest metadata  [F10] Export diagnostics  [Ctrl+C] Exit                     │\r\n"]
+[0.2, "o", "└──────────────────────────────────────────────────────────────────────────────────┘\r\n"]

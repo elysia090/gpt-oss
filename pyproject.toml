@@ -19,6 +19,7 @@ dependencies = [
   "requests>=2.31.0",
   "termcolor",
   "jupyter-client>=8.6.3",
+  "prompt-toolkit>=3.0.43",
 ]
 readme = "README.md"
 requires-python = ">=3.12"
