@@ -248,7 +248,7 @@ def gaussian_vector(prng: SplitMix64, length: int) -> List[float]:
         values.append(g0)
         if len(values) < length:
             values.append(g1)
-        return values
+    return values
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +270,82 @@ def _tensor_bytes(tensor: List) -> bytes:
     buf = array("d")
     buf.extend(float(x) for x in flat)
     return buf.tobytes()
+
+
+def _hash_bytes(data: bytes) -> int:
+    """Return the low 64 bits of the SHA-256 digest of ``data``."""
+
+    return int.from_bytes(hashlib.sha256(data).digest()[:8], "little", signed=False)
+
+
+def _assign_positions(
+    options: Sequence[Tuple[int, int]], occupied: Sequence[bool]
+) -> Optional[List[int]]:
+    placement: List[int] = []
+    used: set[int] = set()
+    for pos0, pos1 in options:
+        choice: Optional[int] = None
+        if 0 <= pos0 < len(occupied) and not occupied[pos0] and pos0 not in used:
+            choice = pos0
+        elif 0 <= pos1 < len(occupied) and not occupied[pos1] and pos1 not in used:
+            choice = pos1
+        if choice is None:
+            return None
+        used.add(choice)
+        placement.append(choice)
+    return placement
+
+
+def _build_two_level_mph(keys: Sequence[int]) -> Tuple[List[int], List[int], Dict[int, int]]:
+    """Construct a deterministic two-level minimal perfect hash (spec §4.4).
+
+    The helper mirrors the construction used in both the tokenizer and the
+    sparse linear dictionary.  ``keys`` are u64 identifiers.  The function
+    returns a tuple ``(seeds, ordered_keys, slot_lookup)`` where ``seeds`` is
+    the table of bucket seeds, ``ordered_keys`` are the keys arranged in slot
+    order, and ``slot_lookup`` maps each key to its slot index.
+    """
+
+    capacity = len(keys)
+    if capacity == 0:
+        return [], [], {}
+
+    table_size = max(1, int(math.ceil(1.23 * capacity)))
+    seeds = [0 for _ in range(table_size)]
+    slots: List[Optional[int]] = [None for _ in range(capacity)]
+    occupied = [False for _ in range(capacity)]
+
+    buckets: Dict[int, List[int]] = {}
+    for key in keys:
+        bucket = _mix64(key) % table_size
+        buckets.setdefault(bucket, []).append(key)
+
+    slot_lookup: Dict[int, int] = {}
+    ordered_buckets = sorted(
+        buckets.items(), key=lambda item: (len(item[1]), item[0]), reverse=True
+    )
+    for bucket, bucket_keys in ordered_buckets:
+        local_keys = sorted(bucket_keys)
+        for seed_candidate in range(1 << 16):
+            options: List[Tuple[int, int]] = []
+            for key in local_keys:
+                pos0 = _mix64(key, seed_candidate) % capacity
+                pos1 = _mix64(key, seed_candidate + 1) % capacity
+                options.append((pos0, pos1))
+            placement = _assign_positions(options, occupied)
+            if placement is None:
+                continue
+            seeds[bucket] = seed_candidate
+            for key, slot in zip(local_keys, placement):
+                slots[slot] = key
+                occupied[slot] = True
+                slot_lookup[key] = slot
+            break
+        else:  # pragma: no cover - deterministic bound ensures termination
+            raise RuntimeError("Unable to build minimal perfect hash (seed cap reached)")
+
+    ordered_keys = [key for key in slots if key is not None]
+    return seeds, ordered_keys, slot_lookup
 
 
 # ---------------------------------------------------------------------------
@@ -419,19 +495,48 @@ def _column_means_squared(matrix: List[List[float]]) -> List[float]:
     return result
 
 
-def compute_prf(layer: LayerConfig, cfg: ModelConfig, tensors: Mapping[str, List], r: int) -> Dict[str, List]:
-    w_k = tensors[layer.w_k]
-    diag = _column_means_squared(w_k)
-    prng = SplitMix64(seed=0xC0FFEE)
+def compute_prf(cfg: ModelConfig, tensors: Mapping[str, List], r: int) -> Dict[str, List]:
+    digest = hashlib.sha256()
+    diag_accum = [0.0 for _ in range(cfg.d_model)]
+    counts = [0 for _ in range(cfg.d_model)]
+    for layer in cfg.layers:
+        matrix = tensors.get(layer.w_k)
+        if matrix is None:
+            continue
+        digest.update(layer.w_k.encode("utf-8"))
+        tensor_bytes = _tensor_bytes(matrix)
+        digest.update(tensor_bytes)
+        for row in matrix:
+            for idx, value in enumerate(row[: cfg.d_model]):
+                diag_accum[idx] += float(value) * float(value)
+                counts[idx] += 1
+
+    diag: List[float] = []
+    for idx in range(cfg.d_model):
+        if counts[idx] == 0:
+            diag.append(1e-8)
+        else:
+            diag.append(max(diag_accum[idx] / counts[idx], 1e-8))
+
+    prng_seed = int.from_bytes(digest.digest()[:8], "little", signed=False)
+    prng = SplitMix64(seed=prng_seed)
     prf_W: List[List[float]] = []
+    whitening_sig2: List[float] = []
+    total_diag = sum(diag) / max(1, len(diag))
     for _ in range(r):
         gaussian = gaussian_vector(prng, cfg.d_model)
-        scaled = [g * math.sqrt(diag[j % len(diag)]) for j, g in enumerate(gaussian)]
+        scaled = [g * math.sqrt(diag[j]) for j, g in enumerate(gaussian)]
+        variance = sum(value * value for value in scaled) / max(1, len(scaled))
+        whitening_sig2.append(max(variance, 1e-6))
         prf_W.append(scaled)
+
+    r_init = []
+    for i in range(r):
+        scale = 1.0 / float(i + 1)
+        r_init.append([diag[j] * scale for j in range(cfg.d_model)])
+
+    s_init = [total_diag for _ in range(r)]
     whitening_mu = [0.0 for _ in range(r)]
-    whitening_sig2 = [1.0 for _ in range(r)]
-    r_init = [[0.0 for _ in range(cfg.d_model)] for _ in range(r)]
-    s_init = [0.0 for _ in range(r)]
     return {
         "prf_W": prf_W,
         "R_init": r_init,
@@ -458,14 +563,48 @@ def gaussian_matrix(prng: SplitMix64, rows: int, cols: int) -> List[List[float]]
     return matrix
 
 
-def compute_overlays(layer: LayerConfig, cfg: ModelConfig, tensors: Mapping[str, List], r: int, r_v: int) -> Dict[str, List]:
-    w_o = tensors[layer.w_o]
-    prng = SplitMix64(seed=0x5EED)
-    H = orthonormal_matrix(r, r_v, hadamard_generator(prng, r, r_v))
-    Omega = gaussian_matrix(prng, len(w_o), r_v)
-    Y = matmul(transpose(w_o), Omega)
-    U = orthonormal_matrix(len(w_o[0]), r_v, transpose(Y))
-    Z = matmul(transpose(U), matmul(w_o, H))
+def compute_overlays(cfg: ModelConfig, tensors: Mapping[str, List], r: int, r_v: int) -> Dict[str, List]:
+    accumulator: Optional[List[List[float]]] = None
+    layer_count = 0
+    digest = hashlib.sha256()
+    for layer in cfg.layers:
+        w_o = tensors.get(layer.w_o)
+        if w_o is None:
+            continue
+        digest.update(layer.w_o.encode("utf-8"))
+        digest.update(_tensor_bytes(w_o))
+        layer_rows = len(w_o)
+        layer_cols = len(w_o[0]) if w_o else 0
+        if accumulator is None:
+            accumulator = [[0.0 for _ in range(layer_cols)] for _ in range(layer_rows)]
+        for i in range(min(layer_rows, len(accumulator))):
+            row = accumulator[i]
+            layer_row = w_o[i]
+            for j in range(min(layer_cols, len(row))):
+                row[j] += float(layer_row[j])
+        layer_count += 1
+
+    if accumulator is None or layer_count == 0:
+        raise ValueError("No W_O tensors available to compute overlays")
+
+    for i in range(len(accumulator)):
+        row = accumulator[i]
+        accumulator[i] = [value / layer_count for value in row]
+
+    prng_seed = int.from_bytes(digest.digest()[:8], "little", signed=False)
+    prng = SplitMix64(seed=prng_seed)
+    rows = len(accumulator)
+    cols = len(accumulator[0]) if accumulator else 0
+    feature_dim = min(r, rows)
+    value_dim = min(r_v, cols) if cols else r_v
+    if feature_dim == 0 or value_dim == 0:
+        raise ValueError("Overlay dimensions must be positive")
+
+    H = orthonormal_matrix(feature_dim, r_v, hadamard_generator(prng, feature_dim, r_v))
+    Omega = gaussian_matrix(prng, rows, r_v)
+    Y = matmul(transpose(accumulator), Omega)
+    U = orthonormal_matrix(cols, r_v, transpose(Y))
+    Z = matmul(transpose(U), matmul(accumulator, H))
     return {
         "overlays_H": H,
         "overlays_U": U,
@@ -495,11 +634,23 @@ def top_indices(values: List[float], count: int) -> List[int]:
     return [idx for idx, _ in sorted(enumerate(values), key=lambda item: item[1], reverse=True)[:count]]
 
 
+_CUCKOO_ENTRY = struct.Struct("<QIf")
+
+
+def _serialize_cuckoo(entries: Sequence[Tuple[int, int, float]]) -> List[int]:
+    if not entries:
+        return []
+    buf = io.BytesIO()
+    for key, hidden_idx, value in entries:
+        buf.write(_CUCKOO_ENTRY.pack(key, hidden_idx, float(value)))
+    return list(buf.getvalue())
+
+
 def collapse_ffn(
     cfg: ModelConfig, tensors: Mapping[str, List], top_l: int
 ) -> Tuple[Dict[str, List], Dict[str, object]]:
     weight_map: Dict[int, float] = {}
-    key_order: List[int] = []
+    residual_entries: List[Tuple[int, int, float]] = []
     base_bias = 0.0
 
     for layer_index, layer in enumerate(cfg.layers):
@@ -520,76 +671,43 @@ def collapse_ffn(
             for h in range(hidden_dim):
                 col_sum = sum(abs_W2[out_idx][h] for out_idx in range(len(abs_W2)))
                 scores.append(col_sum * abs_W1[h][feature])
-            idxs = top_indices(scores, top_l)
+            idxs = set(top_indices(scores, top_l))
             effect = 0.0
             for h in idxs:
                 sign_sum = sum(W2[out_idx][h] for out_idx in range(len(W2)))
                 effect += sign(sign_sum) * max(0.0, float(W1[h][feature]))
             key = (layer_index << 32) | feature
             weight_map[key] = effect
-            key_order.append(key)
 
-    capacity = len(weight_map)
-    table_size = max(1, int(math.ceil(1.23 * capacity)))
-    slots: List[Optional[int]] = [None] * capacity
-    occupied = [False] * capacity
-    seeds: List[int] = [0] * table_size
-    buckets: Dict[int, List[int]] = {}
-    for key in key_order:
-        bucket = _mix64(key) % table_size
-        buckets.setdefault(bucket, []).append(key)
+            for h in range(hidden_dim):
+                if h in idxs:
+                    continue
+                sign_sum = sum(W2[out_idx][h] for out_idx in range(len(W2)))
+                residual = sign(sign_sum) * max(0.0, float(W1[h][feature]))
+                if abs(residual) > 0.0:
+                    residual_entries.append((key, h, residual))
 
-    def assign_positions(options: List[Tuple[int, int]]) -> Optional[List[int]]:
-        placement: List[int] = []
-        used: set[int] = set()
-        for pos0, pos1 in options:
-            choice = None
-            if not occupied[pos0] and pos0 not in used:
-                choice = pos0
-            elif not occupied[pos1] and pos1 not in used:
-                choice = pos1
-            if choice is None:
-                return None
-            used.add(choice)
-            placement.append(choice)
-        return placement
-
-    ordered = sorted(buckets.items(), key=lambda item: (len(item[1]), item[0]), reverse=True)
-    for bucket, bucket_keys in ordered:
-        local_keys = sorted(bucket_keys)
-        for seed_candidate in range(1 << 16):
-            options: List[Tuple[int, int]] = []
-            for key in local_keys:
-                pos0 = _mix64(key, seed_candidate) % capacity
-                pos1 = _mix64(key, seed_candidate + 1) % capacity
-                options.append((pos0, pos1))
-            assignment = assign_positions(options)
-            if assignment is not None:
-                seeds[bucket] = seed_candidate
-                for key, slot in zip(local_keys, assignment):
-                    slots[slot] = key
-                    occupied[slot] = True
-                break
-        else:  # pragma: no cover - deterministic bound ensures termination
-            raise RuntimeError("Unable to build FFN minimal perfect hash")
-
-    slot_keys: List[int] = [key for key in slots if key is not None]
+    slot_keys = list(weight_map.keys())
+    seeds, ordered_keys, slot_lookup = _build_two_level_mph(slot_keys)
     mphf = [[(seed >> (8 * i)) & 0xFF for i in range(4)] for seed in seeds]
-    key_bytes = [[(key >> (8 * i)) & 0xFF for i in range(8)] for key in slot_keys]
-    weights = [weight_map[key] for key in slot_keys]
+    key_bytes = [[(key >> (8 * i)) & 0xFF for i in range(8)] for key in ordered_keys]
+    weights = [weight_map[key] for key in ordered_keys]
+
+    cuckoo_blob = _serialize_cuckoo(residual_entries)
 
     arrays = {
         "linear_mphf": mphf,
         "linear_keys": key_bytes,
         "linear_weights": weights,
         "linear_bias": [base_bias],
-        "cuckoo_delta": [],
+        "cuckoo_delta": cuckoo_blob,
     }
     metadata = {
-        "keys": slot_keys,
+        "keys": ordered_keys,
         "weights": weights,
         "bias": base_bias,
-        "table_size": table_size,
+        "residuals": len(residual_entries),
+        "slot_lookup": slot_lookup,
     }
     return arrays, metadata
 
@@ -651,28 +769,37 @@ def bridge_records(
     aggregated_in = [0.0 for _ in range(vocab)]
     aggregated_out = [0.0 for _ in range(vocab)]
     seeds: List[int] = []
+    digest = hashlib.sha256()
     for layer in cfg.layers:
-        seeds.append(_layer_seed(layer, tensors))
+        layer_seed = _layer_seed(layer, tensors)
+        seeds.append(layer_seed)
+        digest.update(struct.pack("<Q", layer_seed))
         W1 = tensors[layer.w1]
         W2 = tensors[layer.w2]
         b1 = tensors[layer.b1]
         b2 = tensors[layer.b2]
         hidden_dim = len(W1)
+        out_dim = len(W2)
         for token in range(vocab):
             feature = token % cfg.d_model
-            avg_w1 = sum(float(W1[h][feature]) for h in range(hidden_dim)) / max(1, hidden_dim)
-            avg_w2 = sum(float(value) for value in W2[feature]) / max(1, len(W2[feature]))
-            bias1 = float(b1[feature % len(b1)]) if b1 else 0.0
-            bias2 = float(b2[feature % len(b2)]) if b2 else 0.0
+            feature_h = feature % max(1, hidden_dim)
+            feature_out = feature % max(1, out_dim)
+            avg_w1 = sum(float(W1[h][feature % len(W1[h])]) for h in range(hidden_dim)) / max(1, hidden_dim)
+            avg_w2 = sum(float(value) for value in W2[feature_out]) / max(1, len(W2[feature_out]))
+            bias1 = float(b1[feature_h % len(b1)]) if b1 else 0.0
+            bias2 = float(b2[feature_out % len(b2)]) if b2 else 0.0
             aggregated_in[token] += avg_w1 + bias1
             aggregated_out[token] += avg_w2 + bias2
 
-    global_seed = 0
-    for idx, seed in enumerate(seeds):
-        global_seed ^= _mix64(seed, idx + 1)
+    global_seed = int.from_bytes(digest.digest()[:8], "little", signed=False)
 
     for token in range(vocab):
-        prng = SplitMix64(global_seed ^ token)
+        token_digest = hashlib.sha256()
+        token_digest.update(struct.pack("<I", token))
+        token_digest.update(struct.pack("<f", float(aggregated_in[token])))
+        token_digest.update(struct.pack("<f", float(aggregated_out[token])))
+        token_seed = int.from_bytes(token_digest.digest()[:8], "little", signed=False)
+        prng = SplitMix64(global_seed ^ token_seed)
         row: List[int] = []
         for _ in range(W):
             bits = prng.next()
@@ -702,6 +829,7 @@ def bridge_records(
         "out_scales": out_scales,
         "seed": global_seed,
         "legs": W,
+        "layer_seeds": seeds,
     }
     return arrays, metadata
 
@@ -715,50 +843,108 @@ def tokenizer_arrays(
 ) -> Tuple[Dict[str, List], Dict[str, object]]:
     vocab = cfg.vocab_size or 256
     vocab = max(1, vocab)
+
+    tensor_digest = hashlib.sha256()
+    embedding: Optional[List[List[float]]] = None
+    for name in sorted(tensors.keys()):
+        tensor = tensors[name]
+        try:
+            tensor_bytes = _tensor_bytes(tensor)
+        except Exception:  # pragma: no cover - defensive
+            continue
+        tensor_digest.update(name.encode("utf-8"))
+        tensor_digest.update(tensor_bytes)
+        if (
+            embedding is None
+            and isinstance(tensor, list)
+            and tensor
+            and isinstance(tensor[0], list)
+            and len(tensor) >= vocab
+        ):
+            embedding = tensor
+
+    global_seed = int.from_bytes(tensor_digest.digest()[:8], "little", signed=False)
+
+    used_pieces: List[bytes] = []
     pieces: List[Tuple[bytes, int]] = []
 
-    layer_seeds = [_layer_seed(layer, tensors) for layer in cfg.layers]
-    global_seed = 0
-    for idx, seed in enumerate(layer_seeds):
-        global_seed ^= _mix64(seed, idx + 1)
-    global_seed ^= _mix64(vocab, len(layer_seeds) + 1)
+    def has_prefix_conflict(candidate: bytes) -> bool:
+        for existing in used_pieces:
+            if existing.startswith(candidate) or candidate.startswith(existing):
+                return True
+        return False
 
-    prng = SplitMix64(global_seed)
-    sequences: List[Tuple[int, bytes]] = []
     for token in range(vocab):
-        seed = prng.next()
-        local = SplitMix64(seed)
-        length = 1 + (local.next() % max_len)
-        seq = bytes((local.next() & 0xFF) for _ in range(length))
-        sequences.append((token, seq))
-        pieces.append((seq, token))
+        attempt = 0
+        base_seed = _mix64(global_seed, token + 1)
+        row_seed = 0
+        if embedding is not None:
+            row = embedding[token][: cfg.d_model]
+            row_seed = _hash_bytes(_tensor_bytes([row]))
+        while True:
+            local_seed = _mix64(base_seed ^ row_seed, attempt + 1)
+            local = SplitMix64(local_seed)
+            length = 1 + (local.next() % max_len)
+            piece = bytes((local.next() & 0xFF) for _ in range(length))
+            if piece not in used_pieces and not has_prefix_conflict(piece):
+                used_pieces.append(piece)
+                pieces.append((piece, token))
+                break
+            attempt += 1
 
-    lines = ["% byte level fst derived from checkpoint", "start 0", "end 0"]
+    class _TrieNode(dict):
+        pass
+
+    root: _TrieNode = _TrieNode()
+    node_ids: Dict[int, int] = {id(root): 0}
     next_state = 1
-    for token, piece in sequences:
+    transitions: List[Tuple[int, int, int, int]] = []
+
+    for piece, token in pieces:
+        node = root
         current = 0
         for idx, byte in enumerate(piece):
-            last = idx == len(piece) - 1
-            if last:
+            child = node.get(byte)
+            if child is None:
+                child = _TrieNode()
+                node[byte] = child
+            if id(child) not in node_ids and idx < len(piece) - 1:
+                node_ids[id(child)] = next_state
+                next_state += 1
+            if idx == len(piece) - 1:
                 dest = 0
                 output = token
             else:
-                dest = next_state
-                next_state += 1
+                dest = node_ids[id(child)]
                 output = 0
-            lines.append(f"{current} {dest} {byte} {output}")
+            transitions.append((current, dest, byte, output))
+            node = child
             current = dest
+
+    lines = ["% byte level fst derived from checkpoint", "start 0", "end 0"]
+    for src, dst, byte, output in transitions:
+        lines.append(f"{src} {dst} {byte} {output}")
     fst_text = "\n".join(lines).encode("utf-8")
 
     tables: Dict[str, List[int]] = {}
+    mph_meta: Dict[int, Dict[str, object]] = {}
     modulus = 1 << 64
     for length in range(1, max_len + 1):
         factor = pow(257, length - 1, modulus)
-        table = []
+        table_bytes: List[int] = []
         for byte in range(256):
-            value = (factor * byte + global_seed) & 0xFFFFFFFFFFFFFFFF
-            table.append(value & 0xFF)
-        tables[f"T_{length}"] = table
+            value = (factor * byte + global_seed) & (modulus - 1)
+            table_bytes.extend(struct.pack("<Q", value))
+        tables[f"T_{length}"] = table_bytes
+
+        length_pieces = [piece for piece, _ in pieces if len(piece) == length]
+        key_hashes = [_hash_bytes(piece) for piece in length_pieces]
+        seeds, ordered_keys, _ = _build_two_level_mph(key_hashes)
+        mph_meta[length] = {
+            "table_size": len(seeds),
+            "seeds": seeds,
+            "key_hashes": ordered_keys,
+        }
 
     arrays = {"tokenizer_fst": list(fst_text)}
     arrays.update(tables)
@@ -766,6 +952,7 @@ def tokenizer_arrays(
         "pieces": pieces,
         "max_piece_length": max_len,
         "seed": global_seed,
+        "mph": mph_meta,
     }
     return arrays, metadata
 
@@ -911,13 +1098,24 @@ def convert(
         store_array(name, data, "u8")
     metadata["tokenizer"] = tokenizer_meta
 
-    prf = compute_prf(cfg.layers[0], cfg, tensors, r)
+    prf = compute_prf(cfg, tensors, r)
     for name, data in prf.items():
         store_array(name, data, "f32")
+    metadata["attention"] = {
+        "features": r,
+        "tau": cfg.tau,
+        "whitening_sig2": prf.get("whitening_sig2", []),
+    }
 
-    overlays = compute_overlays(cfg.layers[0], cfg, tensors, r, r_v)
+    overlays = compute_overlays(cfg, tensors, r, r_v)
     for name, data in overlays.items():
         store_array(name, data, "f32")
+    metadata["overlays"] = {
+        "rank": r,
+        "rank_value": r_v,
+        "rows": len(overlays.get("overlays_H", [])),
+        "cols": len(overlays.get("overlays_U", [])),
+    }
 
     linear_data, linear_meta = collapse_ffn(cfg, tensors, top_l)
     store_array("linear_mphf", linear_data["linear_mphf"], "u8")
@@ -941,12 +1139,48 @@ def convert(
 
     write_manifest(output / "sera_manifest.bin", cfg, artefact_payloads, r=r, r_v=r_v, vocab_size=cfg.vocab_size or 16)
 
+    sera_cls, sera_config_cls = _load_sera_runtime()
+    base_config = sera_config_cls()
+    tokenizer_vocab = {piece: token for piece, token in tokenizer_meta["pieces"]}
+    tokenizer_config = dataclasses.replace(
+        base_config.tokenizer,
+        vocabulary=tokenizer_vocab,
+        max_piece_length=tokenizer_meta["max_piece_length"],
+    )
+    whitening_sig2 = metadata["attention"].get("whitening_sig2") or [1.0]
+    beta_floor = max(1e-3, min(float(value) for value in whitening_sig2))
+    value_dim = len(overlays.get("overlays_U", [])) or cfg.d_model
+    attention_config = dataclasses.replace(
+        base_config.attention,
+        dim=cfg.d_model,
+        value_dim=value_dim,
+        features=r,
+        tau=cfg.tau,
+        beta_floor=beta_floor,
+    )
+    linear_capacity = max(len(linear_meta["keys"]), base_config.linear.capacity)
+    linear_config = dataclasses.replace(base_config.linear, capacity=linear_capacity)
+    bridge_config = dataclasses.replace(
+        base_config.bridge,
+        hub_window=max(base_config.bridge.hub_window, bridge_meta["legs"] * 4),
+    )
+    sera_config = dataclasses.replace(
+        base_config,
+        tokenizer=tokenizer_config,
+        attention=attention_config,
+        linear=linear_config,
+        bridge=bridge_config,
+    )
+    sera_model = sera_cls(sera_config)
+    runtime_snapshot = sera_model.snapshot()
+
     snapshot_path = output / "sera_state.pkl"
     snapshot = {
         "model_config": _config_to_dict(cfg),
         "artefacts": artefact_records,
         "metadata": metadata,
         "manifest_path": str(output / "sera_manifest.bin"),
+        "sera_snapshot": runtime_snapshot,
     }
     with snapshot_path.open("wb") as fh:
         pickle.dump(snapshot, fh)
