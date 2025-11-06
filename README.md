@@ -284,7 +284,10 @@ python tools/sera_quickstart.py --chat
 The helper downloads `openai/gpt-oss-20b`, stages Sera artefacts under
 `./gpt-oss-sera-20b`, and launches the `gpt-oss-sera-chat` CLI. Pass `--force-clean`
 to remove any previous downloads or `--chat-arg --tool --chat-arg python` to
-enable optional tools in the chat session.
+enable optional tools in the chat session. The chat CLI now streams the trust
+decision and latency diagnostics reported by the runtime; supply
+`--chat-arg --metrics --chat-arg plain` to mirror the per-turn metrics in the
+terminal or switch to JSON with `--metrics json`.
 
 ## Download the model
 
@@ -433,7 +436,7 @@ hf download openai/gpt-oss-20b --local-dir gpt-oss-20b
 python -m gpt_oss.tools.sera_transfer --source gpt-oss-20b --output gpt-oss-sera-20b
 
 # 3. Launch the streaming chat CLI against the converted artefacts.
-gpt-oss-sera-chat --manifest gpt-oss-sera-20b --tool python --prompt "hello"
+gpt-oss-sera-chat --manifest gpt-oss-sera-20b --tool python --prompt "hello" --metrics plain
 ```
 
 The manifest directory must contain `sera_manifest.bin`, an `arrays/` directory,
@@ -442,7 +445,9 @@ the `GPT_OSS_SERA_MANIFEST` environment variable points to a manifest
 directory. Tools are optional and can be enabled with repeated `--tool` flags
 (currently `browser` and `python`). The CLI streams decoded tokens as they are
 returned by the runtime and renders live diagnostics (tokens/sec, bridge trust,
-capacity metrics, …) in a terminal footer or JSONL log.
+latency, capacity metrics, …) in a terminal footer or JSONL log. Use the
+`--metrics` flag to mirror the per-turn trust and latency summary in plain text
+or JSON directly in the transcript.
 
 ### Responses API
 
