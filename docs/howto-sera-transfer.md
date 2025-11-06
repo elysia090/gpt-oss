@@ -6,10 +6,10 @@ The conversion tool lives in `gpt_oss.tools.sera_transfer` and can be invoked wi
 python -m gpt_oss.tools.sera_transfer --source /path/to/checkpoint --output /path/to/output --r 512 --rv 12 --topL 12
 ```
 
-The source directory must contain both `model.safetensors` and `config.json`.  Many
-Hugging Face exports place these files under an `original/` hierarchy, so the
-converter automatically probes `SOURCE/original/` and `SOURCE/original/model/`
-before failing.  If your layout differs, pass `--original-subdir` with a custom
+The source directory must contain both `model.safetensors` and `config.json`.
+When those files are missing from the immediate `SOURCE/` root the converter
+automatically probes `SOURCE/original/` and `SOURCE/original/model/` before
+failing.  If your layout differs, pass `--original-subdir` with a custom
 relative path.  For example, to target `SOURCE/checkpoints/final/`:
 
 ```bash
