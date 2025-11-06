@@ -23,21 +23,7 @@ import sys
 try:  # pragma: no cover - exercised indirectly in environments with safetensors
     from safetensors import safe_open
 except ModuleNotFoundError:  # pragma: no cover - exercised in environments without safetensors
-    _STUB_PATH = Path(__file__).resolve().parents[3] / "safetensors" / "__init__.py"
-    if _STUB_PATH.exists():
-        spec = importlib.util.spec_from_file_location(
-            "safetensors", _STUB_PATH, submodule_search_locations=[str(_STUB_PATH.parent)]
-        )
-        if spec is not None and spec.loader is not None:
-            module = importlib.util.module_from_spec(spec)
-            module.__path__ = [str(_STUB_PATH.parent)]  # type: ignore[attr-defined]
-            sys.modules[spec.name] = module
-            spec.loader.exec_module(module)
-            safe_open = module.safe_open  # type: ignore[assignment]
-        else:  # pragma: no cover - defensive
-            safe_open = None  # type: ignore[assignment]
-    else:
-        safe_open = None  # type: ignore[assignment]
+    safe_open = None  # type: ignore[assignment]
 
 def _load_sera_runtime():
     sera_path = Path(__file__).resolve().parents[1] / "inference" / "sera.py"

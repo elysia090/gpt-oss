@@ -6,6 +6,10 @@ The conversion tool lives in `gpt_oss.tools.sera_transfer` and can be invoked wi
 python -m gpt_oss.tools.sera_transfer --source /path/to/checkpoint --output /path/to/output --r 512 --rv 12 --topL 12
 ```
 
+> **Prerequisite**
+> Install the optional safetensors dependency before running the converter,
+> for example with `pip install "gpt-oss[torch]"` or `pip install safetensors`.
+
 The source directory must contain both `model.safetensors` and `config.json`.
 When those files are missing from the immediate `SOURCE/` root the converter
 automatically probes `SOURCE/original/` and `SOURCE/original/model/` before
