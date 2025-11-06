@@ -274,14 +274,19 @@ session with minimal ceremony.
 
 #### One-command launch (recommended)
 
+Copy/paste the following one-liner and you will land straight in the terminal
+chat after the assets download:
+
 ```shell
+# Replace hf_************************ with your Hugging Face token. You can also
+# export HUGGING_FACE_HUB_TOKEN ahead of time or rely on `huggingface-cli login`.
 HUGGING_FACE_HUB_TOKEN=hf_************************ pipx run --spec gpt-oss gpt-oss-sera-quickstart --chat
 ```
 
 - `pipx run` creates (or reuses) an isolated environment for `gpt-oss`, installs
   the package if necessary, and immediately executes `gpt-oss-sera-quickstart`.
-- Export your Hugging Face token with `HUGGING_FACE_HUB_TOKEN` (or populate it
-  ahead of time with `huggingface-cli login`) so the download can authenticate.
+- Inline the `HUGGING_FACE_HUB_TOKEN` environment variable so the helper can
+  authenticate with Hugging Face during the download.
 - The first run prints messages such as `Downloading openai/gpt-oss-20b...` and
   `Sera artefacts written to ./gpt-oss-sera-20b`. Expect the checkpoint to land
   in `./gpt-oss-20b` and the converted artefacts in `./gpt-oss-sera-20b` next to
