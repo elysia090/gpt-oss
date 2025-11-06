@@ -606,9 +606,52 @@ def _write_utf8(f: io.BufferedWriter, value: str) -> None:
 # Conversion driver
 
 
-def convert(source: Path, output: Path, *, r: int = 64, r_v: int = 8, top_l: int = 8) -> None:
-    config_path = source / "config.json"
-    model_path = source / "model.safetensors"
+def convert(
+    source: Path,
+    output: Path,
+    *,
+    r: int = 64,
+    r_v: int = 8,
+    top_l: int = 8,
+    original_subdir: str | Path | None = None,
+) -> None:
+    """Convert a checkpoint directory into a Sera Transfer Kit artefact.
+
+    The conversion expects a ``config.json`` and ``model.safetensors`` file.  When
+    these files are not present in ``source`` directly, the function probes a
+    small set of common Hugging Face layouts – ``source/original`` and
+    ``source/original/model`` – before failing.  Advanced users can supply an
+    explicit ``original_subdir`` to search an arbitrary additional location.
+    """
+
+    search_roots: List[Path] = []
+
+    def add_root(candidate: Path | str) -> None:
+        path = candidate if isinstance(candidate, Path) else Path(candidate)
+        if not path.is_absolute():
+            path = source / path
+        if path not in search_roots:
+            search_roots.append(path)
+
+    add_root(source)
+    if original_subdir is not None:
+        add_root(original_subdir)
+    else:
+        add_root("original")
+        add_root(Path("original") / "model")
+
+    def find_file(filename: str) -> Path:
+        for root in search_roots:
+            candidate = root / filename
+            if candidate.exists():
+                return candidate
+        search_list = ", ".join(str(root) for root in search_roots)
+        raise FileNotFoundError(
+            f"Unable to locate {filename!r}; searched: {search_list or source}"
+        )
+
+    config_path = find_file("config.json")
+    model_path = find_file("model.safetensors")
     cfg = ModelConfig.from_dict(json.loads(config_path.read_text()))
     tensors = load_tensors(model_path)
 
@@ -672,12 +715,25 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--r", type=int, default=64)
     parser.add_argument("--rv", type=int, default=8)
     parser.add_argument("--topL", type=int, default=8)
+    parser.add_argument(
+        "--original-subdir",
+        type=str,
+        default=None,
+        help="Optional subdirectory that contains config.json and model.safetensors",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
-    convert(args.source, args.output, r=args.r, r_v=args.rv, top_l=args.topL)
+    convert(
+        args.source,
+        args.output,
+        r=args.r,
+        r_v=args.rv,
+        top_l=args.topL,
+        original_subdir=args.original_subdir,
+    )
 
 
 if __name__ == "__main__":
