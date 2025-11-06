@@ -269,34 +269,50 @@ GPTOSS_BUILD_METAL=1 pip install -e ".[metal]"
 The [Sera runtime](docs/sera.md) ships with an interactive terminal client that
 can be launched via the `tools/sera_quickstart.py` helper. The helper downloads
 the published checkpoint, prepares the lightweight Sera artefacts, and finally
-invokes the chat experience so you land directly in an interactive session.
+invokes the chat experience so you land directly in an interactive session with
+minimal ceremony.
 
-**Prerequisites**
+#### Prerequisites checklist
 
-- Python **3.12** with `pip`
-- A Hugging Face account with an access token stored locally (`huggingface-cli
-  login`)
-- An environment able to install the project in editable mode (build tools,
-  virtual environment, etc.)
-- [`prompt_toolkit`](https://python-prompt-toolkit.readthedocs.io/) for the TUI
-  (`pip install prompt_toolkit`). Without it the helper falls back to the plain
-  text interface.
+Make sure the following are ready before you run the helper:
 
-**Run the helper**
+- Python **3.12** (or newer) with `pip` available on your `$PATH`.
+- A Hugging Face account with an access token stored locally
+  (`huggingface-cli login`). First-time users can create a token from the
+  [Hugging Face settings page](https://huggingface.co/settings/tokens).
+- A development environment able to build wheels (virtual environment,
+  compiler toolchain, `git`, etc.).
+- [`prompt_toolkit`](https://python-prompt-toolkit.readthedocs.io/) if you want
+  the rich TUI. Without it the helper gracefully falls back to a plain-text
+  prompt.
+
+> **Tip:** When running on a shared machine, create a dedicated virtual
+> environment so that the editable install and auxiliary dependencies remain
+> isolated.
+
+#### 1. Clone and set up the project
 
 ```shell
 git clone https://github.com/elysia/gpt-oss.git
 cd gpt-oss
 python -m venv .venv && source .venv/bin/activate  # optional but recommended
 pip install -e .
-pip install huggingface-hub prompt_toolkit  # runtime + TUI dependency
-huggingface-cli login                       # skip if this machine is already authenticated
+pip install huggingface-hub prompt_toolkit         # runtime + TUI dependency
+huggingface-cli login                              # skip if already authenticated
+```
+
+#### 2. Launch the chat experience
+
+```shell
 python tools/sera_quickstart.py --chat
 ```
 
-The command downloads `openai/gpt-oss-20b`, caches the Sera artefacts under
-`./gpt-oss-sera-20b`, and launches the default **Sera terminal UI (TUI)**. When
-the UI opens you will see three panels:
+On the first run the command downloads `openai/gpt-oss-20b`, caches the Sera
+artefacts under `./gpt-oss-sera-20b`, and launches the default **Sera terminal
+UI (TUI)**. Subsequent runs reuse the cached artefacts unless you request a
+clean start.
+
+When the TUI opens you will see three panels:
 
 - **Conversation** — the running transcript of the chat session.
 - **Operations** — currently enabled tools, hotkeys, and manifest metadata.
@@ -304,15 +320,17 @@ the UI opens you will see three panels:
 
 Key bindings that are always available in the TUI include:
 
-| Key      | Action |
-|----------|--------|
+| Key        | Action |
+|------------|--------|
 | `F2`, `F3` | Toggle optional tools (`browser`, `python`) |
-| `F9`     | Print manifest metadata into the transcript |
-| `F10`    | Export the latest diagnostics snapshot to `sera_diagnostics_*.json` |
+| `F9`       | Print manifest metadata into the transcript |
+| `F10`      | Export the latest diagnostics snapshot to `sera_diagnostics_*.json` |
 | `Ctrl+C` / `Esc` | Exit the session |
 
-Need to tweak the session? The helper forwards arguments with repeated
-`--chat-arg` flags. Popular combinations are:
+#### Power-user flags
+
+Need to tweak the session? Pass repeated `--chat-arg` flags to forward options
+directly to the chat CLI. Popular combinations include:
 
 - `--force-clean` — delete any cached artefacts before downloading.
 - `--chat-arg --tool --chat-arg python` — pre-enable the Python tool.
