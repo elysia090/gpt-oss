@@ -284,7 +284,7 @@ changes, or control the virtual environment explicitly.
 Confirm the following before you begin:
 
 - Python **3.12** (or newer) with `pip` available on your `$PATH`.
-- A Hugging Face access token stored locally (`huggingface-cli login`). Tokens
+- A Hugging Face access token stored locally (`hf auth login`). Tokens
   can be generated from the [Hugging Face settings
   page](https://huggingface.co/settings/tokens).
 - A development environment capable of building wheels (virtual environment,
@@ -304,7 +304,7 @@ cd gpt-oss
 python -m venv .venv && source .venv/bin/activate  # optional but recommended
 pip install -e .
 pip install huggingface-hub prompt_toolkit         # runtime + TUI dependency
-huggingface-cli login                              # skip if already authenticated
+hf auth login                                      # skip if already authenticated
 ```
 
 > **Working from a fork?** Use the commands that match your setup:
@@ -324,8 +324,10 @@ huggingface-cli login                              # skip if already authenticat
 > - PowerShell: <code>.\.venv\Scripts\Activate.ps1</code>
 > - Command Prompt: <code>.\.venv\Scripts\activate.bat</code>
 
-> **Note:** If `huggingface-cli` is not on your `PATH`, especially on Windows,
-> run `python -m huggingface_hub login` instead.
+> **Note:** If the `hf` command is not on your `PATH`, especially on Windows,
+> invoke it with the full path (for example, `.\\.venv\\Scripts\\hf.exe auth login`).
+> Non-interactive environments can pass the token directly with
+> `hf auth login --token <your_token>`.
 
 ##### Step 2 — start the chat
 
