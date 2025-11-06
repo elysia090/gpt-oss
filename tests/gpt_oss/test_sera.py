@@ -331,3 +331,86 @@ def test_bridge_gate_projects_values() -> None:
     beta = config.beta_min + (config.beta_max - config.beta_min) * 0.5
     expected = (1.0 - beta) * base + beta * 5.0
     assert result == pytest.approx(expected)
+
+
+def test_sera_attention_features_and_collect_features() -> None:
+    config = SeraConfig(feature_budget=3)
+    model = Sera(config)
+
+    y_att = np.array([2.0, 4.0], dtype=float)
+    phi_q = np.array([3.0, 4.0], dtype=float)
+    features = model._attention_features(y_att, phi_q)
+
+    assert features == [(-1, pytest.approx(3.0)), (-2, pytest.approx(5.0))]
+
+    collected = model._collect_features([(0, 0.5), (1, 1.5)])
+    assert collected == [(0, 0.5), (1, 1.5)]
+
+    over_budget = [(idx, float(idx)) for idx in range(config.feature_budget + 1)]
+    with pytest.raises(BudgetError):
+        model._collect_features(over_budget)
+
+
+def test_sera_diagnostics_record_serialises_hex_fields() -> None:
+    model = Sera(SeraConfig())
+    diagnostics = model.diagnostics
+    diagnostics.attention_den_min = float("inf")
+    diagnostics.bridge_last_proof = bytes.fromhex("001122")
+    diagnostics.trust_audit = bytes.fromhex("deadbeef")
+
+    record = model.diagnostics_record()
+
+    assert record["attention_den_min"] is None
+    assert record["bridge_last_proof"] == "001122"
+    assert record["trust_audit"] == "deadbeef"
+
+
+def test_sera_snapshot_restore_roundtrip() -> None:
+    model = Sera(SeraConfig())
+    model.linear.update([(0, 1.0)], target=0.25)
+    model.step(bytes_data=b"abc")
+    model.publish_generation()
+
+    snapshot = model.snapshot()
+    restored = Sera.restore(snapshot)
+
+    assert restored.config == model.config
+    assert restored.generation == model.generation
+    assert restored.linear.snapshot() == model.linear.snapshot()
+    assert restored.manifest_pointer.current_manifest() == restored.manifest_record().as_dict()
+
+
+def test_sera_manifest_pointer_tracks_pins_and_history() -> None:
+    model = Sera(SeraConfig())
+    pointer = model.manifest_pointer
+    initial_manifest = pointer.current_manifest()
+
+    assert initial_manifest is not None
+
+    with model.pin_generation() as pin:
+        assert pointer.pinned_generations() == [model.generation]
+        assert pin.manifest == initial_manifest
+        epoch_before = pointer.epoch
+        model.publish_generation()
+        assert pointer.epoch > epoch_before
+        assert pointer.current_manifest()["generation"] == model.generation
+        assert pointer.manifest_for(pin.generation) == pin.manifest
+
+    assert pointer.pinned_generations() == []
+    assert pointer.manifest_for(pin.generation) is None
+
+
+def test_sera_restore_supports_legacy_linear_blob() -> None:
+    model = Sera(SeraConfig())
+    model.linear.update([(0, 1.0), (1, 2.0)], target=0.75)
+    legacy_snapshot = dict(model.snapshot())
+    legacy_snapshot.pop("linear_state", None)
+    legacy_snapshot["linear_weights"] = {
+        str(slot): float(weight) for slot, weight in model.linear._weights.items()
+    }
+    legacy_snapshot["linear_bias"] = model.linear._bias
+
+    restored = Sera.restore(legacy_snapshot)
+
+    assert restored.linear._weights.get(0) == pytest.approx(model.linear._weights.get(0))
+    assert restored.linear._bias == pytest.approx(model.linear._bias)

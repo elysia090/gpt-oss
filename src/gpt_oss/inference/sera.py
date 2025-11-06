@@ -127,12 +127,11 @@ def _coerce_dataclass_config(
         return value
     if isinstance(value, dict):
         default = factory()
-        merged = {
-            field.name: getattr(default, field.name)
-            for field in dataclasses.fields(cls)
-            if field.init
-        }
-        merged.update(value)
+        init_fields = {field.name for field in dataclasses.fields(cls) if field.init}
+        merged = {name: getattr(default, name) for name in init_fields}
+        for key, val in value.items():
+            if key in init_fields:
+                merged[key] = val
         return cls(**merged)  # type: ignore[arg-type]
     raise TypeError(f"Expected {cls.__name__} or dict, got {type(value)!r}")
 
