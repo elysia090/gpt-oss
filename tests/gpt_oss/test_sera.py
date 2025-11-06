@@ -31,6 +31,8 @@ SparseLinearConfig = _SERA_MODULE.SparseLinearConfig
 CCRConfig = _SERA_MODULE.CCRConfig
 CCRState = _SERA_MODULE.CCRState
 CCRResult = _SERA_MODULE.CCRResult
+TrustGateConfig = _SERA_MODULE.TrustGateConfig
+BridgeConfig = _SERA_MODULE.BridgeConfig
 
 
 def test_tokenizer_enforces_event_budgets() -> None:
@@ -213,3 +215,48 @@ def test_step_exposes_ccr_outputs() -> None:
     assert residual.shape == (2,)
     assert isinstance(correction, np.ndarray)
     assert correction.shape == (2,)
+
+
+def test_trust_gate_adjusts_beta_caps() -> None:
+    trust_config = TrustGateConfig(
+        dimension=6,
+        salts=2,
+        acceptance_k=1,
+        pos_threshold=0.05,
+        neg_threshold=-0.2,
+        q_min_hat=0.9,
+        eps_pos_hat=0.1,
+        pi0=0.5,
+        hazard_positive=2.0,
+        hazard_negative=1.0,
+        psi=0.0,
+        beta_min=0.05,
+        beta_max=0.4,
+        beta_boost=0.2,
+    )
+    config = SeraConfig(trust=trust_config, bridge=BridgeConfig(beta_min=0.05, beta_max=0.4))
+    model = Sera(config)
+
+    trust_state = model.trust_gate
+    rows = trust_state._projections  # type: ignore[attr-defined]
+    norms = trust_state._row_norms  # type: ignore[attr-defined]
+    k = trust_state.config.acceptance_k
+    pos_vec = np.zeros(trust_state.config.dimension, dtype=float)
+    for idx in range(k):
+        pos_vec += rows[idx] / norms[idx]
+    neg_vec = -pos_vec
+
+    model.step(trust_vector=pos_vec.tolist())
+    diag = model.diagnostics
+    assert diag.trust_decision == 1
+    assert diag.trust_m >= trust_config.acceptance_k
+    assert diag.trust_beta_min == pytest.approx(trust_config.beta_boost)
+    assert diag.trust_beta_cap == pytest.approx(trust_config.beta_max)
+    assert isinstance(diag.trust_audit, bytes)
+    assert len(diag.trust_audit) == 64
+
+    model.step(trust_vector=neg_vec.tolist())
+    diag = model.diagnostics
+    assert diag.trust_decision == -1
+    assert diag.trust_beta_cap == pytest.approx(0.0)
+    assert diag.trust_beta_min == pytest.approx(0.0)

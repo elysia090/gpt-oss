@@ -79,6 +79,26 @@ def _sigmoid(x: float) -> float:
     return z / (1.0 + z)
 
 
+def _logit(x: float) -> float:
+    if not 0.0 < x < 1.0:
+        raise ValueError("logit is defined on (0, 1)")
+    return math.log(x / (1.0 - x))
+
+
+def _safe_tanh(value: float, scale: float = 1.0) -> float:
+    if scale <= 0.0:
+        raise ValueError("scale must be positive")
+    if not math.isfinite(value):
+        return 0.0
+    return math.tanh(value / scale)
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    if minimum > maximum:
+        raise ValueError("invalid clamp bounds")
+    return max(minimum, min(maximum, value))
+
+
 def _kahan_update(sum_: float, c: float, value: float) -> Tuple[float, float]:
     """Apply a single Kahan compensated summation step (spec §5.1)."""
 
@@ -1140,6 +1160,240 @@ class FusionState:
 
 
 # ---------------------------------------------------------------------------
+# Trust gate (spec section 6.4)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TrustGateConfig:
+    dimension: int = 16
+    salts: int = 5
+    acceptance_k: int = 3
+    neg_threshold: float = -0.25
+    pos_threshold: float = 0.1
+    q_min_hat: float = 0.6
+    eps_pos_hat: float = 0.2
+    B_floor: float = 6.0
+    pi0: float = 0.25
+    hazard_positive: float = 5.0
+    hazard_negative: float = 1.0
+    hazard_offset: float = 1.0
+    psi: float = 0.5
+    beta_min: float = 0.05
+    beta_max: float = 0.4
+    beta_boost: float = 0.1
+    alpha_unknown: float = 0.5
+    _logit_pi0: float = field(init=False, repr=False)
+    _log_bf_pos: float = field(init=False, repr=False)
+    _gamma_threshold: float = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.dimension <= 0:
+            raise ValueError("dimension must be positive")
+        if self.salts <= 0:
+            raise ValueError("salts must be positive")
+        if not 0 < self.acceptance_k <= self.salts:
+            raise ValueError("acceptance_k must be in (0, salts]")
+        if self.neg_threshold >= self.pos_threshold:
+            raise ValueError("neg_threshold must be < pos_threshold")
+        if self.beta_min < 0 or self.beta_max < 0:
+            raise ValueError("beta bounds must be non-negative")
+        if self.beta_min > self.beta_max:
+            raise ValueError("beta_min cannot exceed beta_max")
+        if not 0 < self.alpha_unknown <= 1:
+            raise ValueError("alpha_unknown must be in (0, 1]")
+        logit_pi0 = _logit(self.pi0)
+        denom = max(self.eps_pos_hat, 10.0 ** (-self.B_floor))
+        bf_pos = self.q_min_hat / denom
+        if bf_pos <= 1.0:
+            raise ValueError("bf_pos must exceed 1 for a meaningful LLR")
+        log_bf = math.log(bf_pos)
+        gamma = (
+            math.log((self.hazard_positive + self.hazard_offset) / (self.hazard_negative + self.hazard_offset))
+            - logit_pi0
+            + self.psi
+        )
+        m_star = math.ceil((gamma - logit_pi0) / log_bf)
+        if m_star < self.acceptance_k:
+            raise ValueError("m_star must be >= acceptance_k for publication")
+        object.__setattr__(self, "_logit_pi0", logit_pi0)
+        object.__setattr__(self, "_log_bf_pos", log_bf)
+        object.__setattr__(self, "_gamma_threshold", gamma)
+
+    @property
+    def logit_pi0(self) -> float:
+        return self._logit_pi0
+
+    @property
+    def log_bf_pos(self) -> float:
+        return self._log_bf_pos
+
+    @property
+    def gamma_threshold(self) -> float:
+        return self._gamma_threshold
+
+
+@dataclass(frozen=True)
+class TrustGateDecision:
+    decision: int
+    m: int
+    llr: float
+    gamma: float
+    consistent: bool
+    audit: bytes
+    beta_min: float
+    beta_cap: float
+
+
+class TrustGateState:
+    """Deterministic verifier implementing the trust gate (spec §6.4)."""
+
+    _AUDIT_SCHEMA = struct.Struct("<ii2dQQ")
+
+    def __init__(self, config: TrustGateConfig) -> None:
+        self.config = config
+        self._projections = self._build_projections(config)
+        norm_list: List[float] = []
+        for row in self._projections:
+            norm_sq = 0.0
+            for value in row:
+                norm_sq += float(value) * float(value)
+            norm = math.sqrt(norm_sq)
+            if norm == 0.0:
+                norm = 1.0
+            norm_list.append(norm)
+        self._row_norms = np.asarray(norm_list, dtype=float)
+
+    @staticmethod
+    def _build_projections(config: TrustGateConfig) -> np.ndarray:
+        matrix = np.zeros((config.salts, config.dimension), dtype=float)
+        for salt in range(config.salts):
+            seed = _mix64(salt + 1, 0xC1F651A1AD4101B7)
+            for idx in range(config.dimension):
+                mixed = _mix64(seed, idx + 1)
+                matrix[salt, idx] = ((mixed / _HASH_MASK) * 2.0) - 1.0
+        return matrix
+
+    def _default_vector(self, diagnostics: "SeraDiagnostics") -> np.ndarray:
+        features = [
+            _safe_tanh(diagnostics.attention_den_min, scale=10.0),
+            _safe_tanh(diagnostics.attention_clip_rate, scale=1.0),
+            _safe_tanh(diagnostics.lambda_star, scale=1.0),
+            _safe_tanh(diagnostics.store_load_p99, scale=1.0),
+            _safe_tanh(diagnostics.stash_occ_p99, scale=1.0),
+            _safe_tanh(diagnostics.kick_len_p99, scale=10.0),
+            _safe_tanh(diagnostics.capacity_lambda_hat, scale=10.0),
+            _safe_tanh(diagnostics.capacity_load, scale=10.0),
+            _safe_tanh(diagnostics.capacity_slack, scale=10.0),
+            _safe_tanh(diagnostics.capacity_margin, scale=10.0),
+            float(bool(diagnostics.capacity_frozen)),
+            _safe_tanh(diagnostics.bridge_guard_rate, scale=1.0),
+            _safe_tanh(diagnostics.tokenizer_probe_max, scale=32.0),
+            _safe_tanh(diagnostics.tok_emitted % 1024, scale=1024.0),
+            _safe_tanh(diagnostics.tok_bytes_in % 1024, scale=1024.0),
+            1.0,
+        ]
+        if len(features) < self.config.dimension:
+            features.extend([0.0] * (self.config.dimension - len(features)))
+        return np.asarray(features[: self.config.dimension], dtype=float)
+
+    def _coerce_vector(self, vector: Optional[Sequence[float]], diagnostics: "SeraDiagnostics") -> np.ndarray:
+        if vector is None:
+            return self._default_vector(diagnostics)
+        arr_list = [float(v) for v in vector]
+        arr = np.asarray(arr_list, dtype=float)
+        if arr.size == self.config.dimension:
+            return arr
+        coerced = np.zeros(self.config.dimension, dtype=float)
+        limit = min(arr.size, self.config.dimension)
+        coerced[:limit] = arr[:limit]
+        return coerced
+
+    def _project(self, vector: np.ndarray) -> np.ndarray:
+        projected = self._projections @ vector
+        return projected / self._row_norms
+
+    def _audit(self, decision: int, m: int, llr: float, gamma: float, digest: int, collisions: int) -> bytes:
+        payload = self._AUDIT_SCHEMA.pack(
+            decision,
+            m,
+            float(llr),
+            float(gamma),
+            digest & _HASH_MASK,
+            collisions & _HASH_MASK,
+        )
+        return payload.ljust(64, b"\x00")
+
+    def judge(
+        self,
+        diagnostics: "SeraDiagnostics",
+        vector: Optional[Sequence[float]] = None,
+    ) -> TrustGateDecision:
+        trust_vec = self._coerce_vector(vector, diagnostics)
+        projections = self._project(trust_vec)
+        neg = False
+        pos_count = 0
+        digest = 0
+        seen_hashes: Set[int] = set()
+        consistent = True
+        for salt, value in enumerate(projections):
+            value = _clamp(float(value), -1.0, 1.0)
+            if value <= self.config.neg_threshold:
+                neg = True
+                digest ^= _mix64(salt + 1, 0)
+            elif value >= self.config.pos_threshold:
+                pos_count += 1
+                witness_hash = _mix64(salt + 1, int(round((value + 1.0) * 1_000_000)))
+                if witness_hash in seen_hashes:
+                    consistent = False
+                seen_hashes.add(witness_hash)
+                digest ^= witness_hash
+        decision = 0
+        beta_min = self.config.beta_min
+        beta_cap = 0.0
+        llr = self.config.logit_pi0
+        gamma = self.config.gamma_threshold
+        if neg:
+            decision = -1
+            beta_cap = 0.0
+        else:
+            if pos_count >= self.config.acceptance_k and consistent:
+                llr = self.config.logit_pi0 + pos_count * self.config.log_bf_pos
+                if llr >= gamma:
+                    decision = 1
+                else:
+                    decision = 0
+            else:
+                decision = 0
+            if decision > 0:
+                beta_min = self.config.beta_boost
+                beta_cap = self.config.beta_max
+            elif decision == 0:
+                beta_min = self.config.beta_min
+                beta_cap = self.config.alpha_unknown * self.config.beta_max
+            else:
+                beta_min = self.config.beta_min
+                beta_cap = 0.0
+            if decision < 0:
+                beta_cap = 0.0
+        if decision < 0:
+            beta_min = 0.0
+        elif beta_cap > 0.0:
+            beta_min = min(beta_min, beta_cap)
+        audit = self._audit(decision, pos_count, llr, gamma, digest, len(seen_hashes))
+        return TrustGateDecision(
+            decision=decision,
+            m=pos_count,
+            llr=llr,
+            gamma=gamma,
+            consistent=consistent,
+            audit=audit,
+            beta_min=beta_min,
+            beta_cap=beta_cap,
+        )
+
+
+# ---------------------------------------------------------------------------
 # CCR overlap corrector (spec section 7)
 # ---------------------------------------------------------------------------
 
@@ -1867,11 +2121,18 @@ class BridgeState:
         bridge_val: np.ndarray,
         guard: bool,
         witness_quality: float = 1.0,
+        *,
+        beta_min_override: Optional[float] = None,
+        beta_cap_override: Optional[float] = None,
     ) -> float:
         guard_weight = float(bool(guard))
         s_q = min(max(float(witness_quality), 0.0), 1.0)
-        beta_span = self.config.beta_max - self.config.beta_min
-        beta = guard_weight * (self.config.beta_min + beta_span * s_q)
+        beta_cap = self.config.beta_max if beta_cap_override is None else float(beta_cap_override)
+        beta_min = self.config.beta_min if beta_min_override is None else float(beta_min_override)
+        beta_cap = _clamp(beta_cap, 0.0, 1.0)
+        beta_min = _clamp(beta_min, 0.0, beta_cap)
+        beta_span = max(beta_cap - beta_min, 0.0)
+        beta = guard_weight * (beta_min + beta_span * s_q)
         alpha = 1.0 - beta
         return alpha * float(base) + beta * float(np.mean(bridge_val))
 
@@ -2268,6 +2529,10 @@ def _default_fusion_config() -> FusionConfig:
     return FusionConfig()
 
 
+def _default_trust_config() -> TrustGateConfig:
+    return TrustGateConfig()
+
+
 def _default_ccr_config() -> CCRConfig:
     return CCRConfig()
 
@@ -2291,6 +2556,7 @@ class SeraConfig:
     linear: SparseLinearConfig = field(default_factory=_default_linear_config)
     memory: FiniteMemoryConfig = field(default_factory=_default_memory_config)
     fusion: FusionConfig = field(default_factory=_default_fusion_config)
+    trust: TrustGateConfig = field(default_factory=_default_trust_config)
     ccr: CCRConfig = field(default_factory=_default_ccr_config)
     bridge: BridgeConfig = field(default_factory=_default_bridge_config)
     tree_search: TreeSearchConfig = field(default_factory=_default_tree_search_config)
@@ -2327,6 +2593,11 @@ class SeraConfig:
             self,
             "fusion",
             _coerce_dataclass_config(self.fusion, FusionConfig, _default_fusion_config),
+        )
+        object.__setattr__(
+            self,
+            "trust",
+            _coerce_dataclass_config(self.trust, TrustGateConfig, _default_trust_config),
         )
         object.__setattr__(
             self,
@@ -2406,6 +2677,14 @@ class SeraDiagnostics:
     capacity_margin: float = 0.0
     capacity_frozen: bool = False
     bridge_guard_rate: float = 0.0
+    trust_decision: int = 0
+    trust_m: int = 0
+    trust_llr: float = 0.0
+    trust_gamma: float = 0.0
+    trust_consistent: bool = True
+    trust_audit: bytes = field(default=b"", repr=False)
+    trust_beta_min: float = 0.0
+    trust_beta_cap: float = 0.0
 
     def __post_init__(self) -> None:
         if self.p99_window < 1:
@@ -2416,6 +2695,10 @@ class SeraDiagnostics:
         self.store_load_p99 = _quantile(self.store_load_samples, 0.99)
         self.stash_occ_p99 = _quantile(self.stash_occ_samples, 0.99)
         self.kick_len_p99 = _quantile(self.kick_len_samples, 0.99)
+        if isinstance(self.bridge_last_proof, str):
+            self.bridge_last_proof = bytes.fromhex(self.bridge_last_proof)
+        if isinstance(self.trust_audit, str):
+            self.trust_audit = bytes.fromhex(self.trust_audit)
 
 
 @dataclass
@@ -2426,6 +2709,7 @@ class Sera:
     linear: SparseLinearState = field(init=False)
     memory: FiniteMemoryState = field(init=False)
     fusion: FusionState = field(init=False)
+    trust_gate: TrustGateState = field(init=False)
     ccr: CCRState = field(init=False)
     bridge: BridgeState = field(init=False)
     tree_search: TreeSearchState = field(init=False)
@@ -2439,6 +2723,7 @@ class Sera:
         object.__setattr__(self, "linear", SparseLinearState(self.config.linear))
         object.__setattr__(self, "memory", FiniteMemoryState(self.config.memory))
         object.__setattr__(self, "fusion", FusionState(self.config.fusion))
+        object.__setattr__(self, "trust_gate", TrustGateState(self.config.trust))
         object.__setattr__(self, "ccr", CCRState(self.config.ccr))
         object.__setattr__(self, "bridge", BridgeState(self.config.bridge))
         object.__setattr__(self, "tree_search", TreeSearchState(self.config.tree_search))
@@ -2473,6 +2758,7 @@ class Sera:
         target: Optional[float] = None,
         bridge_ctx: Optional[int] = None,
         bridge_token: Optional[int] = None,
+        trust_vector: Optional[Sequence[float]] = None,
     ) -> Dict[str, object]:
         """Process a single event in O(1) time, returning the outputs.
 
@@ -2532,6 +2818,17 @@ class Sera:
             fused = self.fusion.fuse(y_att, y_lin)
             gated = self.fusion.gate(y_att, y_lin)
 
+            trust = self.trust_gate.judge(self.diagnostics, trust_vector)
+            diag = self.diagnostics
+            diag.trust_decision = trust.decision
+            diag.trust_m = trust.m
+            diag.trust_llr = float(trust.llr)
+            diag.trust_gamma = float(trust.gamma)
+            diag.trust_consistent = trust.consistent
+            diag.trust_audit = trust.audit
+            diag.trust_beta_min = float(trust.beta_min)
+            diag.trust_beta_cap = float(trust.beta_cap)
+
             locals_vec = np.array([fused, gated], dtype=float)
             ccr_result = self.ccr.correct(locals_vec)
 
@@ -2541,16 +2838,22 @@ class Sera:
             if bridge_ctx is not None:
                 bridge_val, guard, proof = self.bridge.read(bridge_ctx, bridge_token)
                 if guard:
-                    self.diagnostics.bridge_hits += 1
+                    diag.bridge_hits += 1
                 else:
-                    self.diagnostics.bridge_misses += 1
-            self.diagnostics.bridge_last_proof = proof
-            total_guards = self.diagnostics.bridge_hits + self.diagnostics.bridge_misses
+                    diag.bridge_misses += 1
+            diag.bridge_last_proof = proof
+            total_guards = diag.bridge_hits + diag.bridge_misses
             if total_guards:
-                self.diagnostics.bridge_guard_rate = self.diagnostics.bridge_hits / float(total_guards)
+                diag.bridge_guard_rate = diag.bridge_hits / float(total_guards)
             else:
-                self.diagnostics.bridge_guard_rate = 0.0
-            bridged = self.bridge.gate(gated, bridge_val, guard)
+                diag.bridge_guard_rate = 0.0
+            bridged = self.bridge.gate(
+                gated,
+                bridge_val,
+                guard,
+                beta_min_override=trust.beta_min,
+                beta_cap_override=trust.beta_cap,
+            )
 
             self.tree_search.maybe_select()
             self.diagnostics.tree_simulations = self.tree_search._simulations
@@ -2699,6 +3002,9 @@ class Sera:
         proof_blob = record.get("bridge_last_proof")
         if isinstance(proof_blob, (bytes, bytearray)):
             record["bridge_last_proof"] = bytes(proof_blob).hex()
+        audit_blob = record.get("trust_audit")
+        if isinstance(audit_blob, (bytes, bytearray)):
+            record["trust_audit"] = bytes(audit_blob).hex()
         return record
 
     # ------------------------------------------------------------------
@@ -2731,6 +3037,7 @@ __all__ = [
     "ManifestRecord",
     "Sera",
     "SeraConfig",
+    "TrustGateConfig",
 ]
 
 _HASH_BASE = 257
