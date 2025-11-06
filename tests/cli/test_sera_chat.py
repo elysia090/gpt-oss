@@ -4,11 +4,14 @@ import dataclasses
 import importlib
 import importlib.util
 import pickle
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from gpt_oss.cli import sera_chat
 
 
 def _load_sera():
@@ -66,6 +69,8 @@ def test_single_turn_prompt(sera_manifest: Path) -> None:
         "65",
         "--tool",
         "python",
+        "--stats-refresh",
+        "0",
     ]
     env = {"PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src")}
     proc = subprocess.run(script, capture_output=True, text=True, env=env, check=True)
@@ -73,6 +78,7 @@ def test_single_turn_prompt(sera_manifest: Path) -> None:
     assert "Enabled tools: python" in proc.stdout
     assert "Sera" in proc.stdout
     assert "A" in proc.stdout
+    assert "[diag g=" in proc.stdout
 
 
 def test_manifest_env_fallback(sera_manifest: Path) -> None:
@@ -84,6 +90,8 @@ def test_manifest_env_fallback(sera_manifest: Path) -> None:
         "sera_state.pkl",
         "--prompt",
         "ping",
+        "--stats-refresh",
+        "0",
     ]
     env = {
         "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
@@ -92,3 +100,70 @@ def test_manifest_env_fallback(sera_manifest: Path) -> None:
     proc = subprocess.run(script, capture_output=True, text=True, env=env, check=True)
     assert "Enabled tools: none" in proc.stdout
     assert "Sera" in proc.stdout
+    assert "[diag g=" in proc.stdout
+
+
+def test_dashboard_formatter_snapshot() -> None:
+    diag = {
+        "tokens_emitted": 42,
+        "bridge_hits": 7,
+        "bridge_misses": 3,
+        "bridge_guard_rate": 0.7,
+        "trust_decision": 1,
+        "trust_consistent": False,
+        "trust_llr": 0.125,
+        "store_load_p99": 0.93,
+        "stash_occ_p99": 0.12,
+        "kick_len_p99": 2.5,
+        "capacity_load": 0.4,
+        "capacity_slack": 0.6,
+        "capacity_margin": 0.1,
+        "capacity_frozen": True,
+        "attention_updates": 11,
+        "attention_clip_rate": 0.33,
+        "attention_den_min": 0.02,
+        "lambda_star": 0.9,
+        "tree_simulations": 5,
+        "trust_m": 4,
+        "trust_gamma": 0.07,
+        "trust_beta_min": 0.1,
+        "trust_beta_cap": 0.9,
+        "cfr_mode": "ACTIVE",
+        "cfr_beta": 0.5,
+        "cfr_guard": True,
+        "cfr_health_ok": False,
+        "cfr_y_cfr": 1.2,
+    }
+    output = sera_chat._format_dashboard(
+        diag,
+        generation=3,
+        turn_tokens=6,
+        verbose=True,
+    )
+    expected = (
+        "[diag g=3] turn_tokens=6 total_emitted=42 bridge=7/3 (0.70) "
+        "p99(store/stash/kick)=0.93/0.12/2.50 trust=1 (consistent=False) llr=0.12 "
+        "capacity(load/slack/margin)=0.40/0.60/0.10 frozen=True\n"
+        "  attention: updates=11 clip=0.33 min_den=0.02 lambda*=0.90 tree_sims=5\n"
+        "  trust: m=4 gamma=0.07 beta=[0.10, 0.90]\n"
+        "  cfr: mode=ACTIVE beta=0.50 guard=True health=False y_cfr=1.20"
+    )
+    assert output == expected
+
+
+def test_dashboard_logs_jsonl(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    dash = sera_chat.DiagnosticsDashboard(
+        refresh_interval=0.0,
+        verbose=False,
+        log_path=tmp_path / "diag.jsonl",
+        _clock=lambda: 0.0,
+    )
+    diag = {"tokens_emitted": 1, "bridge_hits": 0, "bridge_misses": 0}
+    dash.update(diagnostics=diag, generation=1, turn_tokens=1)
+    dash.close()
+    captured = capsys.readouterr()
+    assert "[diag g=1]" in captured.out
+    log_path = tmp_path / "diag.jsonl"
+    payloads = [json.loads(line) for line in log_path.read_text().splitlines() if line]
+    assert payloads and payloads[0]["generation"] == 1
+    assert payloads[0]["turn_tokens"] == 1
