@@ -267,12 +267,45 @@ GPTOSS_BUILD_METAL=1 pip install -e ".[metal]"
 ### Quickstart: Sera terminal chat
 
 The [Sera runtime](docs/sera.md) ships with an interactive terminal client that
-can be launched via the `tools/sera_quickstart.py` helper. The helper downloads
-the published checkpoint, prepares the lightweight Sera artefacts, and finally
-invokes the chat experience so you land directly in an interactive session with
-minimal ceremony.
+is now exposed as the `gpt-oss-sera-quickstart` console script. The helper
+downloads the published checkpoint, prepares the lightweight Sera artefacts, and
+finally invokes the chat experience so you land directly in an interactive
+session with minimal ceremony.
 
-#### Prerequisites checklist
+#### One-command launch (recommended)
+
+Copy/paste the following one-liner and you will land straight in the terminal
+chat after the assets download:
+
+```shell
+# Replace hf_************************ with your Hugging Face token. You can also
+# export HUGGING_FACE_HUB_TOKEN ahead of time or rely on `huggingface-cli login`.
+HUGGING_FACE_HUB_TOKEN=hf_************************ pipx run --spec gpt-oss gpt-oss-sera-quickstart --chat
+```
+
+- `pipx run` creates (or reuses) an isolated environment for `gpt-oss`, installs
+  the package if necessary, and immediately executes `gpt-oss-sera-quickstart`.
+- Inline the `HUGGING_FACE_HUB_TOKEN` environment variable so the helper can
+  authenticate with Hugging Face during the download.
+- The first run prints messages such as `Downloading openai/gpt-oss-20b...` and
+  `Sera artefacts written to ./gpt-oss-sera-20b`. Expect the checkpoint to land
+  in `./gpt-oss-20b` and the converted artefacts in `./gpt-oss-sera-20b` next to
+  the directory where you launched the command. Subsequent invocations reuse
+  these directories unless `--force-clean` is provided.
+- `pipx` keeps its transient virtual environment under
+  `~/.local/pipx/venvs/gpt-oss`, so rerunning the command does not reinstall the
+  package.
+
+Prefer `uvx`? Swap the prefix for `uvx gpt-oss-sera-quickstart --chat` (and pass
+through `HUGGING_FACE_HUB_TOKEN` the same way) to get the same experience with
+`uv`'s runner.
+
+#### Advanced/manual setup
+
+Follow these steps if you want to clone the repository, work from a local
+checkout, or customise the environment.
+
+##### Prerequisites checklist
 
 Make sure the following are ready before you run the helper:
 
@@ -290,7 +323,7 @@ Make sure the following are ready before you run the helper:
 > environment so that the editable install and auxiliary dependencies remain
 > isolated.
 
-#### 1. Clone and set up the project
+##### 1. Clone and set up the project
 
 ```shell
 git clone https://github.com/elysia/gpt-oss.git
@@ -301,10 +334,10 @@ pip install huggingface-hub prompt_toolkit         # runtime + TUI dependency
 huggingface-cli login                              # skip if already authenticated
 ```
 
-#### 2. Launch the chat experience
+##### 2. Launch the chat experience
 
 ```shell
-python tools/sera_quickstart.py --chat
+gpt-oss-sera-quickstart --chat
 ```
 
 On the first run the command downloads `openai/gpt-oss-20b`, caches the Sera
