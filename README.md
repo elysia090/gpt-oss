@@ -443,11 +443,27 @@ The manifest directory must contain `sera_manifest.bin`, an `arrays/` directory,
 and a runtime snapshot such as `sera_state.pkl`. You can omit `--manifest` when
 the `GPT_OSS_SERA_MANIFEST` environment variable points to a manifest
 directory. Tools are optional and can be enabled with repeated `--tool` flags
-(currently `browser` and `python`). The CLI streams decoded tokens as they are
-returned by the runtime and renders live diagnostics (tokens/sec, bridge trust,
-latency, capacity metrics, …) in a terminal footer or JSONL log. Use the
-`--metrics` flag to mirror the per-turn trust and latency summary in plain text
-or JSON directly in the transcript.
+(currently `browser` and `python`).
+
+By default `gpt-oss-sera-chat` now launches a prompt_toolkit-powered terminal
+UI with three panes: a scrolling transcript, live diagnostics, and an
+operations sidebar. The sidebar lists hotkeys for toggling optional tools (`F2`
+for `browser`, `F3` for `python`), viewing manifest metadata (`F9`), exporting
+the latest diagnostics without leaving the chat (`F10`), and exiting. Metrics
+selected via `--metrics` are reflected in both the transcript and diagnostics
+pane. Use `--plain` to restore the legacy single-pane text interface or pass
+`--tui` explicitly if you disable it in shell aliases.
+
+An asciinema recording that previews the layout and hotkeys is available at
+`docs/media/sera-tui-demo.cast`:
+
+```bash
+asciinema play docs/media/sera-tui-demo.cast
+```
+
+The CLI still streams decoded tokens as they are returned by the runtime and
+can mirror per-turn trust/latency summaries in plain text or JSON by using the
+`--metrics` flag.
 
 ### Responses API
 

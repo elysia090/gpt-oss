@@ -25,6 +25,7 @@ import struct
 import sys
 import time
 import hashlib
+import io
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -35,6 +36,8 @@ from typing import (
     Optional,
     Sequence,
     Dict,
+    List,
+    TextIO,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - import only used for type checkers
@@ -187,6 +190,7 @@ class DiagnosticsDashboard:
     refresh_interval: float
     verbose: bool
     log_path: Optional[Path] = None
+    stream: Optional[TextIO] = None
     _clock: Callable[[], float] = time.monotonic
 
     def __post_init__(self) -> None:
@@ -194,14 +198,16 @@ class DiagnosticsDashboard:
         self._last_render: float = 0.0
         self._log_file = None
         self._last_line_len = 0
+        self._stream = self.stream if self.stream is not None else sys.stdout
         if self.log_path is not None:
             log_path = self.log_path.expanduser()
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_file = log_path.open("a", encoding="utf-8")
 
     def close(self) -> None:
-        if self.refresh_interval > 0.0 and self._last_line_len:
-            print()
+        if self.refresh_interval > 0.0 and self._last_line_len and self._stream is not None:
+            self._stream.write("\n")
+            self._stream.flush()
             self._last_line_len = 0
         if self._log_file is not None:
             self._log_file.close()
@@ -241,13 +247,31 @@ class DiagnosticsDashboard:
                 turn_tokens=turn_tokens,
                 verbose=self.verbose,
             )
+            if self._stream is None:
+                return
             if self.refresh_interval <= 0.0:
-                print(line)
+                self._stream.write(line + "\n")
+                self._stream.flush()
             else:
                 padding = max(0, self._last_line_len - len(line))
-                sys.stdout.write("\r" + line + (" " * padding))
-                sys.stdout.flush()
+                self._stream.write("\r" + line + (" " * padding))
+                self._stream.flush()
                 self._last_line_len = len(line)
+
+
+@dataclass
+class TurnRecord:
+    prompt: str
+    user_text: str
+    user_tokens: int
+    response_text: str
+    response_fragments: List[str]
+    response_tokens: List[int]
+    diagnostics: Dict[str, object]
+    metrics_payload: Dict[str, object]
+    generation: int
+    turn_tokens: int
+    y_out: Optional[float]
 
 
 def _load_sera_class():
@@ -410,13 +434,10 @@ def _load_manifest_arrays(
     return loaded
 
 
-def _run_turn(
+def _execute_turn(
     model: "Sera",
     prompt: str,
-    dashboard: DiagnosticsDashboard,
-    *,
-    metrics_mode: str = "off",
-) -> str:
+) -> TurnRecord:
     start = time.perf_counter()
     result = model.step(bytes_data=prompt.encode("utf-8"))
     elapsed = max(time.perf_counter() - start, 1e-6)
@@ -455,25 +476,13 @@ def _run_turn(
     except Exception:  # pragma: no cover - fallback if tokenizer encode fails
         response_tokens = [ord(ch) for ch in response_text]
 
-    print("Sera: ", end="", flush=True)
+    response_fragments: List[str] = []
     for token_id in response_tokens:
         try:
             fragment = model.tokenizer.decode([int(token_id)])
         except Exception:  # pragma: no cover - defensive against tokenizer errors
             fragment = bytes([int(token_id) & 0xFF])
-        text = _decode_text(fragment)
-        sys.stdout.write(text)
-        sys.stdout.flush()
-    print()
-
-    if "y_out" in result:
-        print(f"Logit y_out: {_format_float(result['y_out'])}")
-
-    dashboard.update(
-        diagnostics,
-        generation=getattr(model, "generation", 0),
-        turn_tokens=turn_tokens,
-    )
+        response_fragments.append(_decode_text(fragment))
 
     metrics_payload = {
         "latency_ms": _coerce_number(diagnostics.get("latency_ms")),
@@ -483,13 +492,53 @@ def _run_turn(
         "turn_tokens": int(turn_tokens),
     }
 
+    return TurnRecord(
+        prompt=prompt,
+        user_text=user_text,
+        user_tokens=len(tokens),
+        response_text=response_text,
+        response_fragments=response_fragments,
+        response_tokens=[int(token) for token in response_tokens],
+        diagnostics=diagnostics,
+        metrics_payload=metrics_payload,
+        generation=getattr(model, "generation", 0),
+        turn_tokens=turn_tokens,
+        y_out=_coerce_number(result.get("y_out")),
+    )
+
+
+def _run_turn(
+    model: "Sera",
+    prompt: str,
+    dashboard: DiagnosticsDashboard,
+    *,
+    metrics_mode: str = "off",
+) -> str:
+    turn = _execute_turn(model, prompt)
+
+    print(f"User ({turn.user_tokens} tokens): {turn.user_text}")
+    print("Sera: ", end="", flush=True)
+    for fragment in turn.response_fragments:
+        sys.stdout.write(fragment)
+        sys.stdout.flush()
+    print()
+
+    if turn.y_out is not None:
+        print(f"Logit y_out: {_format_float(turn.y_out)}")
+
+    dashboard.update(
+        turn.diagnostics,
+        generation=turn.generation,
+        turn_tokens=turn.turn_tokens,
+    )
+
     if metrics_mode == "plain":
-        print(_format_metrics_line(metrics_payload))
+        print(_format_metrics_line(turn.metrics_payload))
     elif metrics_mode == "json":
-        json_payload = {k: v for k, v in metrics_payload.items()}
+        json_payload = {k: v for k, v in turn.metrics_payload.items()}
         print("[metrics] " + json.dumps(json_payload, sort_keys=True))
 
-    return response_text
+    return turn.response_text
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -541,12 +590,29 @@ def _build_parser() -> argparse.ArgumentParser:
         default="off",
         help="Render per-turn metrics after streaming tokens",
     )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--tui",
+        action="store_true",
+        help="Launch the interactive terminal UI (default mode)",
+    )
+    mode_group.add_argument(
+        "--plain",
+        action="store_true",
+        help="Use the legacy plain-text interface",
+    )
     return parser
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
+
+    use_tui = True
+    if getattr(args, "plain", False):
+        use_tui = False
+    elif getattr(args, "tui", False):
+        use_tui = True
 
     manifest_dir = _resolve_manifest_dir(args.manifest)
     state_path = _locate_state_file(manifest_dir, args.state_file)
@@ -574,14 +640,16 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             config = SeraConfig()
         model = Sera(config)
 
+    load_messages = [f"Loaded Sera manifest from {manifest_dir}"]
+    dashboard_stream = io.StringIO() if use_tui else None
     dashboard = DiagnosticsDashboard(
         refresh_interval=args.stats_refresh,
         verbose=args.verbose_stats,
         log_path=Path(args.diagnostic_log).expanduser() if args.diagnostic_log else None,
+        stream=dashboard_stream,
     )
 
     enabled_tools = sorted(set(args.tools or []))
-    print(f"Loaded Sera manifest from {manifest_dir}")
     if arrays:
         preview = ", ".join(
             f"{name}:{info['dtype']}@{info['shape']}"
@@ -589,26 +657,57 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         )
         if len(arrays) > 3:
             preview += ", ..."
-        print(
+        load_messages.append(
             f"Loaded {len(arrays)} arrays from {manifest_dir / 'arrays'}"
             + (f" [{preview}]" if preview else "")
         )
     if enabled_tools:
-        print("Enabled tools: " + ", ".join(enabled_tools))
+        load_messages.append("Enabled tools: " + ", ".join(enabled_tools))
     else:
-        print("Enabled tools: none")
+        load_messages.append("Enabled tools: none")
+
+    if args.prompt is not None:
+        use_tui = False
 
     try:
-        if args.prompt is not None:
-            _run_turn(model, args.prompt, dashboard, metrics_mode=args.metrics)
+        if not use_tui:
+            for line in load_messages:
+                print(line)
+            if args.prompt is not None:
+                _run_turn(model, args.prompt, dashboard, metrics_mode=args.metrics)
+                return 0
+
+            print("Type your message and press enter (Ctrl+C to exit).")
+            while True:
+                prompt = input("You: ")
+                if not prompt:
+                    continue
+                _run_turn(model, prompt, dashboard, metrics_mode=args.metrics)
             return 0
 
-        print("Type your message and press enter (Ctrl+C to exit).")
-        while True:
-            prompt = input("You: ")
-            if not prompt:
-                continue
-            _run_turn(model, prompt, dashboard, metrics_mode=args.metrics)
+        from .sera_tui import SeraTUI
+
+        tui = SeraTUI(
+            model=model,
+            dashboard=dashboard,
+            execute_turn=lambda prompt: _execute_turn(model, prompt),
+            diagnostics_formatter=lambda diagnostics, generation, turn_tokens: _format_dashboard(
+                diagnostics,
+                generation=generation,
+                turn_tokens=turn_tokens,
+                verbose=args.verbose_stats,
+            ),
+            metrics_formatter=_format_metrics_line,
+            manifest_dir=manifest_dir,
+            manifest_state_path=state_path,
+            manifest_state=runtime_blob,
+            manifest_arrays=arrays,
+            initial_tools=enabled_tools,
+            optional_tools=OPTIONAL_TOOLS,
+            load_messages=load_messages,
+            metrics_mode=args.metrics,
+        )
+        tui.run()
     except KeyboardInterrupt:
         print("\nExiting.")
     finally:
