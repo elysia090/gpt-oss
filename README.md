@@ -266,28 +266,43 @@ GPTOSS_BUILD_METAL=1 pip install -e ".[metal]"
 
 ### Quickstart: Sera terminal chat
 
-To experiment with the lightweight Sera runtime without juggling multiple
-commands you can use the `tools/sera_quickstart.py` helper. The script requires
-Python 3.12, `pip`, and access to the Hugging Face Hub (run `huggingface-cli
-login` beforehand if necessary). A minimal sequence from an empty directory to
-an interactive chat session is:
+The [Sera runtime](docs/sera.md) ships with an interactive terminal client that
+can be launched via the `tools/sera_quickstart.py` helper. This script wraps the
+common setup steps—downloading model weights, preparing the runtime artefacts,
+and invoking the chat CLI—so you can focus on testing the experience.
+
+**Prerequisites**
+
+- Python **3.12** with `pip`
+- A Hugging Face account with an access token stored locally (`huggingface-cli
+  login`)
+- An environment able to install the project in editable mode (build tools,
+  virtual environment, etc.)
+
+**Run the helper**
 
 ```shell
 git clone https://github.com/openai/gpt-oss.git
 cd gpt-oss
+python -m venv .venv && source .venv/bin/activate  # optional but recommended
 pip install -e .
 pip install huggingface-hub  # provides huggingface_hub.snapshot_download
-huggingface-cli login        # if you have not authenticated this machine yet
+huggingface-cli login        # skip if this machine is already authenticated
 python tools/sera_quickstart.py --chat
 ```
 
-The helper downloads `openai/gpt-oss-20b`, stages Sera artefacts under
-`./gpt-oss-sera-20b`, and launches the `gpt-oss-sera-chat` CLI. Pass `--force-clean`
-to remove any previous downloads or `--chat-arg --tool --chat-arg python` to
-enable optional tools in the chat session. The chat CLI now streams the trust
-decision and latency diagnostics reported by the runtime; supply
-`--chat-arg --metrics --chat-arg plain` to mirror the per-turn metrics in the
-terminal or switch to JSON with `--metrics json`.
+By default the script downloads `openai/gpt-oss-20b`, caches the Sera artefacts
+under `./gpt-oss-sera-20b`, and launches the `gpt-oss-sera-chat` CLI. Useful
+options include:
+
+- `--force-clean` — delete any cached artefacts before downloading
+- `--chat-arg --tool --chat-arg python` — enable the Python tool inside the
+  chat session
+- `--chat-arg --metrics --chat-arg plain` — stream trust decisions and latency
+  diagnostics in plain text (use `json` for structured logs)
+
+Run `python tools/sera_quickstart.py --help` for the full list of supported
+flags and environment variables.
 
 ## Download the model
 
