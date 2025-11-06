@@ -307,11 +307,24 @@ pip install huggingface-hub prompt_toolkit         # runtime + TUI dependency
 huggingface-cli login                              # skip if already authenticated
 ```
 
+> **Windows tip:** Replace `source .venv/bin/activate` in the snippet above with
+> the activation command for your shell:
+>
+> - PowerShell: <code>.\.venv\Scripts\Activate.ps1</code>
+> - Command Prompt: <code>.\.venv\Scripts\activate.bat</code>
+
+> **Note:** If `huggingface-cli` is not on your `PATH`, especially on Windows,
+> run `python -m huggingface_hub login` instead.
+
 ##### Step 2 — start the chat
 
 ```shell
 gpt-oss-sera-quickstart --chat
 ```
+
+Once the environment is activated, the `gpt-oss-sera-quickstart --chat`
+entrypoint is available on your `PATH`. If the script is unavailable, invoke
+the helper directly with `python -m gpt_oss.tools.sera_quickstart --chat`.
 
 The first invocation downloads `openai/gpt-oss-20b`, caches the Sera artefacts
 under `./gpt-oss-sera-20b`, and opens the default **Sera terminal UI (TUI)**.
