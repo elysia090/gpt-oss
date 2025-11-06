@@ -102,6 +102,49 @@ def _create_openai_checkpoint(root: Path) -> Path:
     return source
 
 
+def test_model_config_accepts_hf_config_fields() -> None:
+    config = {
+        "hidden_size": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "vocab_size": 8,
+        "rope_theta": 10000.0,
+    }
+
+    rng = random.Random(0)
+    tensors = {
+        "model.layers.0.attention.k_proj.weight": _create_matrix(4, 4, rng),
+        "model.layers.0.attention.o_proj.weight": _create_matrix(4, 4, rng),
+        "model.layers.0.mlp.gate_proj.weight": _create_matrix(8, 4, rng),
+        "model.layers.0.mlp.down_proj.weight": _create_matrix(4, 8, rng),
+        "model.layers.0.mlp.gate_proj.bias": _create_vector(8, rng),
+        "model.layers.0.mlp.down_proj.bias": _create_vector(4, rng),
+    }
+
+    cfg = sera_transfer.ModelConfig.from_dict(config, tensors=tensors)
+
+    assert cfg.d_model == 4
+    assert cfg.n_heads == 2
+    assert cfg.head_dim == 2
+    assert len(cfg.layers) == 1
+    layer = cfg.layers[0]
+    assert layer.w_k.endswith("attention.k_proj.weight")
+    assert layer.w_o.endswith("attention.o_proj.weight")
+    assert layer.w1.endswith("mlp.gate_proj.weight")
+    assert layer.w2.endswith("mlp.down_proj.weight")
+    assert layer.b1.endswith("mlp.gate_proj.bias")
+    assert layer.b2.endswith("mlp.down_proj.bias")
+
+
+def test_model_config_missing_dim_fields_raises_helpful_error() -> None:
+    with pytest.raises(ValueError) as excinfo:
+        sera_transfer.ModelConfig.from_dict({"foo": "bar"})
+
+    message = str(excinfo.value)
+    assert "d_model" in message
+    assert "docs/howto-sera-transfer.md" in message
+
+
 def _read_header(path: Path) -> sera_transfer.ArrayHeader:
     raw = path.read_bytes()[:sera_transfer.ArrayHeader.HEADER_STRUCT.size]
     values = sera_transfer.ArrayHeader.HEADER_STRUCT.unpack(raw)

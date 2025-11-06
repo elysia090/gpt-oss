@@ -463,9 +463,78 @@ class ModelConfig:
         data: Mapping[str, object],
         tensors: Mapping[str, object] | None = None,
     ) -> "ModelConfig":
-        d_model = int(data["d_model"])
-        n_heads = int(data["n_heads"])
-        head_dim = int(data["head_dim"])
+        raw = dict(data)
+
+        def _select(*keys: str) -> object | None:
+            for key in keys:
+                if key in raw:
+                    return raw[key]
+            return None
+
+        def _coerce_int(name: str, value: object | None) -> int | None:
+            if value is None:
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
+                raise ValueError(
+                    f"Model config field '{name}' must be an integer, got {value!r}"
+                ) from exc
+
+        d_model = _coerce_int(
+            "d_model",
+            raw.get("d_model")
+            or _select("hidden_size", "n_embd", "model_dim", "dim_model"),
+        )
+
+        n_heads = _coerce_int(
+            "n_heads",
+            raw.get("n_heads")
+            or _select(
+                "num_attention_heads",
+                "num_heads",
+                "n_head",
+                "decoder_attention_heads",
+            ),
+        )
+
+        kv_heads = _coerce_int(
+            "num_key_value_heads",
+            _select("num_key_value_heads", "num_kv_heads", "n_kv_heads"),
+        )
+
+        head_dim = _coerce_int(
+            "head_dim",
+            raw.get("head_dim") or _select("head_dim", "attention_head_size"),
+        )
+
+        if n_heads == 0:
+            raise ValueError("Model config field 'n_heads' must be greater than zero")
+
+        if head_dim is None and d_model is not None and n_heads is not None and n_heads:
+            if d_model % n_heads == 0:
+                head_dim = d_model // n_heads
+            elif kv_heads:
+                if d_model % kv_heads == 0:
+                    head_dim = d_model // kv_heads
+        if head_dim is None and d_model is not None and n_heads is not None:
+            doc_hint = "docs/howto-sera-transfer.md"
+            raise ValueError(
+                "Model config does not provide 'head_dim'. Provide the Sera schema "
+                "(d_model/n_heads/head_dim) or a Hugging Face config with "
+                "hidden_size/num_attention_heads/head_dim. See "
+                f"{doc_hint} for details."
+            )
+
+        if d_model is None or n_heads is None or head_dim is None:
+            doc_hint = "docs/howto-sera-transfer.md"
+            raise ValueError(
+                "Model config must define d_model, n_heads, and head_dim (or provide "
+                "their Hugging Face equivalents such as hidden_size, "
+                "num_attention_heads, and head_dim). See "
+                f"{doc_hint} for the expected schema."
+            )
+
         vocab_size = int(data.get("vocab_size", 0) or 0)
         tau = float(data.get("tau", 1.0))
         rope_theta = data.get("rope_theta")
