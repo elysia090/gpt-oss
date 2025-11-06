@@ -27,6 +27,7 @@ version = "0.0.8"
 
 [project.scripts]
 gpt-oss-sera-chat = "gpt_oss.cli.sera_chat:main"
+gpt-oss-sera-quickstart = "gpt_oss.tools.sera_quickstart:main"
 
 [project.optional-dependencies]
 triton = ["triton>=3.4", "safetensors>=0.5.3", "torch>=2.7.0"]
