@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import dataclasses
+import importlib
 import importlib.util
 import pickle
 import subprocess
 import sys
 from pathlib import Path
 
-import dataclasses
 import pytest
 
 
@@ -19,18 +20,6 @@ def _load_sera():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module.Sera, module.SeraConfig
-
-
-def _strip_private_fields(blob):
-    if isinstance(blob, dict):
-        return {
-            key: _strip_private_fields(value)
-            for key, value in blob.items()
-            if not (isinstance(key, str) and key.startswith("_"))
-        }
-    if isinstance(blob, list):
-        return [_strip_private_fields(value) for value in blob]
-    return blob
 
 
 def _config_to_dict(config):
@@ -50,7 +39,7 @@ def _config_to_dict(config):
 
 
 @pytest.fixture()
-def sera_snapshot(tmp_path: Path) -> Path:
+def sera_manifest(tmp_path: Path) -> Path:
     Sera, SeraConfig = _load_sera()
     model = Sera(SeraConfig())
     snapshot = model.snapshot()
@@ -58,22 +47,29 @@ def sera_snapshot(tmp_path: Path) -> Path:
     state_path = tmp_path / "sera_state.pkl"
     with state_path.open("wb") as fh:
         pickle.dump(snapshot, fh)
+    manifest_path = tmp_path / "sera_manifest.bin"
+    manifest_path.write_bytes(b"SERM")
+    (tmp_path / "arrays").mkdir()
     return tmp_path
 
 
-def test_single_turn_prompt(sera_snapshot: Path) -> None:
+def test_single_turn_prompt(sera_manifest: Path) -> None:
     script = [
         sys.executable,
         "-m",
         "gpt_oss.cli.sera_chat",
-        "--artifacts",
-        str(sera_snapshot),
+        "--manifest",
+        str(sera_manifest),
         "--prompt",
         "hello",
         "--response-token",
         "65",
+        "--tool",
+        "python",
     ]
     env = {"PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src")}
     proc = subprocess.run(script, capture_output=True, text=True, env=env, check=True)
+    assert "Loaded Sera manifest" in proc.stdout
+    assert "Enabled tools: python" in proc.stdout
     assert "Sera" in proc.stdout
     assert "A" in proc.stdout
