@@ -7,8 +7,10 @@ python -m gpt_oss.tools.sera_transfer --source /path/to/checkpoint --output /pat
 ```
 
 > **Prerequisite**
-> Install the optional safetensors dependency before running the converter,
-> for example with `pip install "gpt-oss[torch]"` or `pip install safetensors`.
+> Install the official safetensors wheel before running the converter, for
+> example with `pip install safetensors` or `pip install "gpt-oss[torch]"`.
+> The repository bundles a JSON-only stub for tests; the upstream package is
+> required to load binary `model.safetensors` checkpoints.
 
 The source directory must contain both `model.safetensors` and `config.json`.
 When those files are missing from the immediate `SOURCE/` root the converter
