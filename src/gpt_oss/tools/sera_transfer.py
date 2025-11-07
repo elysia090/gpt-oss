@@ -942,7 +942,8 @@ class ModelConfig:
 
 _SAFETENSORS_MISSING_MSG = (
     "The `safetensors` package is required to load model checkpoints. "
-    "Install it via `pip install safetensors` or provide a preloaded tensor map."
+    "Install the official wheel (for example, via `pip install safetensors`) to "
+    "handle binary `model.safetensors` payloads or provide a preloaded tensor map."
 )
 
 
@@ -1066,7 +1067,11 @@ def load_tensors(path: Path) -> Dict[str, List]:
             raise ModuleNotFoundError(stub_hint)
 
     tensors: Dict[str, List] = {}
-    open_kwargs = {"framework": "python" if safe_open_is_stub else "numpy"}
+    open_kwargs: Dict[str, object] = {}
+    if safe_open_is_stub:
+        open_kwargs["framework"] = "python"
+    else:
+        open_kwargs["framework"] = "numpy"
 
     try:
         with safe_open_fn(path, **open_kwargs) as f:

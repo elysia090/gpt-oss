@@ -33,10 +33,7 @@ def _create_vector(length: int, rng: random.Random) -> list[float]:
     return [rng.uniform(-1.0, 1.0) for _ in range(length)]
 
 
-def _create_checkpoint(root: Path) -> Path:
-    source = root / "source"
-    source.mkdir(parents=True, exist_ok=True)
-
+def _sample_checkpoint_contents() -> tuple[dict, dict[str, list]]:
     config = {
         "d_model": 4,
         "n_heads": 2,
@@ -47,7 +44,7 @@ def _create_checkpoint(root: Path) -> Path:
     }
     layers = []
     rng = random.Random(0)
-    tensors = {}
+    tensors: dict[str, list] = {}
     for idx in range(2):
         prefix = f"layers.{idx}"
         layer = {
@@ -69,6 +66,14 @@ def _create_checkpoint(root: Path) -> Path:
 
     tensors["tok_embeddings.weight"] = _create_matrix(config["vocab_size"], config["d_model"], rng)
     config["layers"] = layers
+    return config, tensors
+
+
+def _create_checkpoint(root: Path) -> Path:
+    source = root / "source"
+    source.mkdir(parents=True, exist_ok=True)
+
+    config, tensors = _sample_checkpoint_contents()
     (source / "config.json").write_text(json.dumps(config))
     save_file(tensors, source / "model.safetensors")
     return source
@@ -104,6 +109,23 @@ def _create_openai_checkpoint(root: Path) -> Path:
     tensors["tok_embeddings.weight"] = _create_matrix(config["vocab_size"], config["d_model"], rng)
     save_file(tensors, source / "model.safetensors")
     return source
+
+
+def _tensor_shape(tensor) -> list[int]:
+    if isinstance(tensor, list) and tensor:
+        return [len(tensor)] + _tensor_shape(tensor[0])
+    if isinstance(tensor, list):
+        return [0]
+    return []
+
+
+def _flatten_tensor(tensor) -> list[float]:
+    if isinstance(tensor, list):
+        result: list[float] = []
+        for item in tensor:
+            result.extend(_flatten_tensor(item))
+        return result
+    return [float(tensor)]
 
 
 def test_load_tensors_requires_safetensors(monkeypatch):
@@ -522,6 +544,89 @@ def test_convert_handles_stat_failure(tmp_path: Path, monkeypatch) -> None:
 
     assert call_count["value"] >= 1
     assert (output / "sera_manifest.bin").exists()
+
+
+def test_convert_supports_stub_and_wheel_safe_open(tmp_path: Path, monkeypatch) -> None:
+    module = importlib.reload(sera_transfer)
+
+    stub_config, stub_tensors = _sample_checkpoint_contents()
+    stub_source = tmp_path / "stub_source"
+    stub_source.mkdir()
+    (stub_source / "config.json").write_text(json.dumps(stub_config))
+    stub_payload = {
+        "tensors": {
+            name: {"shape": _tensor_shape(data), "data": _flatten_tensor(data)}
+            for name, data in stub_tensors.items()
+        }
+    }
+    (stub_source / "model.safetensors").write_text(json.dumps(stub_payload))
+
+    stub_frameworks: list[str] = []
+    stub_safe_open = sys.modules["safetensors"].safe_open
+
+    def recording_stub_safe_open(path, framework="python", **kwargs):
+        stub_frameworks.append(framework)
+        return stub_safe_open(path, framework=framework, **kwargs)
+
+    recording_stub_safe_open.__module__ = getattr(stub_safe_open, "__module__", "safetensors")
+
+    monkeypatch.setattr(module, "_resolve_safe_open", lambda: recording_stub_safe_open)
+
+    stub_output = tmp_path / "stub_output"
+    module.convert(stub_source, stub_output, r=4, r_v=2, top_l=2)
+    assert stub_frameworks == ["python"]
+    assert (stub_output / "sera_manifest.bin").exists()
+
+    wheel_config, wheel_tensors = _sample_checkpoint_contents()
+    wheel_source = tmp_path / "wheel_source"
+    wheel_source.mkdir()
+    (wheel_source / "config.json").write_text(json.dumps(wheel_config))
+    wheel_source.joinpath("model.safetensors").write_bytes(b"BIN" + pickle.dumps(wheel_tensors))
+
+    wheel_frameworks: list[str] = []
+
+    class _WheelTensor:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def tolist(self):
+            return self._payload
+
+    class _WheelSafeFile:
+        def __init__(self, path, *, framework="numpy"):
+            wheel_frameworks.append(framework)
+            if framework != "numpy":
+                raise RuntimeError(f"Unexpected framework: {framework!r}")
+            raw = Path(path).read_bytes()
+            if not raw.startswith(b"BIN"):
+                raise ValueError("Unexpected payload")
+            loaded = pickle.loads(raw[3:])
+            self._tensors = {
+                key: _WheelTensor(value)
+                for key, value in loaded.items()
+            }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def keys(self):
+            return list(self._tensors.keys())
+
+        def get_tensor(self, key):
+            return self._tensors[key]
+
+    def fake_safe_open(path, framework="numpy", **kwargs):
+        return _WheelSafeFile(path, framework=framework)
+
+    monkeypatch.setattr(module, "_resolve_safe_open", lambda: fake_safe_open)
+
+    wheel_output = tmp_path / "wheel_output"
+    module.convert(wheel_source, wheel_output, r=4, r_v=2, top_l=2)
+    assert wheel_frameworks == ["numpy"]
+    assert (wheel_output / "sera_manifest.bin").exists()
 
 def test_deterministic_conversion(tmp_path: Path) -> None:
     source = _create_checkpoint(tmp_path / "deterministic")
