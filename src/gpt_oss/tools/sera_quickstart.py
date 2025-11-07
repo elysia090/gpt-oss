@@ -18,7 +18,6 @@ from typing import Iterable, Optional, Sequence
 from . import sera_transfer
 
 DEFAULT_REPO_ID = "openai/gpt-oss-20b"
-DEFAULT_DOWNLOAD_DIR = Path("gpt-oss-20b")
 DEFAULT_OUTPUT_DIR = Path("gpt-oss-sera-20b")
 DEFAULT_R = 512
 DEFAULT_R_V = 12
@@ -49,10 +48,11 @@ def _download_checkpoint(
         download_dir = download_dir.expanduser()
         download_dir.parent.mkdir(parents=True, exist_ok=True)
         print(f"Downloading {repo_id} to {download_dir}...")
-        kwargs.update(
-            local_dir=str(download_dir),
-            local_dir_use_symlinks=not materialize,
-        )
+        kwargs["local_dir"] = str(download_dir)
+        if materialize:
+            # Allow callers to request a fully materialised copy explicitly;
+            # otherwise the helper reuses the Hugging Face cache via symlinks.
+            kwargs["local_dir_use_symlinks"] = False
     else:
         print(f"Downloading {repo_id} using the Hugging Face cache...")
 

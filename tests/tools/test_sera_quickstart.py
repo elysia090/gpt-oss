@@ -105,7 +105,7 @@ def test_quickstart_pipeline(tmp_path: Path, monkeypatch, launch_chat: bool) -> 
     ) -> str:
         calls.append((repo_id, revision))
         assert local_dir is not None
-        assert local_dir_use_symlinks is True
+        assert local_dir_use_symlinks is None
         destination = Path(local_dir)
         destination.mkdir(parents=True, exist_ok=True)
         for item in checkpoint_dir.iterdir():
@@ -256,5 +256,5 @@ def test_quickstart_uses_cache_when_download_dir_unspecified(
 
     assert exit_code == 0
     assert cache_calls == [("openai/gpt-oss-20b", None, {})]
-    assert not (tmp_path / quickstart.DEFAULT_DOWNLOAD_DIR).exists()
+    assert not (tmp_path / "gpt-oss-20b").exists()
     assert (output_dir / "sera_manifest.bin").exists()
