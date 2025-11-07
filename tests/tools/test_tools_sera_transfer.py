@@ -153,11 +153,14 @@ def test_load_tensors_stub_passes_python_framework(tmp_path, monkeypatch):
     assert module._looks_like_repo_stub_safe_open(module.safe_open)
 
     original_safe_open = safetensors_stub.safe_open
-    calls: list[str] = []
+    calls: list[tuple[str, str | None]] = []
 
-    def recording_safe_open(path, framework="python", **kwargs):
-        calls.append(framework)
-        return original_safe_open(path, framework=framework, **kwargs)
+    def recording_safe_open(*args, **kwargs):
+        if len(args) >= 2:
+            calls.append(("positional", args[1]))
+        else:
+            calls.append(("keyword", kwargs.get("framework")))
+        return original_safe_open(*args, **kwargs)
 
     recording_safe_open.__module__ = original_safe_open.__module__
 
@@ -174,7 +177,55 @@ def test_load_tensors_stub_passes_python_framework(tmp_path, monkeypatch):
     tensors = module.load_tensors(checkpoint)
 
     assert tensors["foo"] == [[1.0, 2.0]]
-    assert calls == ["python"]
+    assert calls == [("positional", "python")]
+
+
+def test_load_tensors_keyword_only_safe_open_backward_compat(tmp_path, monkeypatch):
+    module = importlib.reload(sera_transfer)
+
+    assert module.safe_open is not None
+
+    class _FakeTensor:
+        def __init__(self, data):
+            self._data = data
+
+        def tolist(self):
+            return self._data
+
+    class _FakeSafeFile:
+        def __init__(self, mapping):
+            self._mapping = mapping
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def keys(self):
+            return list(self._mapping.keys())
+
+        def get_tensor(self, key):
+            return _FakeTensor(self._mapping[key])
+
+    calls: list[tuple[str, str]] = []
+    payload = {"foo": [[1.0, 2.0]]}
+
+    def keyword_only_safe_open(path, *args, framework, device=None):  # noqa: ARG001
+        if args:
+            raise TypeError("safe_open() takes 1 positional argument but 2 were given")
+        calls.append(("keyword", framework))
+        return _FakeSafeFile(payload)
+
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"")
+
+    monkeypatch.setattr(module, "safe_open", keyword_only_safe_open)
+
+    tensors = module.load_tensors(checkpoint)
+
+    assert tensors == payload
+    assert calls == [("keyword", "pt")]
 
 
 def test_load_tensors_prefers_real_safetensors_when_available(tmp_path, monkeypatch):

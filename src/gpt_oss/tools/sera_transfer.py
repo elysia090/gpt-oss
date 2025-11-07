@@ -976,7 +976,6 @@ def load_tensors(path: Path) -> Dict[str, List]:
     tensors: Dict[str, List] = {}
 
     try:
-        safe_open_kwargs: Dict[str, object] = {}
         framework_value: Optional[str]
 
         try:
@@ -998,10 +997,19 @@ def load_tensors(path: Path) -> Dict[str, List]:
             else:
                 framework_value = None
 
-        if framework_value is not None:
-            safe_open_kwargs["framework"] = framework_value
+        def _open_file():
+            if framework_value is None:
+                return safe_open_fn(path)
 
-        with safe_open_fn(path, **safe_open_kwargs) as f:
+            try:
+                return safe_open_fn(path, framework_value)
+            except TypeError as exc:
+                try:
+                    return safe_open_fn(path, framework=framework_value)
+                except TypeError:
+                    raise exc
+
+        with _open_file() as f:
             for key in f.keys():
                 tensor = f.get_tensor(key)
                 try:
