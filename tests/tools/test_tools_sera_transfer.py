@@ -242,9 +242,9 @@ class _FakeTensor:
         return self._payload
 
 
-def safe_open(path, **kwargs):
-    if "framework" in kwargs:
-        raise SafetensorError(f"Unexpected framework: {kwargs['framework']!r}")
+def safe_open(path, framework="pt", **kwargs):
+    if framework != "pt":
+        raise SafetensorError(f"Unexpected framework: {framework!r}")
     return _FakeSafeFile(path)
 """
     )
@@ -325,9 +325,9 @@ class SafetensorError(RuntimeError):
     pass
 
 
-def safe_open(path, **kwargs):
-    if "framework" in kwargs:
-        raise SafetensorError(f"Unexpected framework: {kwargs['framework']!r}")
+def safe_open(path, framework="pt", **kwargs):
+    if framework != "pt":
+        raise SafetensorError(f"Unexpected framework: {framework!r}")
     return _FakeSafeFile(path)
 """
     )
@@ -434,9 +434,9 @@ class _FakeSafeFile:
         return self._payload[key]
 
 
-def safe_open(path, **kwargs):
-    if "framework" in kwargs:
-        raise SafetensorError(f"Unexpected framework: {kwargs['framework']!r}")
+def safe_open(path, framework="pt", **kwargs):
+    if framework != "pt":
+        raise SafetensorError(f"Unexpected framework: {framework!r}")
     return _FakeSafeFile(path)
 """
         )
