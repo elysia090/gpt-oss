@@ -1999,6 +1999,18 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     args = parser.parse_args(argv)
 
+    def _expand_path(value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        return value.expanduser()
+
+    args.source = _expand_path(args.source)
+    args.output = _expand_path(args.output)
+    args.summary_output = _expand_path(args.summary_output)
+
+    if args.original_subdir is not None:
+        args.original_subdir = Path(args.original_subdir).expanduser()
+
     if args.verbose is None:
         env_value = os.environ.get("SERA_TRANSFER_VERBOSE")
         if env_value is None:

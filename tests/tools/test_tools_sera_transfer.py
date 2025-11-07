@@ -377,6 +377,30 @@ def test_convert_emits_json_snapshot(tmp_path: Path) -> None:
     )
 
 
+def test_parse_args_expands_user(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    args = sera_transfer._parse_args(
+        [
+            "--source",
+            "~/checkpoint",
+            "--output",
+            "~/output",
+            "--summary-output",
+            "~/summary.json",
+            "--original-subdir",
+            "~/nested/original",
+        ]
+    )
+
+    assert args.source == Path(home / "checkpoint")
+    assert args.output == Path(home / "output")
+    assert args.summary_output == Path(home / "summary.json")
+    assert args.original_subdir == Path(home / "nested" / "original")
+
+
 def test_written_arrays_match_reference(tmp_path: Path) -> None:
     source = _create_checkpoint(tmp_path / "reference")
     output = tmp_path / "output"
