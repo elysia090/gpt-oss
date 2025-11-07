@@ -49,11 +49,14 @@ def _create_vector(length: int, rng: random.Random) -> list[float]:
     return [rng.uniform(-1.0, 1.0) for _ in range(length)]
 
 
-def _create_checkpoint(tmp_path: Path) -> Path:
+def _create_checkpoint(tmp_path: Path, *, nested: bool = False) -> Path:
     source = tmp_path / "checkpoint"
     source.mkdir()
     original = source / "original"
     original.mkdir()
+
+    payload_root = original / "model" if nested else original
+    payload_root.mkdir(parents=True, exist_ok=True)
 
     config = {
         "d_model": 4,
@@ -74,7 +77,7 @@ def _create_checkpoint(tmp_path: Path) -> Path:
             }
         ],
     }
-    (original / "config.json").write_text(json.dumps(config))
+    (payload_root / "config.json").write_text(json.dumps(config))
 
     tokenizer_stub = json.dumps({"tokenizer": "stub"})
     for filename in quickstart.TOKENIZER_FILENAMES:
@@ -89,13 +92,29 @@ def _create_checkpoint(tmp_path: Path) -> Path:
         "layers.0.ffn.w1.bias": _create_vector(8, rng),
         "layers.0.ffn.w2.bias": _create_vector(4, rng),
     }
-    save_file(tensors, original / "model.safetensors")
+    save_file(tensors, payload_root / "model.safetensors")
     return source
 
 
+@pytest.mark.parametrize("nested_layout", [False, True], ids=["flat", "nested"])
 @pytest.mark.parametrize("launch_chat", [False, True])
-def test_quickstart_pipeline(tmp_path: Path, monkeypatch, launch_chat: bool) -> None:
-    checkpoint_dir = _create_checkpoint(tmp_path)
+def test_quickstart_pipeline(
+    tmp_path: Path,
+    monkeypatch,
+    launch_chat: bool,
+    nested_layout: bool,
+) -> None:
+    checkpoint_dir = _create_checkpoint(tmp_path, nested=nested_layout)
+    if nested_layout:
+        assert not (checkpoint_dir / "config.json").exists()
+        assert not (checkpoint_dir / "model.safetensors").exists()
+        nested_root = checkpoint_dir / "original" / "model"
+        assert nested_root.is_dir()
+        assert (nested_root / "config.json").exists()
+        assert (nested_root / "model.safetensors").exists()
+    else:
+        assert (checkpoint_dir / "original" / "config.json").exists()
+        assert (checkpoint_dir / "original" / "model.safetensors").exists()
     download_dir = tmp_path / "download"
     output_dir = tmp_path / "sera"
 
