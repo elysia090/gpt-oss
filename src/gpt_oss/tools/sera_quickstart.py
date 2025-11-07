@@ -51,6 +51,23 @@ class QuickstartError(RuntimeError):
     """Raised when the quickstart pipeline encounters a fatal error."""
 
 
+def _normalise_path(path: Path) -> Path:
+    """Return an absolute version of *path* that tolerates exotic Windows links.
+
+    Hugging Face's Windows cache can expose XET-backed files using reparse
+    points that occasionally cause :meth:`Path.resolve` to raise an
+    :class:`OSError`.  When this happens we fall back to :meth:`Path.absolute`
+    so the caller can keep using the cache directory without forcing a full
+    materialisation of the checkpoint on disk.
+    """
+
+    path = path.expanduser()
+    try:
+        return path.resolve()
+    except OSError:  # pragma: no cover - exercised on Windows
+        return path.absolute()
+
+
 def _download_checkpoint(
     repo_id: str,
     revision: Optional[str],
@@ -95,11 +112,11 @@ def _convert_checkpoint(
     r_v: int,
     top_l: int,
 ) -> Path:
-    source_dir = source_dir.expanduser().resolve()
+    source_dir = _normalise_path(source_dir)
     if not source_dir.exists():
         raise QuickstartError(f"Checkpoint directory {source_dir} does not exist")
 
-    output_dir = output_dir.expanduser().resolve()
+    output_dir = _normalise_path(output_dir)
     print(
         "Converting checkpoint at"
         f" {source_dir} -> {output_dir} (r={r}, r_v={r_v}, top_l={top_l})"
@@ -219,13 +236,15 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         download_dir, output_dir = _prepare_directories(args)
 
         if args.checkpoint_dir is not None:
-            checkpoint_dir = Path(args.checkpoint_dir).expanduser().resolve()
+            checkpoint_dir = _normalise_path(Path(args.checkpoint_dir))
         else:
-            checkpoint_dir = _download_checkpoint(
+            checkpoint_dir = _normalise_path(
+                _download_checkpoint(
                 args.repo_id,
                 args.revision,
                 download_dir,
                 materialize=args.materialize_download,
+                )
             )
 
         artifacts_dir = _convert_checkpoint(

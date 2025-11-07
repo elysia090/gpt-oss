@@ -96,6 +96,23 @@ def _create_checkpoint(tmp_path: Path, *, nested: bool = False) -> Path:
     return source
 
 
+def test_normalise_path_handles_resolve_oserror(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "hf-cache"
+    target.mkdir()
+
+    original_resolve = type(target).resolve
+
+    def fake_resolve(self):  # type: ignore[no-untyped-def]
+        if self == target:
+            raise OSError("simulated reparse failure")
+        return original_resolve(self)
+
+    monkeypatch.setattr(type(target), "resolve", fake_resolve, raising=False)
+
+    resolved = quickstart._normalise_path(target)
+    assert resolved == target.absolute()
+
+
 @pytest.mark.parametrize("nested_layout", [False, True], ids=["flat", "nested"])
 @pytest.mark.parametrize("launch_chat", [False, True])
 def test_quickstart_pipeline(
