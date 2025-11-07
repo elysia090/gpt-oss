@@ -19,7 +19,7 @@ import sys
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
 try:  # pragma: no cover - exercised indirectly in environments with safetensors
     from safetensors import safe_open as _real_safe_open
@@ -29,6 +29,27 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in environments with
 from gpt_oss._stubs.safetensors import is_stub_safe_open, safe_open as _stub_safe_open
 
 safe_open = _real_safe_open if _real_safe_open is not None else _stub_safe_open  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency
+    import numpy as _np
+except Exception:  # pragma: no cover - defensive
+    _np = None
+
+try:  # pragma: no cover - optional dependency
+    import torch as _torch
+except Exception:  # pragma: no cover - defensive
+    _torch = None
+
+if TYPE_CHECKING:  # pragma: no cover - typing helper
+    from numpy import ndarray as _NDArray
+    from torch import Tensor as _TorchTensor
+
+    TensorLike = list | _NDArray | _TorchTensor
+else:  # pragma: no cover - runtime alias
+    TensorLike = Any
+
+_NP_ARRAY_TYPES = (_np.ndarray,) if _np is not None else ()
+_TORCH_TENSOR_TYPES = (_torch.Tensor,) if _torch is not None else ()
 
 
 def _looks_like_repo_stub_safe_open(func) -> bool:
@@ -143,13 +164,36 @@ def _json_value(value: object):
     return value
 
 
-def _flatten(values: Iterable) -> List[float]:
+def _flatten(values) -> List[float]:
     result: List[float] = []
-    for item in values:
+
+    def _recurse(item) -> None:
         if isinstance(item, (list, tuple)):
-            result.extend(_flatten(item))
-        else:
-            result.append(float(item))
+            for sub in item:
+                _recurse(sub)
+            return
+        if _NP_ARRAY_TYPES and isinstance(item, _NP_ARRAY_TYPES):
+            ndim = getattr(item, "ndim", 0)
+            if ndim == 0:
+                result.append(float(item))
+            else:
+                for sub in item:
+                    _recurse(sub)
+            return
+        if _TORCH_TENSOR_TYPES and isinstance(item, _TORCH_TENSOR_TYPES):
+            if item.ndim == 0:
+                result.append(float(item))
+            else:
+                for sub in item:
+                    _recurse(sub)
+            return
+        if hasattr(item, "__iter__") and not isinstance(item, (str, bytes, bytearray)):
+            for sub in item:
+                _recurse(sub)
+            return
+        result.append(float(item))
+
+    _recurse(values)
     return result
 
 
@@ -166,7 +210,24 @@ def _infer_shape(values) -> Tuple[int, ...]:
             return (0,)
         inner = _infer_shape(values[0])
         return (len(values),) + inner
+    if _NP_ARRAY_TYPES and isinstance(values, _NP_ARRAY_TYPES):
+        return tuple(int(dim) for dim in getattr(values, "shape", ()))
+    if _TORCH_TENSOR_TYPES and isinstance(values, _TORCH_TENSOR_TYPES):
+        return tuple(int(dim) for dim in values.shape)
     raise TypeError(f"Unsupported tensor type: {type(values)!r}")
+
+
+def _tensor_len(value) -> int:
+    try:
+        return int(len(value))  # type: ignore[arg-type]
+    except TypeError:
+        if _NP_ARRAY_TYPES and isinstance(value, _NP_ARRAY_TYPES):
+            shape = getattr(value, "shape", ())
+            return int(shape[0]) if shape else 0
+        if _TORCH_TENSOR_TYPES and isinstance(value, _TORCH_TENSOR_TYPES):
+            shape = value.shape
+            return int(shape[0]) if len(shape) else 0
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +524,7 @@ def _mix64(value: int, seed: int = 0) -> int:
     return (z ^ (z >> 31)) & 0xFFFFFFFFFFFFFFFF
 
 
-def _tensor_bytes(tensor: List) -> bytes:
+def _tensor_bytes(tensor: TensorLike) -> bytes:
     from array import array
 
     flat = _flatten(tensor)
@@ -953,7 +1014,7 @@ def _resolve_safe_open():
     return safe_open
 
 
-def load_tensors(path: Path) -> Dict[str, List]:
+def load_tensors(path: Path) -> Dict[str, TensorLike]:
     safe_open_fn = _resolve_safe_open()
 
     safe_open_is_stub = _looks_like_repo_stub_safe_open(safe_open_fn)
@@ -973,7 +1034,7 @@ def load_tensors(path: Path) -> Dict[str, List]:
         if sample and not sample.lstrip().startswith(b"{"):
             raise ModuleNotFoundError(stub_hint)
 
-    tensors: Dict[str, List] = {}
+    tensors: Dict[str, TensorLike] = {}
 
     try:
         framework_value: Optional[str]
@@ -1011,11 +1072,9 @@ def load_tensors(path: Path) -> Dict[str, List]:
 
         with _open_file() as f:
             for key in f.keys():
-                tensor = f.get_tensor(key)
-                try:
-                    tensors[key] = tensor.tolist()
-                except AttributeError:
-                    tensors[key] = tensor  # pragma: no cover - defensive fallback
+                # Preserve the tensor in its native representation (e.g. numpy or torch)
+                # so that downstream stages can leverage zero-copy views when available.
+                tensors[key] = f.get_tensor(key)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         if safe_open_is_stub:
             raise ModuleNotFoundError(stub_hint) from exc
@@ -1042,7 +1101,7 @@ def _column_means_squared(matrix: List[List[float]]) -> List[float]:
     return result
 
 
-def compute_prf(cfg: ModelConfig, tensors: Mapping[str, List], r: int) -> Dict[str, List]:
+def compute_prf(cfg: ModelConfig, tensors: Mapping[str, TensorLike], r: int) -> Dict[str, List]:
     digest = hashlib.sha256()
     diag_accum = [0.0 for _ in range(cfg.d_model)]
     counts = [0 for _ in range(cfg.d_model)]
@@ -1110,7 +1169,9 @@ def gaussian_matrix(prng: SplitMix64, rows: int, cols: int) -> List[List[float]]
     return matrix
 
 
-def compute_overlays(cfg: ModelConfig, tensors: Mapping[str, List], r: int, r_v: int) -> Dict[str, List]:
+def compute_overlays(
+    cfg: ModelConfig, tensors: Mapping[str, TensorLike], r: int, r_v: int
+) -> Dict[str, List]:
     accumulator: Optional[List[List[float]]] = None
     layer_count = 0
     digest = hashlib.sha256()
@@ -1120,8 +1181,8 @@ def compute_overlays(cfg: ModelConfig, tensors: Mapping[str, List], r: int, r_v:
             continue
         digest.update(layer.w_o.encode("utf-8"))
         digest.update(_tensor_bytes(w_o))
-        layer_rows = len(w_o)
-        layer_cols = len(w_o[0]) if w_o else 0
+        layer_rows = _tensor_len(w_o)
+        layer_cols = _tensor_len(w_o[0]) if layer_rows else 0
         if accumulator is None:
             accumulator = [[0.0 for _ in range(layer_cols)] for _ in range(layer_rows)]
         for i in range(min(layer_rows, len(accumulator))):
@@ -1163,8 +1224,11 @@ def compute_overlays(cfg: ModelConfig, tensors: Mapping[str, List], r: int, r_v:
 # FFN collapse
 
 
-def matrix_abs(matrix: List[List[float]]) -> List[List[float]]:
-    return [[abs(value) for value in row] for row in matrix]
+def matrix_abs(matrix) -> List[List[float]]:
+    result: List[List[float]] = []
+    for row in matrix:
+        result.append([abs(float(value)) for value in row])
+    return result
 
 
 def sign(value: float) -> float:
@@ -1194,7 +1258,7 @@ def _serialize_cuckoo(entries: Sequence[Tuple[int, int, float]]) -> List[int]:
 
 
 def collapse_ffn(
-    cfg: ModelConfig, tensors: Mapping[str, List], top_l: int
+    cfg: ModelConfig, tensors: Mapping[str, TensorLike], top_l: int
 ) -> Tuple[Dict[str, List], Dict[str, object]]:
     weight_map: Dict[int, float] = {}
     residual_entries: List[Tuple[int, int, float]] = []
@@ -1221,7 +1285,9 @@ def collapse_ffn(
             idxs = set(top_indices(scores, top_l))
             effect = 0.0
             for h in idxs:
-                sign_sum = sum(W2[out_idx][h] for out_idx in range(len(W2)))
+                sign_sum = sum(
+                    float(W2[out_idx][h]) for out_idx in range(len(W2))
+                )
                 effect += sign(sign_sum) * max(0.0, float(W1[h][feature]))
             key = (layer_index << 32) | feature
             weight_map[key] = effect
@@ -1229,7 +1295,9 @@ def collapse_ffn(
             for h in range(hidden_dim):
                 if h in idxs:
                     continue
-                sign_sum = sum(W2[out_idx][h] for out_idx in range(len(W2)))
+                sign_sum = sum(
+                    float(W2[out_idx][h]) for out_idx in range(len(W2))
+                )
                 residual = sign(sign_sum) * max(0.0, float(W1[h][feature]))
                 if abs(residual) > 0.0:
                     residual_entries.append((key, h, residual))
@@ -1278,7 +1346,7 @@ def memory_coefficients(cfg: ModelConfig) -> Tuple[Dict[str, List], Dict[str, ob
     return arrays, metadata
 
 
-def _layer_seed(layer: LayerConfig, tensors: Mapping[str, List]) -> int:
+def _layer_seed(layer: LayerConfig, tensors: Mapping[str, TensorLike]) -> int:
     digest = hashlib.sha256()
     for name in (layer.w_k, layer.w_o, layer.w1, layer.w2, layer.b1, layer.b2):
         tensor = tensors.get(name)
@@ -1302,7 +1370,7 @@ def _quantize_q8_8(value: float) -> Tuple[List[int], float]:
 
 
 def bridge_records(
-    cfg: ModelConfig, tensors: Mapping[str, List], vocab_size: int, W: int = 2
+    cfg: ModelConfig, tensors: Mapping[str, TensorLike], vocab_size: int, W: int = 2
 ) -> Tuple[Dict[str, List], Dict[str, object]]:
     vocab = vocab_size or cfg.d_model or 16
     vocab = max(1, vocab)
@@ -1333,8 +1401,10 @@ def bridge_records(
             feature_out = feature % max(1, out_dim)
             avg_w1 = sum(float(W1[h][feature % len(W1[h])]) for h in range(hidden_dim)) / max(1, hidden_dim)
             avg_w2 = sum(float(value) for value in W2[feature_out]) / max(1, len(W2[feature_out]))
-            bias1 = float(b1[feature_h % len(b1)]) if b1 else 0.0
-            bias2 = float(b2[feature_out % len(b2)]) if b2 else 0.0
+            b1_len = _tensor_len(b1)
+            b2_len = _tensor_len(b2)
+            bias1 = float(b1[feature_h % b1_len]) if b1_len else 0.0
+            bias2 = float(b2[feature_out % b2_len]) if b2_len else 0.0
             aggregated_in[token] += avg_w1 + bias1
             aggregated_out[token] += avg_w2 + bias2
 
@@ -1386,13 +1456,13 @@ def bridge_records(
 
 
 def tokenizer_arrays(
-    cfg: ModelConfig, tensors: Mapping[str, List], max_len: int = 4
+    cfg: ModelConfig, tensors: Mapping[str, TensorLike], max_len: int = 4
 ) -> Tuple[Dict[str, List], Dict[str, object]]:
     vocab = cfg.vocab_size or 256
     vocab = max(1, vocab)
 
     tensor_digest = hashlib.sha256()
-    embedding: Optional[List[List[float]]] = None
+    embedding: Optional[TensorLike] = None
     for name in sorted(tensors.keys()):
         tensor = tensors[name]
         try:
@@ -1401,14 +1471,15 @@ def tokenizer_arrays(
             continue
         tensor_digest.update(name.encode("utf-8"))
         tensor_digest.update(tensor_bytes)
-        if (
-            embedding is None
-            and isinstance(tensor, list)
-            and tensor
-            and isinstance(tensor[0], list)
-            and len(tensor) >= vocab
-        ):
-            embedding = tensor
+        if embedding is None:
+            rows = _tensor_len(tensor)
+            if rows >= vocab:
+                try:
+                    first_row = tensor[0]  # type: ignore[index]
+                except Exception:
+                    first_row = None
+                if first_row is not None and _tensor_len(first_row) > 0:
+                    embedding = tensor
 
     global_seed = int.from_bytes(tensor_digest.digest()[:8], "little", signed=False)
 
