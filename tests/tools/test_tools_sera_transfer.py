@@ -276,6 +276,11 @@ def test_resolve_safe_open_prefers_real_wheel(tmp_path, monkeypatch):
     assert module.safe_open is not None
     assert module._looks_like_repo_stub_safe_open(module.safe_open)
 
+    # Ensure the cached resolver currently points at the repository stub.
+    initial = module._resolve_safe_open()
+    assert module._looks_like_repo_stub_safe_open(initial)
+    assert initial is module.safe_open
+
     real_root = tmp_path / "real_wheel"
     real_pkg = real_root / "safetensors"
     real_pkg.mkdir(parents=True)
