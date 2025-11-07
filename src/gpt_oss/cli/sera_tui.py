@@ -89,7 +89,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for environments with
             self.container = container
             self.focused_element = focused_element
 
-from .sera_chat import TurnRecord
+from .sera_chat import TranscriptLogger, TurnRecord
 
 if TYPE_CHECKING:  # pragma: no cover - import only for typing
     from .sera_chat import DiagnosticsDashboard
@@ -143,6 +143,7 @@ class SeraTUI:
         optional_tools: Sequence[str],
         load_messages: Sequence[str],
         metrics_mode: str,
+        transcript_logger: TranscriptLogger | None = None,
     ) -> None:
         self.model = model
         self.dashboard = dashboard
@@ -173,8 +174,13 @@ class SeraTUI:
         self._chat_transcript: List[str] = [f"[system] {msg}" for msg in self._load_messages]
         self._last_diagnostics: Optional[Mapping[str, object]] = None
         self._last_metrics: Optional[Mapping[str, object]] = None
-        self._last_export_path: Optional[Path] = None
+        self._last_diagnostics_export_path: Optional[Path] = None
+        self._last_transcript_export_path: Optional[Path] = None
+        self._transcript_logger = transcript_logger
         self._tool_key_map = self._build_tool_key_map(self._optional_tools)
+        if self._transcript_logger is not None:
+            for message in self._load_messages:
+                self._transcript_logger.record_event(message, role="system")
 
     def _build_tool_key_map(self, tools: Sequence[str]) -> Dict[str, str]:
         mapping: Dict[str, str] = {}
@@ -232,6 +238,10 @@ class SeraTUI:
         def _(event) -> None:
             self.export_diagnostics()
 
+        @kb.add("f11")
+        def _(event) -> None:
+            self.export_transcript()
+
         @kb.add("escape")
         def _(event) -> None:  # pragma: no cover - interactive exit
             event.app.exit()
@@ -272,6 +282,12 @@ class SeraTUI:
         elif self.metrics_mode == "json":
             json_payload = json.dumps(turn.metrics_payload, sort_keys=True)
             self._append_chat_line(f"[metrics] {json_payload}")
+        if self._transcript_logger is not None:
+            self._transcript_logger.record_turn(
+                prompt,
+                turn,
+                tools=self._enabled_tools,
+            )
         return turn
 
     # ----------------------------------------------------------------- Actions
@@ -325,6 +341,13 @@ class SeraTUI:
             self._enabled_tools.add(tool)
             status = "enabled"
         self._append_chat_line(f"[system] Tool '{tool}' {status}.")
+        if self._transcript_logger is not None:
+            self._transcript_logger.record_event(
+                f"Tool '{tool}' {status}.",
+                role="system",
+                tool=tool,
+                enabled=status == "enabled",
+            )
         self._refresh_operations()
 
     def view_manifest_metadata(self) -> None:
@@ -344,8 +367,30 @@ class SeraTUI:
             "timestamp": datetime.now(UTC).isoformat(),
         }
         export_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-        self._last_export_path = export_path
+        self._last_diagnostics_export_path = export_path
         self._append_chat_line(f"[system] Diagnostics exported to {export_path}")
+        if self._transcript_logger is not None:
+            self._transcript_logger.record_event(
+                "Diagnostics exported",
+                role="system",
+                path=str(export_path),
+            )
+        self._refresh_operations()
+        return export_path
+
+    def export_transcript(self) -> Optional[Path]:
+        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        export_path = self.manifest_summary.directory / f"sera_transcript_{timestamp}.log"
+        transcript_text = "\n".join(self._chat_transcript)
+        export_path.write_text(transcript_text + "\n", encoding="utf-8")
+        self._last_transcript_export_path = export_path
+        self._append_chat_line(f"[system] Transcript exported to {export_path}")
+        if self._transcript_logger is not None:
+            self._transcript_logger.record_event(
+                "Transcript exported",
+                role="system",
+                path=str(export_path),
+            )
         self._refresh_operations()
         return export_path
 
@@ -395,6 +440,7 @@ class SeraTUI:
             [
                 ("F9", "View manifest metadata", ""),
                 ("F10", "Export diagnostics", ""),
+                ("F11", "Export transcript", ""),
                 ("Ctrl+C", "Exit", ""),
             ]
         )
@@ -415,8 +461,22 @@ class SeraTUI:
         lines.extend(
             self._wrap_label_value("Manifest dir:", str(self.manifest_summary.directory))
         )
-        if self._last_export_path is not None:
-            lines.extend(self._wrap_label_value("Last export:", str(self._last_export_path)))
+        if self._transcript_logger is not None:
+            lines.extend(
+                self._wrap_label_value("Transcript log:", str(self._transcript_logger.path))
+            )
+        if self._last_diagnostics_export_path is not None:
+            lines.extend(
+                self._wrap_label_value(
+                    "Diag export:", str(self._last_diagnostics_export_path)
+                )
+            )
+        if self._last_transcript_export_path is not None:
+            lines.extend(
+                self._wrap_label_value(
+                    "Transcript export:", str(self._last_transcript_export_path)
+                )
+            )
         return lines
 
     def _wrap_label_value(self, label: str, value: str) -> List[str]:

@@ -112,6 +112,7 @@ __all__ = [
     "SnapshotInfo",
     "crc32c",
     "format_summary",
+    "render_summary",
     "run_interactive_cli",
     "sha256_low64",
     "SplitMix64",
@@ -401,6 +402,26 @@ def format_summary(summary: ConversionSummary) -> str:
         f"Total arrays: {summary.array_count} | Total payload bytes: {summary.total_bytes}"
     )
     return "\n".join(lines)
+
+
+def render_summary(summary: ConversionSummary, *, format: str = "table") -> str:
+    """Serialise ``summary`` into the requested format.
+
+    Parameters
+    ----------
+    summary:
+        The conversion summary produced by :func:`convert`.
+    format:
+        Either ``"table"`` for the human-readable report or ``"json"`` for a
+        machine-friendly representation. The check is case-insensitive.
+    """
+
+    normalized = format.lower()
+    if normalized == "table":
+        return format_summary(summary)
+    if normalized == "json":
+        return json.dumps(summary.to_dict(), indent=2, sort_keys=True)
+    raise ValueError(f"Unsupported summary format: {format}")
 
 
 # ---------------------------------------------------------------------------
@@ -1509,7 +1530,7 @@ def convert(
     top_l: int = 8,
     original_subdir: str | Path | None = None,
     verbose: bool = False,
-) -> None:
+) -> ConversionSummary:
     """Convert a checkpoint directory into a Sera Transfer Kit artefact.
 
     The conversion expects a ``config.json`` and ``model.safetensors`` file. When
@@ -1893,7 +1914,7 @@ def run_interactive_cli(
         verbose=verbose,
     )
     _display("")
-    _display(format_summary(summary))
+    _display(render_summary(summary, format="table"))
     return summary
 
 
@@ -1950,6 +1971,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_false",
         help="Do not print the conversion summary table",
     )
+    parser.add_argument(
+        "--summary-format",
+        choices=("table", "json"),
+        default="table",
+        help="Format to use when rendering the conversion summary",
+    )
+    parser.add_argument(
+        "--summary-output",
+        type=Path,
+        help="Optional path to write the conversion summary to",
+    )
     parser.set_defaults(print_summary=True)
 
     args = parser.parse_args(argv)
@@ -2001,8 +2033,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         original_subdir=args.original_subdir,
         verbose=args.verbose,
     )
+
+    try:
+        rendered = render_summary(summary, format=args.summary_format)
+    except ValueError as exc:  # pragma: no cover - defensive
+        raise SystemExit(str(exc)) from exc
+
+    if args.summary_output is not None:
+        summary_path = args.summary_output.expanduser()
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        text = rendered if rendered.endswith("\n") else rendered + "\n"
+        summary_path.write_text(text, encoding="utf-8")
+
     if args.print_summary:
-        print(format_summary(summary))
+        print(rendered)
 
 
 if __name__ == "__main__":

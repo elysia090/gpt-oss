@@ -201,3 +201,29 @@ def test_dashboard_logs_jsonl(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     payloads = [json.loads(line) for line in log_path.read_text().splitlines() if line]
     assert payloads and payloads[0]["generation"] == 1
     assert payloads[0]["turn_tokens"] == 1
+
+
+def test_transcript_logger_records_turn(tmp_path: Path) -> None:
+    logger = sera_chat.TranscriptLogger(tmp_path / "transcript.jsonl")
+    turn = sera_chat.TurnRecord(
+        prompt="hello",
+        user_text="hello",
+        user_tokens=1,
+        response_text="world",
+        response_fragments=["world"],
+        response_tokens=[1, 2, 3],
+        diagnostics={"latency_ms": 1.23},
+        metrics_payload={"latency_ms": 1.23, "trust_decision": 1},
+        generation=2,
+        turn_tokens=4,
+        y_out=0.5,
+    )
+
+    logger.record_event("Session start")
+    logger.record_turn("hello", turn, tools=["browser"])
+
+    lines = [json.loads(line) for line in logger.path.read_text().splitlines() if line]
+    assert any(entry["type"] == "event" for entry in lines)
+    turn_entries = [entry for entry in lines if entry["type"] == "turn"]
+    assert turn_entries and turn_entries[0]["prompt"] == "hello"
+    assert turn_entries[0]["tools"] == ["browser"]

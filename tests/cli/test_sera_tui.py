@@ -80,6 +80,7 @@ def test_tui_updates_and_commands(tmp_path: Path, faux_model: FauxSera) -> None:
         optional_tools=("browser", "python"),
         load_messages=["Loaded Sera manifest"],
         metrics_mode="plain",
+        transcript_logger=None,
     )
 
     app = tui._ensure_application()
@@ -106,3 +107,8 @@ def test_tui_updates_and_commands(tmp_path: Path, faux_model: FauxSera) -> None:
     payload = json.loads(export_path.read_text(encoding="utf-8"))
     assert payload["diagnostics"]["trust_decision"] == 1
     assert sorted(payload["tools"]) == ["browser", "python"]
+
+    transcript_path = tui.export_transcript()
+    assert transcript_path is not None
+    transcript_data = transcript_path.read_text(encoding="utf-8").splitlines()
+    assert any(line.startswith("You:") for line in transcript_data)
