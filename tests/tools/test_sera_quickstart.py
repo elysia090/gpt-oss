@@ -52,6 +52,8 @@ def _create_vector(length: int, rng: random.Random) -> list[float]:
 def _create_checkpoint(tmp_path: Path) -> Path:
     source = tmp_path / "checkpoint"
     source.mkdir()
+    original = source / "original"
+    original.mkdir()
 
     config = {
         "d_model": 4,
@@ -72,7 +74,11 @@ def _create_checkpoint(tmp_path: Path) -> Path:
             }
         ],
     }
-    (source / "config.json").write_text(json.dumps(config))
+    (original / "config.json").write_text(json.dumps(config))
+
+    tokenizer_stub = json.dumps({"tokenizer": "stub"})
+    for filename in quickstart.TOKENIZER_FILENAMES:
+        (original / filename).write_text(tokenizer_stub)
 
     rng = random.Random(0)
     tensors = {
@@ -83,7 +89,7 @@ def _create_checkpoint(tmp_path: Path) -> Path:
         "layers.0.ffn.w1.bias": _create_vector(8, rng),
         "layers.0.ffn.w2.bias": _create_vector(4, rng),
     }
-    save_file(tensors, source / "model.safetensors")
+    save_file(tensors, original / "model.safetensors")
     return source
 
 
@@ -93,17 +99,19 @@ def test_quickstart_pipeline(tmp_path: Path, monkeypatch, launch_chat: bool) -> 
     download_dir = tmp_path / "download"
     output_dir = tmp_path / "sera"
 
-    calls: list[tuple[str, str | None]] = []
+    calls: list[tuple[str, str | None, tuple[str, ...] | None]] = []
     chat_calls: list[tuple[Path, tuple[str, ...]]] = []
 
     def _fake_snapshot_download(
         repo_id: str,
         revision: str | None,
         *,
+        allow_patterns: Sequence[str] | None = None,
         local_dir: str | None = None,
         local_dir_use_symlinks: bool | None = None,
     ) -> str:
-        calls.append((repo_id, revision))
+        calls.append((repo_id, revision, tuple(allow_patterns) if allow_patterns is not None else None))
+        assert allow_patterns == quickstart.CHECKPOINT_ALLOW_PATTERNS
         assert local_dir is not None
         assert local_dir_use_symlinks is None
         destination = Path(local_dir)
@@ -149,9 +157,12 @@ def test_quickstart_pipeline(tmp_path: Path, monkeypatch, launch_chat: bool) -> 
 
     exit_code = quickstart.main(argv)
     assert exit_code == 0
-    assert calls == [("openai/gpt-oss-20b", None)]
+    assert calls == [("openai/gpt-oss-20b", None, quickstart.CHECKPOINT_ALLOW_PATTERNS)]
     assert (output_dir / "sera_manifest.bin").exists()
     assert any(output_dir.glob("sera_state.*"))
+    tokenizer_root = download_dir / "original"
+    for filename in quickstart.TOKENIZER_FILENAMES:
+        assert (tokenizer_root / filename).exists()
     if launch_chat:
         assert chat_calls == [(output_dir.resolve(), tuple())]
 
@@ -161,16 +172,23 @@ def test_quickstart_materialize_download(tmp_path: Path, monkeypatch) -> None:
     download_dir = tmp_path / "download"
     output_dir = tmp_path / "sera"
 
-    calls: list[tuple[str, str | None, bool | None]] = []
+    calls: list[tuple[str, str | None, bool | None, tuple[str, ...] | None]] = []
 
     def _fake_snapshot_download(
         repo_id: str,
         revision: str | None,
         *,
+        allow_patterns: Sequence[str] | None = None,
         local_dir: str | None = None,
         local_dir_use_symlinks: bool | None = None,
     ) -> str:
-        calls.append((repo_id, revision, local_dir_use_symlinks))
+        calls.append((
+            repo_id,
+            revision,
+            local_dir_use_symlinks,
+            tuple(allow_patterns) if allow_patterns is not None else None,
+        ))
+        assert allow_patterns == quickstart.CHECKPOINT_ALLOW_PATTERNS
         assert local_dir is not None
         destination = Path(local_dir)
         destination.mkdir(parents=True, exist_ok=True)
@@ -201,7 +219,9 @@ def test_quickstart_materialize_download(tmp_path: Path, monkeypatch) -> None:
     )
 
     assert exit_code == 0
-    assert calls == [("openai/gpt-oss-20b", None, False)]
+    assert calls == [
+        ("openai/gpt-oss-20b", None, False, quickstart.CHECKPOINT_ALLOW_PATTERNS)
+    ]
 
 
 def test_quickstart_missing_checkpoint(tmp_path: Path, capsys) -> None:
@@ -239,6 +259,7 @@ def test_quickstart_uses_cache_when_download_dir_unspecified(
         **kwargs: object,
     ) -> str:
         cache_calls.append((repo_id, revision, kwargs))
+        assert kwargs.get("allow_patterns") == quickstart.CHECKPOINT_ALLOW_PATTERNS
         assert "local_dir" not in kwargs
         assert "local_dir_use_symlinks" not in kwargs
         return str(checkpoint_dir)
@@ -255,6 +276,12 @@ def test_quickstart_uses_cache_when_download_dir_unspecified(
     ])
 
     assert exit_code == 0
-    assert cache_calls == [("openai/gpt-oss-20b", None, {})]
+    assert cache_calls == [
+        (
+            "openai/gpt-oss-20b",
+            None,
+            {"allow_patterns": quickstart.CHECKPOINT_ALLOW_PATTERNS},
+        )
+    ]
     assert not (tmp_path / "gpt-oss-20b").exists()
     assert (output_dir / "sera_manifest.bin").exists()

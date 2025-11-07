@@ -23,6 +23,24 @@ DEFAULT_R = 512
 DEFAULT_R_V = 12
 DEFAULT_TOP_L = 12
 
+# Restrict downloads to the original checkpoint payload alongside tokenizer
+# metadata required by :mod:`gpt_oss.tools.sera_transfer`. The Hugging Face
+# repository also contains larger converted variants that are unnecessary for
+# the quickstart workflow; scoping the patterns prevents unnecessary disk
+# usage while keeping the tokenizer assets intact for downstream consumers.
+TOKENIZER_FILENAMES: tuple[str, ...] = (
+    "added_tokens.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+)
+CHECKPOINT_ALLOW_PATTERNS: tuple[str, ...] = (
+    "original/*",
+    *TOKENIZER_FILENAMES,
+    "tokenizer/*",
+)
+
 
 class QuickstartError(RuntimeError):
     """Raised when the quickstart pipeline encounters a fatal error."""
@@ -43,7 +61,7 @@ def _download_checkpoint(
             " `pip install huggingface-hub`."
         ) from exc
 
-    kwargs = {}
+    kwargs = {"allow_patterns": CHECKPOINT_ALLOW_PATTERNS}
     if download_dir is not None:
         download_dir = download_dir.expanduser()
         download_dir.parent.mkdir(parents=True, exist_ok=True)
