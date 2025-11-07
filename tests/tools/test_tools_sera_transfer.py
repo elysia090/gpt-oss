@@ -176,7 +176,8 @@ def test_load_tensors_stub_passes_python_framework(tmp_path, monkeypatch):
 
     tensors = module.load_tensors(checkpoint)
 
-    assert tensors["foo"] == [[1.0, 2.0]]
+    tensor = tensors["foo"]
+    assert tensor == [[1.0, 2.0]]
     assert calls == [("positional", "python")]
 
 
@@ -191,6 +192,26 @@ def test_load_tensors_keyword_only_safe_open_backward_compat(tmp_path, monkeypat
 
         def tolist(self):
             return self._data
+
+        def __len__(self):
+            return len(self._data)
+
+        def __iter__(self):
+            return iter(self._data)
+
+        def __getitem__(self, index):
+            return self._data[index]
+
+        @property
+        def shape(self):
+            dims: list[int] = []
+            current = self._data
+            while isinstance(current, list):
+                dims.append(len(current))
+                if not current:
+                    break
+                current = current[0]
+            return tuple(dims)
 
     class _FakeSafeFile:
         def __init__(self, mapping):
@@ -224,7 +245,9 @@ def test_load_tensors_keyword_only_safe_open_backward_compat(tmp_path, monkeypat
 
     tensors = module.load_tensors(checkpoint)
 
-    assert tensors == payload
+    tensor = tensors["foo"]
+    assert isinstance(tensor, _FakeTensor)
+    assert tensor.tolist() == payload["foo"]
     assert calls == [("keyword", "pt")]
 
 
@@ -296,7 +319,10 @@ def safe_open(path, framework="pt", **kwargs):
     checkpoint.write_bytes(b"BIN" + payload)
 
     tensors = module.load_tensors(checkpoint)
-    assert tensors == expected
+    assert tensors.keys() == expected.keys()
+    for name, tensor in tensors.items():
+        assert hasattr(tensor, "tolist")
+        assert tensor.tolist() == expected[name]
 
     safe_open_fn = module._resolve_safe_open()
     assert not module._looks_like_repo_stub_safe_open(safe_open_fn)
@@ -440,6 +466,26 @@ class _FakeTensor:
 
     def tolist(self):
         return self._payload
+
+    def __len__(self):
+        return len(self._payload)
+
+    def __iter__(self):
+        return iter(self._payload)
+
+    def __getitem__(self, index):
+        return self._payload[index]
+
+    @property
+    def shape(self):
+        dims = []
+        current = self._payload
+        while isinstance(current, list):
+            dims.append(len(current))
+            if not current:
+                break
+            current = current[0]
+        return tuple(dims)
 
 
 class _FakeSafeFile:
@@ -733,6 +779,26 @@ def test_convert_supports_stub_and_wheel_safe_open(tmp_path: Path, monkeypatch) 
 
         def tolist(self):
             return self._payload
+
+        def __len__(self):
+            return len(self._payload)
+
+        def __iter__(self):
+            return iter(self._payload)
+
+        def __getitem__(self, index):
+            return self._payload[index]
+
+        @property
+        def shape(self):
+            dims: list[int] = []
+            current = self._payload
+            while isinstance(current, list):
+                dims.append(len(current))
+                if not current:
+                    break
+                current = current[0]
+            return tuple(dims)
 
     class _WheelSafeFile:
         def __init__(self, path, *, framework="numpy"):
