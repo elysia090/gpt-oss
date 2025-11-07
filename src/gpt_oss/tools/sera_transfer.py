@@ -1071,7 +1071,32 @@ def load_tensors(path: Path) -> Dict[str, List]:
     tensors: Dict[str, List] = {}
 
     try:
-        with safe_open_fn(path) as f:
+        safe_open_kwargs: Dict[str, object] = {}
+        framework_value: Optional[str]
+
+        try:
+            signature = inspect.signature(safe_open_fn)
+        except (TypeError, ValueError):  # pragma: no cover - builtins and mocks
+            framework_value = "python" if safe_open_is_stub else "pt"
+        else:
+            parameter = signature.parameters.get("framework")
+            if parameter is not None:
+                if parameter.default is inspect._empty:
+                    framework_value = "python" if safe_open_is_stub else "pt"
+                else:
+                    framework_value = parameter.default
+            elif any(
+                param.kind is inspect.Parameter.VAR_KEYWORD
+                for param in signature.parameters.values()
+            ):
+                framework_value = "python" if safe_open_is_stub else "pt"
+            else:
+                framework_value = None
+
+        if framework_value is not None:
+            safe_open_kwargs["framework"] = framework_value
+
+        with safe_open_fn(path, **safe_open_kwargs) as f:
             for key in f.keys():
                 tensor = f.get_tensor(key)
                 try:
