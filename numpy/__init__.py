@@ -1,29 +1,55 @@
-"""Compatibility shim that provides :mod:`numpy` or a lightweight stub."""
+"""Compatibility shim that prefers the real :mod:`numpy` package."""
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Iterable
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _filter_sys_path(path_entries: Iterable[str]) -> list[str]:
+    """Return *path_entries* without the repository root.
+
+    The compatibility shim lives inside the repository, so leaving the root on
+    :data:`sys.path` would cause :mod:`importlib` to rediscover this module
+    instead of the distribution provided by ``pip``.  Filtering makes it
+    possible to import the real package when it is installed.
+    """
+
+    filtered: list[str] = []
+    for entry in path_entries:
+        try:
+            resolved = Path(entry).resolve()
+        except OSError:
+            filtered.append(entry)
+            continue
+        if resolved == _REPO_ROOT:
+            continue
+        filtered.append(entry)
+    return filtered
 
 
 def _load_real_numpy() -> ModuleType:
-    current_file = __file__
-    for finder in sys.meta_path:
-        find_spec = getattr(finder, "find_spec", None)
-        if find_spec is None:
-            continue
-        spec = find_spec("numpy")
-        if spec is None or spec.origin in {None, current_file}:
-            continue
-        loader = spec.loader
-        if loader is None:
-            continue
-        module = importlib.util.module_from_spec(spec)
-        loader.exec_module(module)
-        return module
-    raise ModuleNotFoundError("numpy")
+    saved_module = sys.modules.pop(__name__, None)
+    original_sys_path = list(sys.path)
+    try:
+        sys.path = _filter_sys_path(original_sys_path)
+        module = importlib.import_module("numpy")
+    except ModuleNotFoundError:
+        if saved_module is not None:
+            sys.modules[__name__] = saved_module
+        raise
+    finally:
+        sys.path = original_sys_path
+
+    sys.modules[__name__] = module
+    return module
 
 
 try:  # pragma: no cover - exercised in environments with real numpy
@@ -43,4 +69,3 @@ except ModuleNotFoundError:  # pragma: no cover - deterministic fallback
 else:  # pragma: no cover - executed when numpy is available
     globals().update(_real_numpy.__dict__)
     __all__ = getattr(_real_numpy, "__all__", [name for name in _real_numpy.__dict__ if not name.startswith("_")])
-    sys.modules[__name__] = _real_numpy
