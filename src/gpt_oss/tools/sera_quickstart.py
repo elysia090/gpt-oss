@@ -24,10 +24,13 @@ DEFAULT_R_V = 12
 DEFAULT_TOP_L = 12
 
 # Restrict downloads to the original checkpoint payload alongside tokenizer
-# metadata required by :mod:`gpt_oss.tools.sera_transfer`. The Hugging Face
-# repository also contains larger converted variants that are unnecessary for
-# the quickstart workflow; scoping the patterns prevents unnecessary disk
-# usage while keeping the tokenizer assets intact for downstream consumers.
+# metadata required by :mod:`gpt_oss.tools.sera_transfer`. The conversion step
+# reads the ``config.json`` and ``model.safetensors`` files from the repository
+# root in addition to the ``original/`` subdirectory, so we must permit both
+# locations. The Hugging Face repository also contains larger converted variants
+# that are unnecessary for the quickstart workflow; scoping the patterns
+# prevents unnecessary disk usage while keeping the tokenizer assets intact for
+# downstream consumers.
 TOKENIZER_FILENAMES: tuple[str, ...] = (
     "added_tokens.json",
     "special_tokens_map.json",
@@ -36,6 +39,8 @@ TOKENIZER_FILENAMES: tuple[str, ...] = (
     "tokenizer_config.json",
 )
 CHECKPOINT_ALLOW_PATTERNS: tuple[str, ...] = (
+    "config.json",
+    "model.safetensors",
     "original/*",
     *TOKENIZER_FILENAMES,
     "tokenizer/*",
