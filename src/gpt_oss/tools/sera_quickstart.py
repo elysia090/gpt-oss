@@ -33,6 +33,8 @@ def _download_checkpoint(
     repo_id: str,
     revision: Optional[str],
     download_dir: Optional[Path],
+    *,
+    materialize: bool,
 ) -> Path:
     try:
         from huggingface_hub import snapshot_download
@@ -47,7 +49,10 @@ def _download_checkpoint(
         download_dir = download_dir.expanduser()
         download_dir.parent.mkdir(parents=True, exist_ok=True)
         print(f"Downloading {repo_id} to {download_dir}...")
-        kwargs.update(local_dir=str(download_dir), local_dir_use_symlinks=False)
+        kwargs.update(
+            local_dir=str(download_dir),
+            local_dir_use_symlinks=not materialize,
+        )
     else:
         print(f"Downloading {repo_id} using the Hugging Face cache...")
 
@@ -106,9 +111,20 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Directory to materialise the downloaded checkpoint into. By default"
-            " the Hugging Face cache is reused; supply a path (for example"
-            f" {DEFAULT_DOWNLOAD_DIR}) to create a copy on disk."
+            "Directory to expose the downloaded checkpoint in. By default the"
+            " helper reuses the Hugging Face cache and populates the directory"
+            " with symlinks; combine with --materialize-download to request a"
+            " full copy on disk."
+        ),
+    )
+    parser.add_argument(
+        "--materialize-download",
+        action="store_true",
+        help=(
+            "Force the helper to create a real copy of the checkpoint when"
+            " --download-dir is provided. Without this flag the download"
+            " directory contains symlinks back into the Hugging Face cache"
+            " whenever supported."
         ),
     )
     parser.add_argument(
@@ -182,7 +198,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         if args.checkpoint_dir is not None:
             checkpoint_dir = Path(args.checkpoint_dir).expanduser().resolve()
         else:
-            checkpoint_dir = _download_checkpoint(args.repo_id, args.revision, download_dir)
+            checkpoint_dir = _download_checkpoint(
+                args.repo_id,
+                args.revision,
+                download_dir,
+                materialize=args.materialize_download,
+            )
 
         artifacts_dir = _convert_checkpoint(
             checkpoint_dir,

@@ -269,7 +269,10 @@ GPTOSS_BUILD_METAL=1 pip install -e ".[metal]"
 The [Sera runtime](docs/sera.md) includes a full-featured terminal interface
 exposed through the `gpt-oss-sera-quickstart` console script. The helper takes
 care of downloading the published checkpoint, preparing the lightweight Sera
-artefacts, and starting an interactive session for you.
+artefacts, and starting an interactive session for you. By default the
+Quickstart reuses the Hugging Face cache so no extra copy of the checkpoint is
+created; pass `--materialize-download` if you need the files duplicated into a
+separate directory.
 
 Follow the manual setup below to install the helper and launch the chat from a
 local environment.
