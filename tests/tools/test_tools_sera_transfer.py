@@ -135,6 +135,39 @@ def test_load_tensors_requires_safetensors(monkeypatch):
     importlib.reload(sera_transfer)
 
 
+def test_load_tensors_stub_passes_python_framework(tmp_path, monkeypatch):
+    module = importlib.reload(sera_transfer)
+
+    assert module.safe_open is not None
+    assert module._looks_like_repo_stub_safe_open(module.safe_open)
+
+    stub_module = sys.modules["safetensors"]
+    original_safe_open = stub_module.safe_open
+    calls: list[str] = []
+
+    def recording_safe_open(path, framework="python", **kwargs):
+        calls.append(framework)
+        return original_safe_open(path, framework=framework, **kwargs)
+
+    recording_safe_open.__module__ = original_safe_open.__module__
+
+    monkeypatch.setattr(stub_module, "safe_open", recording_safe_open)
+    monkeypatch.setattr(module, "safe_open", recording_safe_open)
+
+    payload = {
+        "tensors": {
+            "foo": {"shape": [1, 2], "data": [1.0, 2.0]},
+        }
+    }
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_text(json.dumps(payload))
+
+    tensors = module.load_tensors(checkpoint)
+
+    assert tensors["foo"] == [[1.0, 2.0]]
+    assert calls == ["python"]
+
+
 def test_load_tensors_prefers_real_safetensors_when_available(tmp_path, monkeypatch):
     module = importlib.reload(sera_transfer)
 
@@ -156,10 +189,13 @@ from pathlib import Path
 
 class _FakeSafeFile:
     def __init__(self, path, framework="python"):
+        if framework != "numpy":
+            raise RuntimeError(f"Unexpected framework: {framework!r}")
         raw = Path(path).read_bytes()
         if not raw.startswith(b"BIN"):
             raise ValueError("Unexpected payload")
-        self._tensors = pickle.loads(raw[3:])
+        loaded = pickle.loads(raw[3:])
+        self._tensors = {key: _FakeTensor(value) for key, value in loaded.items()}
 
     def __enter__(self):
         return self
@@ -172,6 +208,14 @@ class _FakeSafeFile:
 
     def get_tensor(self, key):
         return self._tensors[key]
+
+
+class _FakeTensor:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def tolist(self):
+        return self._payload
 
 
 def safe_open(path, framework="python"):

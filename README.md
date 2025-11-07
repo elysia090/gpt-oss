@@ -295,7 +295,8 @@ Confirm the following before you begin:
 - The official [`safetensors`](https://pypi.org/project/safetensors/) wheel.
   The repository includes a JSON-only stub for tests, but converting binary
   checkpoints requires installing the published package (for example,
-  `pip install safetensors`).
+  `pip install safetensors`). With the wheel present the converter loads
+  `model.safetensors` archives directly.
 - [`prompt_toolkit`](https://python-prompt-toolkit.readthedocs.io/) for the
   richer terminal UI. Without it the helper gracefully falls back to a plain
   prompt.
@@ -617,8 +618,10 @@ The repository ships with a Sera Transfer tool that deterministically converts a
 checkpoint into the [Sera runtime](docs/specs/Sera-Transfer.txt) artefacts and a
 companion chat CLI for quick experiments.
 
-Before running the converter make sure the optional dependencies are installed,
-for example via `pip install "gpt-oss[torch]"` or `pip install safetensors`.
+Before running the converter make sure the official `safetensors` wheel is
+installed. The repository ships a JSON-only stub for unit tests; installing the
+upstream package (for example via `pip install safetensors`) enables loading
+binary checkpoints during conversion.
 
 1. Convert the original model (example for `gpt-oss-20b`):
 

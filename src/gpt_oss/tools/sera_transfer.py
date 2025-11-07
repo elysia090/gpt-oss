@@ -1061,8 +1061,10 @@ def load_tensors(path: Path) -> Dict[str, List]:
             raise ModuleNotFoundError(stub_hint)
 
     tensors: Dict[str, List] = {}
+    open_kwargs = {"framework": "python" if safe_open_is_stub else "numpy"}
+
     try:
-        with safe_open_fn(path, framework="python") as f:
+        with safe_open_fn(path, **open_kwargs) as f:
             for key in f.keys():
                 tensor = f.get_tensor(key)
                 try:
