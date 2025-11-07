@@ -950,91 +950,93 @@ _SAFETENSORS_MISSING_MSG = (
 def _resolve_safe_open():
     global safe_open
 
-    def _import_safe_open(
-        allow_missing: bool,
-        *,
-        prefer_real: bool = False,
-    ) -> Optional[Callable]:
-        try:
-            repo_root = Path(__file__).resolve().parents[3]
-            stub_dir_candidate = (repo_root / "safetensors").resolve()
-            if (stub_dir_candidate / "__init__.py").exists():
-                stub_dir: Optional[Path] = stub_dir_candidate
-            else:  # pragma: no cover - defensive
-                stub_dir = None
-        except Exception:  # pragma: no cover - defensive
+    try:
+        repo_root = Path(__file__).resolve().parents[3]
+        stub_dir_candidate = (repo_root / "safetensors").resolve()
+        if (stub_dir_candidate / "__init__.py").exists():
+            stub_dir: Optional[Path] = stub_dir_candidate
+        else:  # pragma: no cover - defensive
             stub_dir = None
+    except Exception:  # pragma: no cover - defensive
+        stub_dir = None
 
-        removed_modules: List[Tuple[str, object]] = []
-        removed_paths: List[Tuple[int, str]] = []
+    removed_modules: List[Tuple[str, object]] = []
+    removed_paths: List[Tuple[int, str]] = []
 
-        def _restore_modules() -> None:
-            for name, module in removed_modules:
-                sys.modules[name] = module
+    def _maybe_remove_repo_stub() -> None:
+        if stub_dir is None:
+            return
 
-        if prefer_real and stub_dir is not None:
-            for name in list(sys.modules):
-                if name != "safetensors" and not name.startswith("safetensors."):
-                    continue
-                module = sys.modules.get(name)
-                if module is None:
-                    continue
-                module_file = getattr(module, "__file__", None)
-                if not module_file:
-                    continue
-                try:
-                    module_path = Path(module_file).resolve()
-                except Exception:  # pragma: no cover - defensive
-                    continue
-                try:
-                    module_path.relative_to(stub_dir)
-                except ValueError:
-                    continue
-                removed_modules.append((name, module))
-                del sys.modules[name]
+        for name in list(sys.modules):
+            if name != "safetensors" and not name.startswith("safetensors."):
+                continue
+            module = sys.modules.get(name)
+            if module is None:
+                continue
+            module_file = getattr(module, "__file__", None)
+            if not module_file:
+                continue
+            try:
+                module_path = Path(module_file).resolve()
+            except Exception:  # pragma: no cover - defensive
+                continue
+            try:
+                module_path.relative_to(stub_dir)
+            except ValueError:
+                continue
+            removed_modules.append((name, module))
+            del sys.modules[name]
 
-            for index in range(len(sys.path) - 1, -1, -1):
-                entry = sys.path[index]
-                try:
-                    entry_path = Path(entry).resolve()
-                except Exception:  # pragma: no cover - defensive
-                    continue
-                if entry_path == stub_dir or entry_path == stub_dir.parent:
-                    removed_paths.append((index, entry))
-                    sys.path.pop(index)
+        for index in range(len(sys.path) - 1, -1, -1):
+            entry = sys.path[index]
+            try:
+                entry_path = Path(entry).resolve()
+            except Exception:  # pragma: no cover - defensive
+                continue
+            if entry_path == stub_dir or entry_path == stub_dir.parent:
+                removed_paths.append((index, entry))
+                sys.path.pop(index)
 
+    def _restore_paths() -> None:
+        for index, entry in sorted(removed_paths):
+            if entry not in sys.path:
+                sys.path.insert(index, entry)
+
+    def _restore_modules() -> None:
+        for name, module in removed_modules:
+            sys.modules[name] = module
+
+    def _import_safe_open(allow_missing: bool) -> Optional[Callable]:
         try:
             import importlib
 
             importlib.invalidate_caches()
             from safetensors import safe_open as imported_safe_open
         except ModuleNotFoundError:
-            if prefer_real:
-                _restore_modules()
             if allow_missing:
                 return None
             raise
-        finally:
-            if prefer_real:
-                for index, entry in sorted(removed_paths):
-                    if entry not in sys.path:
-                        sys.path.insert(index, entry)
-
-        if prefer_real and stub_dir is not None and _looks_like_repo_stub_safe_open(imported_safe_open):
-            _restore_modules()
-            if allow_missing:
-                return None
-            raise ModuleNotFoundError(_SAFETENSORS_MISSING_MSG)
-
         return imported_safe_open
 
     if safe_open is not None and not _looks_like_repo_stub_safe_open(safe_open):
         return safe_open
 
     if safe_open is not None and _looks_like_repo_stub_safe_open(safe_open):
-        imported_safe_open = _import_safe_open(allow_missing=True, prefer_real=True)
-        if imported_safe_open is not None:
-            safe_open = imported_safe_open
+        _maybe_remove_repo_stub()
+        try:
+            imported_safe_open = _import_safe_open(allow_missing=True)
+        except ModuleNotFoundError as exc:  # pragma: no cover - defensive
+            _restore_modules()
+            _restore_paths()
+            raise ModuleNotFoundError(_SAFETENSORS_MISSING_MSG) from exc
+        finally:
+            _restore_paths()
+
+        if imported_safe_open is None or _looks_like_repo_stub_safe_open(imported_safe_open):
+            _restore_modules()
+            return safe_open
+
+        safe_open = imported_safe_open
         return safe_open
 
     try:  # pragma: no cover - exercised when lazy import succeeds
