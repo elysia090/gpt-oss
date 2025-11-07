@@ -105,14 +105,13 @@ def _config_to_dict(config):
 logger = logging.getLogger(__name__)
 
 
-def _safe_exists(path: Path, *, verbose: bool = False) -> bool:
+def _safe_exists(path: Path) -> bool:
     """Return ``True`` if *path* exists, suppressing ``OSError`` failures."""
 
     try:
         return path.exists()
-    except OSError as exc:  # pragma: no cover - defensive logging branch
-        if verbose:
-            logger.warning("Failed to stat %s: %s", path, exc)
+    except OSError:  # pragma: no cover - defensive
+        # HF symlink/xet が変なタイプでも「足りない」とみなして再取得させる
         return False
 
 
@@ -1578,9 +1577,10 @@ def convert(
     if original_subdir is not None:
         add_root(original_subdir)
     else:
+        expected_files = ("config.json", "model.safetensors")
         need_probe = any(
-            not _safe_exists(source / filename, verbose=verbose)
-            for filename in ("config.json", "model.safetensors")
+            not _safe_exists(source / filename)
+            for filename in expected_files
         )
         if need_probe:
             add_root("original")
@@ -1591,7 +1591,7 @@ def convert(
             candidate = root / filename
             if verbose:
                 logger.info("Probing %s", candidate)
-            if _safe_exists(candidate, verbose=verbose):
+            if _safe_exists(candidate):
                 if verbose:
                     logger.info("Located %s at %s", filename, candidate)
                 return candidate
