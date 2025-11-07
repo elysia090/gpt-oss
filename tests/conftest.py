@@ -6,9 +6,13 @@ from typing import Generator, Any
 from unittest.mock import Mock, MagicMock
 from fastapi.testclient import TestClient
 
-SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT_DIR / "src"
 
-sys.path.insert(0, str(SRC_DIR))
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from openai_harmony import (
     HarmonyEncodingName,
