@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import importlib
+import inspect
 import hashlib
 import json
 import os
@@ -131,8 +132,76 @@ def test_load_tensors_requires_safetensors(monkeypatch):
     assert "pip install safetensors" in message
 
     monkeypatch.undo()
-    sys.modules[module_name] = module
-    importlib.reload(module)
+    importlib.reload(sera_transfer)
+
+
+def test_load_tensors_prefers_real_safetensors_when_available(tmp_path, monkeypatch):
+    module = importlib.reload(sera_transfer)
+
+    assert module.safe_open is not None
+    assert module._looks_like_repo_stub_safe_open(module.safe_open)
+
+    for name in list(sys.modules):
+        if name == "safetensors" or name.startswith("safetensors."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+
+    real_impl_root = tmp_path / "real_impl"
+    real_pkg = real_impl_root / "safetensors"
+    real_pkg.mkdir(parents=True)
+    (real_pkg / "__init__.py").write_text(
+        """
+import pickle
+from pathlib import Path
+
+
+class _FakeSafeFile:
+    def __init__(self, path, framework="python"):
+        raw = Path(path).read_bytes()
+        if not raw.startswith(b"BIN"):
+            raise ValueError("Unexpected payload")
+        self._tensors = pickle.loads(raw[3:])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def keys(self):
+        return list(self._tensors.keys())
+
+    def get_tensor(self, key):
+        return self._tensors[key]
+
+
+def safe_open(path, framework="python"):
+    return _FakeSafeFile(path, framework)
+"""
+    )
+
+    monkeypatch.syspath_prepend(str(real_impl_root))
+    importlib.invalidate_caches()
+
+    expected = {"foo": [[1.0, 2.0], [3.0, 4.0]]}
+    payload = pickle.dumps(expected)
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"BIN" + payload)
+
+    tensors = module.load_tensors(checkpoint)
+    assert tensors == expected
+
+    safe_open_fn = module._resolve_safe_open()
+    assert not module._looks_like_repo_stub_safe_open(safe_open_fn)
+    owning_module = inspect.getmodule(safe_open_fn)
+    assert owning_module is not None
+    assert Path(owning_module.__file__).resolve().parent == real_pkg.resolve()
+
+    for name in list(sys.modules):
+        if name == "safetensors" or name.startswith("safetensors."):
+            sys.modules.pop(name, None)
+
+    monkeypatch.undo()
+    importlib.reload(sera_transfer)
 
 
 def test_model_config_accepts_hf_config_fields() -> None:
