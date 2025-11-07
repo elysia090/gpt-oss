@@ -964,26 +964,41 @@ class ModelConfig:
         expected_proj = n_heads * head_dim
         layer_map: Dict[str, Dict[str, str]] = {}
 
+        role_suffix_tokens = {
+            role: [tuple(suffix.lower().split(".")) for suffix in suffixes]
+            for role, suffixes in role_suffixes.items()
+        }
+
         for name, tensor in tensors.items():
             if not isinstance(name, str):
                 continue
-            lowered = name.lower()
+
             shape = _tensor_shape(tensor)
-            for role, suffixes in role_suffixes.items():
+            name_tokens = name.split(".")
+            lower_tokens = [token.lower() for token in name_tokens]
+
+            for role, suffix_token_sets in role_suffix_tokens.items():
                 matched = False
-                for suffix in suffixes:
-                    if lowered.endswith(suffix):
-                        if not ModelConfig._shape_allows_role(
-                            role, shape, expected_proj
-                        ):
-                            continue
-                        prefix = name[: len(name) - len(suffix)].rstrip(".")
-                        if not prefix:
-                            break
-                        layer_roles = layer_map.setdefault(prefix, {})
-                        layer_roles.setdefault(role, name)
-                        matched = True
-                        break
+                for suffix_tokens in suffix_token_sets:
+                    if len(lower_tokens) < len(suffix_tokens):
+                        continue
+
+                    tail_tokens = lower_tokens[-len(suffix_tokens) :]
+                    if not ModelConfig._tokens_allow_role(
+                        role, tail_tokens, suffix_tokens, shape, expected_proj
+                    ):
+                        continue
+
+                    prefix_tokens = name_tokens[: -len(suffix_tokens)]
+                    prefix = ".".join(prefix_tokens).rstrip(".")
+                    if not prefix:
+                        continue
+
+                    layer_roles = layer_map.setdefault(prefix, {})
+                    layer_roles.setdefault(role, name)
+                    matched = True
+                    break
+
                 if matched:
                     break
 
@@ -1027,6 +1042,39 @@ class ModelConfig:
                 )
             )
         return layers
+
+    @staticmethod
+    def _tokens_allow_role(
+        role: str,
+        tail_tokens: Sequence[str],
+        suffix_tokens: Sequence[str],
+        shape: Tuple[int, ...],
+        expected_proj: int,
+    ) -> bool:
+        if not ModelConfig._tokens_match(tail_tokens, suffix_tokens):
+            return False
+
+        if not ModelConfig._shape_allows_role(role, shape, expected_proj):
+            return False
+
+        return True
+
+    @staticmethod
+    def _tokens_match(
+        actual_tokens: Sequence[str],
+        expected_tokens: Sequence[str],
+    ) -> bool:
+        if len(actual_tokens) != len(expected_tokens):
+            return False
+
+        return all(
+            ModelConfig._normalize_token(actual) == ModelConfig._normalize_token(expected)
+            for actual, expected in zip(actual_tokens, expected_tokens)
+        )
+
+    @staticmethod
+    def _normalize_token(token: str) -> str:
+        return token.lower().replace("_", "").replace("-", "")
 
     @staticmethod
     def _shape_allows_role(
