@@ -26,9 +26,21 @@ try:  # pragma: no cover - exercised indirectly in environments with safetensors
 except ModuleNotFoundError:  # pragma: no cover - exercised in environments without safetensors
     _real_safe_open = None
 
+from functools import wraps
+
 from gpt_oss._stubs.safetensors import is_stub_safe_open, safe_open as _stub_safe_open
 
-safe_open = _real_safe_open if _real_safe_open is not None else _stub_safe_open  # type: ignore[assignment]
+
+@wraps(_stub_safe_open)
+def _default_stub_safe_open(*args, **kwargs):
+    return _stub_safe_open(*args, **kwargs)
+
+
+_default_stub_safe_open.__gpt_oss_stub__ = getattr(_stub_safe_open, "__gpt_oss_stub__", True)
+_default_stub_safe_open.__module__ = getattr(_stub_safe_open, "__module__", _default_stub_safe_open.__module__)
+_default_stub_safe_open.__gpt_oss_default_stub__ = True  # type: ignore[attr-defined]
+
+safe_open = _default_stub_safe_open  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency
     import numpy as _np
@@ -993,6 +1005,16 @@ def _resolve_safe_open():
         return safe_open
 
     if safe_open is not None and _looks_like_repo_stub_safe_open(safe_open):
+        if _real_safe_open is not None and safe_open is not _real_safe_open:
+            if not getattr(safe_open, "__gpt_oss_default_stub__", False):
+                # The environment already provided the real ``safetensors``
+                # implementation when the module was imported. Reaching this
+                # branch therefore means callers intentionally replaced
+                # ``safe_open`` with the repository stub (for example, in
+                # tests). Respect the override instead of importing the wheel
+                # again.
+                return safe_open
+
         try:
             from safetensors import safe_open as imported_safe_open
         except ModuleNotFoundError:
