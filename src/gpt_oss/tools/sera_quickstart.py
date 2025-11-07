@@ -2,7 +2,9 @@
 
 This module downloads the published GPT-OSS checkpoint from the Hugging Face
 Hub, converts it into Sera Transfer artefacts, and optionally launches the
-:mod:`gpt_oss.cli.sera_chat` interface.
+:mod:`gpt_oss.cli.sera_chat` interface. By default the helper reuses the
+Hugging Face cache instead of materialising a fresh checkpoint copy on disk; a
+local directory can be requested via ``--download-dir`` when needed.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ class QuickstartError(RuntimeError):
 def _download_checkpoint(
     repo_id: str,
     revision: Optional[str],
-    download_dir: Path,
+    download_dir: Optional[Path],
 ) -> Path:
     try:
         from huggingface_hub import snapshot_download
@@ -40,15 +42,19 @@ def _download_checkpoint(
             " `pip install huggingface-hub`."
         ) from exc
 
-    download_dir = download_dir.expanduser()
-    download_dir.parent.mkdir(parents=True, exist_ok=True)
+    kwargs = {}
+    if download_dir is not None:
+        download_dir = download_dir.expanduser()
+        download_dir.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Downloading {repo_id} to {download_dir}...")
+        kwargs.update(local_dir=str(download_dir), local_dir_use_symlinks=False)
+    else:
+        print(f"Downloading {repo_id} using the Hugging Face cache...")
 
-    print(f"Downloading {repo_id} to {download_dir}...")
     snapshot_path = snapshot_download(
         repo_id=repo_id,
         revision=revision,
-        local_dir=str(download_dir),
-        local_dir_use_symlinks=False,
+        **kwargs,
     )
     return Path(snapshot_path)
 
@@ -98,8 +104,12 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser.add_argument(
         "--download-dir",
         type=Path,
-        default=DEFAULT_DOWNLOAD_DIR,
-        help="Directory to store the downloaded checkpoint",
+        default=None,
+        help=(
+            "Directory to materialise the downloaded checkpoint into. By default"
+            " the Hugging Face cache is reused; supply a path (for example"
+            f" {DEFAULT_DOWNLOAD_DIR}) to create a copy on disk."
+        ),
     )
     parser.add_argument(
         "--checkpoint-dir",
@@ -139,17 +149,24 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser.add_argument(
         "--force-clean",
         action="store_true",
-        help="Delete any existing download/output directories before running",
+        help=(
+            "Delete any existing download/output directories before running."
+            " The download directory is only removed when --download-dir is set."
+        ),
     )
     return parser.parse_args([] if argv is None else list(argv))
 
 
-def _prepare_directories(args: argparse.Namespace) -> tuple[Path, Path]:
-    download_dir = args.download_dir if args.download_dir is not None else DEFAULT_DOWNLOAD_DIR
+def _prepare_directories(args: argparse.Namespace) -> tuple[Optional[Path], Path]:
+    download_dir = args.download_dir
     output_dir = args.output_dir if args.output_dir is not None else DEFAULT_OUTPUT_DIR
 
     if args.force_clean:
-        if args.checkpoint_dir is None and download_dir.exists():
+        if (
+            args.checkpoint_dir is None
+            and download_dir is not None
+            and download_dir.exists()
+        ):
             shutil.rmtree(download_dir)
         if output_dir.exists():
             shutil.rmtree(output_dir)

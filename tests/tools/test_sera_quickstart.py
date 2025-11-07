@@ -99,10 +99,12 @@ def test_quickstart_pipeline(tmp_path: Path, monkeypatch, launch_chat: bool) -> 
     def _fake_snapshot_download(
         repo_id: str,
         revision: str | None,
-        local_dir: str,
-        local_dir_use_symlinks: bool,
+        *,
+        local_dir: str | None = None,
+        local_dir_use_symlinks: bool | None = None,
     ) -> str:
         calls.append((repo_id, revision))
+        assert local_dir is not None
         destination = Path(local_dir)
         destination.mkdir(parents=True, exist_ok=True)
         for item in checkpoint_dir.iterdir():
@@ -173,3 +175,37 @@ def test_stub_safe_open_binary_blob(tmp_path: Path) -> None:
 
     with pytest.raises(ModuleNotFoundError, match="pip install safetensors"):
         quickstart.sera_transfer.load_tensors(binary_path)
+
+
+def test_quickstart_uses_cache_when_download_dir_unspecified(
+    tmp_path: Path, monkeypatch
+) -> None:
+    checkpoint_dir = _create_checkpoint(tmp_path)
+    output_dir = tmp_path / "sera"
+    cache_calls: list[tuple[str, str | None, dict[str, object]]] = []
+
+    def _fake_snapshot_download(
+        repo_id: str,
+        revision: str | None,
+        **kwargs: object,
+    ) -> str:
+        cache_calls.append((repo_id, revision, kwargs))
+        assert "local_dir" not in kwargs
+        assert "local_dir_use_symlinks" not in kwargs
+        return str(checkpoint_dir)
+
+    hub_stub = types.ModuleType("huggingface_hub")
+    hub_stub.snapshot_download = _fake_snapshot_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub_stub)
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = quickstart.main([
+        "--output-dir",
+        str(output_dir),
+        "--force-clean",
+    ])
+
+    assert exit_code == 0
+    assert cache_calls == [("openai/gpt-oss-20b", None, {})]
+    assert not (tmp_path / quickstart.DEFAULT_DOWNLOAD_DIR).exists()
+    assert (output_dir / "sera_manifest.bin").exists()
