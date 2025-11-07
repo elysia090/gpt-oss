@@ -289,6 +289,10 @@ Confirm the following before you begin:
   page](https://huggingface.co/settings/tokens).
 - A development environment capable of building wheels (virtual environment,
   compiler toolchain, `git`, etc.).
+- The official [`safetensors`](https://pypi.org/project/safetensors/) wheel.
+  The repository includes a JSON-only stub for tests, but converting binary
+  checkpoints requires installing the published package (for example,
+  `pip install safetensors`).
 - [`prompt_toolkit`](https://python-prompt-toolkit.readthedocs.io/) for the
   richer terminal UI. Without it the helper gracefully falls back to a plain
   prompt.

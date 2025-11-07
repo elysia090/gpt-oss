@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import importlib.util
 import io
 import json
@@ -24,6 +25,42 @@ try:  # pragma: no cover - exercised indirectly in environments with safetensors
     from safetensors import safe_open
 except ModuleNotFoundError:  # pragma: no cover - exercised in environments without safetensors
     safe_open = None  # type: ignore[assignment]
+
+
+def _looks_like_repo_stub_safe_open(func) -> bool:
+    if func is None:
+        return False
+
+    module = inspect.getmodule(func)
+    if module is None:
+        return False
+
+    module_file = getattr(module, "__file__", None)
+    if not module_file:
+        return False
+
+    try:
+        module_path = Path(module_file).resolve()
+    except OSError:  # pragma: no cover - defensive
+        return False
+
+    try:
+        repo_root = Path(__file__).resolve().parents[3]
+    except IndexError:  # pragma: no cover - defensive
+        return False
+
+    stub_path = (repo_root / "safetensors" / "__init__.py").resolve()
+    if module_path == stub_path:
+        return True
+
+    if module_path.name == "__init__.py" and module_path.parent.name == "safetensors":
+        try:
+            module_path.relative_to(repo_root)
+        except ValueError:
+            return False
+        return True
+
+    return False
 
 def _load_sera_runtime():
     sera_path = Path(__file__).resolve().parents[1] / "inference" / "sera.py"
@@ -730,14 +767,37 @@ def load_tensors(path: Path) -> Dict[str, List]:
             "The `safetensors` package is required to load model checkpoints. "
             "Install it via `pip install safetensors` or provide a preloaded tensor map."
         )
+
+    safe_open_is_stub = _looks_like_repo_stub_safe_open(safe_open)
+    stub_hint = (
+        "The repository includes a JSON-only stub of `safetensors`. "
+        "Install the official `safetensors` wheel (for example, via `pip install safetensors`) "
+        "to load binary checkpoints."
+    )
+
+    if safe_open_is_stub:
+        try:
+            with path.open("rb") as fh:
+                sample = fh.read(1024)
+        except OSError:
+            sample = b""
+
+        if sample and not sample.lstrip().startswith(b"{"):
+            raise ModuleNotFoundError(stub_hint)
+
     tensors: Dict[str, List] = {}
-    with safe_open(path, framework="python") as f:
-        for key in f.keys():
-            tensor = f.get_tensor(key)
-            try:
-                tensors[key] = tensor.tolist()
-            except AttributeError:
-                tensors[key] = tensor  # pragma: no cover - defensive fallback
+    try:
+        with safe_open(path, framework="python") as f:
+            for key in f.keys():
+                tensor = f.get_tensor(key)
+                try:
+                    tensors[key] = tensor.tolist()
+                except AttributeError:
+                    tensors[key] = tensor  # pragma: no cover - defensive fallback
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if safe_open_is_stub:
+            raise ModuleNotFoundError(stub_hint) from exc
+        raise
     return tensors
 
 

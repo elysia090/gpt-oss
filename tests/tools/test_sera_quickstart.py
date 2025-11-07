@@ -165,3 +165,11 @@ def test_quickstart_missing_checkpoint(tmp_path: Path, capsys) -> None:
     assert exit_code == 1
     stderr = capsys.readouterr().err
     assert "sera_quickstart:" in stderr
+
+
+def test_stub_safe_open_binary_blob(tmp_path: Path) -> None:
+    binary_path = tmp_path / "model.safetensors"
+    binary_path.write_bytes(b"\x00\x01binary")
+
+    with pytest.raises(ModuleNotFoundError, match="pip install safetensors"):
+        quickstart.sera_transfer.load_tensors(binary_path)
