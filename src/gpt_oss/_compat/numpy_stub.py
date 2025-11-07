@@ -9,7 +9,14 @@ from typing import Callable, Iterable, Iterator, List, Sequence, Tuple, Union
 
 Number = Union[int, float]
 Scalar = Union[Number, bool]
+bool_ = bool
 Shape = Tuple[int, ...]
+
+
+def isscalar(value: object) -> bool:
+    """Return ``True`` when *value* can be treated as a scalar."""
+
+    return isinstance(value, (int, float, bool))
 
 
 def _coerce_scalar(value: Scalar) -> Scalar:
@@ -486,6 +493,8 @@ random = _RandomModule()
 __all__ = [
     "array",
     "asarray",
+    "bool_",
+    "isscalar",
     "zeros",
     "zeros_like",
     "ones",
