@@ -105,6 +105,7 @@ def test_quickstart_pipeline(tmp_path: Path, monkeypatch, launch_chat: bool) -> 
     ) -> str:
         calls.append((repo_id, revision))
         assert local_dir is not None
+        assert local_dir_use_symlinks is True
         destination = Path(local_dir)
         destination.mkdir(parents=True, exist_ok=True)
         for item in checkpoint_dir.iterdir():
@@ -153,6 +154,54 @@ def test_quickstart_pipeline(tmp_path: Path, monkeypatch, launch_chat: bool) -> 
     assert any(output_dir.glob("sera_state.*"))
     if launch_chat:
         assert chat_calls == [(output_dir.resolve(), tuple())]
+
+
+def test_quickstart_materialize_download(tmp_path: Path, monkeypatch) -> None:
+    checkpoint_dir = _create_checkpoint(tmp_path)
+    download_dir = tmp_path / "download"
+    output_dir = tmp_path / "sera"
+
+    calls: list[tuple[str, str | None, bool | None]] = []
+
+    def _fake_snapshot_download(
+        repo_id: str,
+        revision: str | None,
+        *,
+        local_dir: str | None = None,
+        local_dir_use_symlinks: bool | None = None,
+    ) -> str:
+        calls.append((repo_id, revision, local_dir_use_symlinks))
+        assert local_dir is not None
+        destination = Path(local_dir)
+        destination.mkdir(parents=True, exist_ok=True)
+        for item in checkpoint_dir.iterdir():
+            target = destination / item.name
+            if item.is_dir():
+                if target.exists():
+                    shutil.rmtree(target)
+                shutil.copytree(item, target)
+            else:
+                shutil.copy2(item, target)
+        return str(destination)
+
+    hub_stub = types.ModuleType("huggingface_hub")
+    hub_stub.snapshot_download = _fake_snapshot_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub_stub)
+
+    exit_code = quickstart.main(
+        [
+            "--repo-id",
+            "openai/gpt-oss-20b",
+            "--download-dir",
+            str(download_dir),
+            "--materialize-download",
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert exit_code == 0
+    assert calls == [("openai/gpt-oss-20b", None, False)]
 
 
 def test_quickstart_missing_checkpoint(tmp_path: Path, capsys) -> None:
