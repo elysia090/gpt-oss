@@ -949,28 +949,29 @@ _SAFETENSORS_MISSING_MSG = (
 def _resolve_safe_open():
     global safe_open
 
-    def _import_safe_open(allow_missing: bool) -> Optional[Callable]:
+    def _import_safe_open(
+        allow_missing: bool,
+        *,
+        prefer_real: bool = False,
+    ) -> Optional[Callable]:
         try:
             repo_root = Path(__file__).resolve().parents[3]
-            stub_dir = (repo_root / "safetensors").resolve()
+            stub_dir_candidate = (repo_root / "safetensors").resolve()
+            if (stub_dir_candidate / "__init__.py").exists():
+                stub_dir: Optional[Path] = stub_dir_candidate
+            else:  # pragma: no cover - defensive
+                stub_dir = None
         except Exception:  # pragma: no cover - defensive
             stub_dir = None
 
-        removed_paths: List[Tuple[int, str]] = []
-        if stub_dir is not None:
-            repo_root = stub_dir.parent
-            for index in range(len(sys.path) - 1, -1, -1):
-                entry = sys.path[index]
-                try:
-                    entry_path = Path(entry).resolve()
-                except Exception:  # pragma: no cover - defensive
-                    continue
-                if entry_path == stub_dir or entry_path == repo_root:
-                    removed_paths.append((index, entry))
-                    sys.path.pop(index)
-
         removed_modules: List[Tuple[str, object]] = []
-        if stub_dir is not None:
+        removed_paths: List[Tuple[int, str]] = []
+
+        def _restore_modules() -> None:
+            for name, module in removed_modules:
+                sys.modules[name] = module
+
+        if prefer_real and stub_dir is not None:
             for name in list(sys.modules):
                 if name != "safetensors" and not name.startswith("safetensors."):
                     continue
@@ -991,34 +992,38 @@ def _resolve_safe_open():
                 removed_modules.append((name, module))
                 del sys.modules[name]
 
+            for index in range(len(sys.path) - 1, -1, -1):
+                entry = sys.path[index]
+                try:
+                    entry_path = Path(entry).resolve()
+                except Exception:  # pragma: no cover - defensive
+                    continue
+                if entry_path == stub_dir or entry_path == stub_dir.parent:
+                    removed_paths.append((index, entry))
+                    sys.path.pop(index)
+
         try:
             import importlib
+
             importlib.invalidate_caches()
             from safetensors import safe_open as imported_safe_open
-            import inspect
-            module = inspect.getmodule(imported_safe_open)
-            if module is None and allow_missing:
-                for name, module_obj in removed_modules:
-                    sys.modules[name] = module_obj
-                return None
         except ModuleNotFoundError:
-            if stub_dir is not None:
-                for name, module in removed_modules:
-                    sys.modules[name] = module
+            if prefer_real:
+                _restore_modules()
             if allow_missing:
                 return None
             raise
         finally:
-            if stub_dir is not None:
+            if prefer_real:
                 for index, entry in sorted(removed_paths):
                     if entry not in sys.path:
                         sys.path.insert(index, entry)
 
-        if stub_dir is not None and _looks_like_repo_stub_safe_open(imported_safe_open):
+        if prefer_real and stub_dir is not None and _looks_like_repo_stub_safe_open(imported_safe_open):
+            _restore_modules()
             if allow_missing:
-                for name, module in removed_modules:
-                    sys.modules[name] = module
                 return None
+            raise ModuleNotFoundError(_SAFETENSORS_MISSING_MSG)
 
         return imported_safe_open
 
@@ -1026,7 +1031,7 @@ def _resolve_safe_open():
         return safe_open
 
     if safe_open is not None and _looks_like_repo_stub_safe_open(safe_open):
-        imported_safe_open = _import_safe_open(allow_missing=True)
+        imported_safe_open = _import_safe_open(allow_missing=True, prefer_real=True)
         if imported_safe_open is not None:
             safe_open = imported_safe_open
         return safe_open

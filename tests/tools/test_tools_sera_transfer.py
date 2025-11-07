@@ -248,6 +248,86 @@ def safe_open(path, framework="python"):
     importlib.reload(sera_transfer)
 
 
+def test_resolve_safe_open_prefers_real_wheel(tmp_path, monkeypatch):
+    module = importlib.reload(sera_transfer)
+
+    assert module.safe_open is not None
+    assert module._looks_like_repo_stub_safe_open(module.safe_open)
+
+    real_root = tmp_path / "real_wheel"
+    real_pkg = real_root / "safetensors"
+    real_pkg.mkdir(parents=True)
+    (real_pkg / "__init__.py").write_text(
+        """
+from pathlib import Path
+
+
+class _FakeTensor:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def tolist(self):
+        return self._payload
+
+
+class _FakeSafeFile:
+    def __init__(self, path, *, framework="numpy"):
+        if framework != "numpy":
+            raise RuntimeError(f"Expected numpy framework, got {framework!r}")
+        raw = Path(path).read_bytes()
+        if raw != b"real":
+            raise ValueError("Unexpected payload")
+        self._payload = {"foo": _FakeTensor([[1.0]])}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def keys(self):
+        return list(self._payload.keys())
+
+    def get_tensor(self, key):
+        return self._payload[key]
+
+
+def safe_open(path, framework="numpy", **kwargs):
+    return _FakeSafeFile(path, framework=framework)
+"""
+    )
+
+    monkeypatch.syspath_prepend(str(real_root))
+    importlib.invalidate_caches()
+
+    # Ensure the stub is currently loaded to simulate an environment upgrade.
+    assert "safetensors" in sys.modules
+    original_module = sys.modules["safetensors"]
+    assert module._looks_like_repo_stub_safe_open(getattr(original_module, "safe_open", None))
+
+    # Create a dummy file that only the real implementation accepts.
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"real")
+
+    try:
+        resolved = module._resolve_safe_open()
+        assert not module._looks_like_repo_stub_safe_open(resolved)
+        owning_module = inspect.getmodule(resolved)
+        assert owning_module is not None
+        assert Path(owning_module.__file__).resolve().parent == real_pkg.resolve()
+
+        with resolved(checkpoint) as handle:
+            assert handle.keys() == ["foo"]
+            tensor = handle.get_tensor("foo")
+            assert tensor.tolist() == [[1.0]]
+    finally:
+        for name in list(sys.modules):
+            if name == "safetensors" or name.startswith("safetensors."):
+                sys.modules.pop(name, None)
+        monkeypatch.undo()
+        importlib.reload(sera_transfer)
+
+
 def test_model_config_accepts_hf_config_fields() -> None:
     config = {
         "hidden_size": 4,
