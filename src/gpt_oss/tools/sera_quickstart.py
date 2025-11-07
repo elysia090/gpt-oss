@@ -41,9 +41,9 @@ TOKENIZER_FILENAMES: tuple[str, ...] = (
 CHECKPOINT_ALLOW_PATTERNS: tuple[str, ...] = (
     "config.json",
     "model.safetensors",
-    "original/*",
+    "original/**",
     *TOKENIZER_FILENAMES,
-    "tokenizer/*",
+    "tokenizer/**",
 )
 
 
