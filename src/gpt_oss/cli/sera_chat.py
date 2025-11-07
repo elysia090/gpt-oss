@@ -26,6 +26,7 @@ import sys
 import time
 import hashlib
 import io
+from datetime import UTC, datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -275,6 +276,60 @@ class TurnRecord:
     generation: int
     turn_tokens: int
     y_out: Optional[float]
+
+
+@dataclass
+class TranscriptLogger:
+    """Persist chat transcripts for later inspection."""
+
+    path: Path
+    include_diagnostics: bool = True
+
+    def __post_init__(self) -> None:
+        self.path = self.path.expanduser()
+        parent = self.path.parent
+        if not parent.exists():
+            parent.mkdir(parents=True, exist_ok=True)
+
+    def record_event(self, message: str, *, role: str = "system", **extra: object) -> None:
+        payload: Dict[str, object] = {
+            "type": "event",
+            "role": role,
+            "message": message,
+        }
+        if extra:
+            payload.update(extra)
+        self._write(payload)
+
+    def record_turn(
+        self,
+        prompt: str,
+        turn: TurnRecord,
+        *,
+        tools: Iterable[str] = (),
+    ) -> None:
+        payload: Dict[str, object] = {
+            "type": "turn",
+            "prompt": prompt,
+            "prompt_tokens": turn.user_tokens,
+            "response_text": turn.response_text,
+            "response_fragments": list(turn.response_fragments),
+            "response_tokens": list(turn.response_tokens),
+            "metrics": dict(turn.metrics_payload),
+            "generation": turn.generation,
+            "turn_tokens": turn.turn_tokens,
+            "y_out": turn.y_out,
+            "tools": sorted(set(tools)),
+        }
+        if self.include_diagnostics:
+            payload["diagnostics"] = dict(turn.diagnostics)
+        self._write(payload)
+
+    def _write(self, payload: Dict[str, object]) -> None:
+        record = {"timestamp": datetime.now(UTC).isoformat(), **payload}
+        with self.path.open("a", encoding="utf-8") as fh:
+            json.dump(record, fh, ensure_ascii=False, sort_keys=True)
+            fh.write("\n")
 
 
 def _load_sera_class():
@@ -542,7 +597,7 @@ def _run_turn(
     dashboard: DiagnosticsDashboard,
     *,
     metrics_mode: str = "off",
-) -> str:
+) -> TurnRecord:
     turn = _execute_turn(model, prompt)
 
     print(f"User ({turn.user_tokens} tokens): {turn.user_text}")
@@ -567,7 +622,7 @@ def _run_turn(
         json_payload = {k: v for k, v in turn.metrics_payload.items()}
         print("[metrics] " + json.dumps(json_payload, sort_keys=True))
 
-    return turn.response_text
+    return turn
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -612,6 +667,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--diagnostic-log",
         type=str,
         help="Write diagnostics to the given JSONL file for scripting",
+    )
+    parser.add_argument(
+        "--transcript",
+        type=str,
+        help="Record a JSONL transcript of the session to the given path",
     )
     parser.add_argument(
         "--metrics",
@@ -678,6 +738,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         stream=dashboard_stream,
     )
 
+    transcript_logger = (
+        TranscriptLogger(Path(args.transcript)) if args.transcript else None
+    )
+
     enabled_tools = sorted(set(args.tools or []))
     if arrays:
         preview = ", ".join(
@@ -700,10 +764,24 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     try:
         if not use_tui:
+            if transcript_logger:
+                for message in load_messages:
+                    transcript_logger.record_event(message, role="system")
             for line in load_messages:
                 print(line)
             if args.prompt is not None:
-                _run_turn(model, args.prompt, dashboard, metrics_mode=args.metrics)
+                turn = _run_turn(
+                    model,
+                    args.prompt,
+                    dashboard,
+                    metrics_mode=args.metrics,
+                )
+                if transcript_logger:
+                    transcript_logger.record_turn(
+                        args.prompt,
+                        turn,
+                        tools=enabled_tools,
+                    )
                 return 0
 
             print("Type your message and press enter (Ctrl+C to exit).")
@@ -711,7 +789,18 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 prompt = input("You: ")
                 if not prompt:
                     continue
-                _run_turn(model, prompt, dashboard, metrics_mode=args.metrics)
+                turn = _run_turn(
+                    model,
+                    prompt,
+                    dashboard,
+                    metrics_mode=args.metrics,
+                )
+                if transcript_logger:
+                    transcript_logger.record_turn(
+                        prompt,
+                        turn,
+                        tools=enabled_tools,
+                    )
             return 0
 
         from .sera_tui import SeraTUI
@@ -735,10 +824,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             optional_tools=OPTIONAL_TOOLS,
             load_messages=load_messages,
             metrics_mode=args.metrics,
+            transcript_logger=transcript_logger,
         )
         tui.run()
     except KeyboardInterrupt:
         print("\nExiting.")
+        if transcript_logger:
+            transcript_logger.record_event("Session interrupted", role="system")
     finally:
         dashboard.close()
     return 0
