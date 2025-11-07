@@ -52,6 +52,9 @@ DEFAULT_STATE_FILENAMES: Sequence[str] = (
 OPTIONAL_TOOLS: Sequence[str] = ("browser", "python")
 
 
+JSON_BYTES_PREFIX = "__sera_bytes__:"
+
+
 _ARRAY_HEADER_STRUCT = struct.Struct("<I H H 5Q Q Q Q I I")
 _DTYPE_CODES: Dict[int, str] = {
     1: "f64",
@@ -299,6 +302,21 @@ def _strip_private_fields(blob):
     return blob
 
 
+def _decode_snapshot_types(blob):
+    if isinstance(blob, str) and blob.startswith(JSON_BYTES_PREFIX):
+        return bytes.fromhex(blob[len(JSON_BYTES_PREFIX) :])
+    if isinstance(blob, list):
+        return [_decode_snapshot_types(value) for value in blob]
+    if isinstance(blob, dict):
+        result = {}
+        for key, value in blob.items():
+            if isinstance(key, str):
+                key = _decode_snapshot_types(key)
+            result[key] = _decode_snapshot_types(value)
+        return result
+    return blob
+
+
 def _decode_text(value) -> str:
     if isinstance(value, (bytes, bytearray)):
         data = bytes(value)
@@ -362,7 +380,18 @@ def _load_state(path: Path):
             return pickle.load(fh)
     if suffix == ".json":
         with path.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
+            blob = json.load(fh)
+        return _decode_snapshot_types(blob)
+    if suffix in {".msgpack", ".mpk"}:
+        try:  # pragma: no cover - optional dependency
+            import msgpack  # type: ignore
+        except ModuleNotFoundError as exc:  # pragma: no cover - defensive
+            raise RuntimeError(
+                "Support for msgpack snapshots requires the 'msgpack' package"
+            ) from exc
+        with path.open("rb") as fh:
+            blob = msgpack.unpack(fh, raw=False)
+        return _decode_snapshot_types(blob)
     raise RuntimeError(f"Unsupported snapshot format: {path}")
 
 

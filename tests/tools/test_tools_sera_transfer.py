@@ -324,6 +324,32 @@ def test_deterministic_conversion(tmp_path: Path) -> None:
     assert snap_a["metadata"] == snap_b["metadata"]
 
 
+def test_convert_emits_json_snapshot(tmp_path: Path) -> None:
+    source = _create_checkpoint(tmp_path / "json_snapshot")
+    output = tmp_path / "output"
+
+    sera_transfer.convert(source, output, r=4, r_v=2, top_l=2)
+
+    json_path = output / "sera_state.json"
+    assert json_path.exists()
+
+    json_blob = json.loads(json_path.read_text())
+    vocab = json_blob["sera_snapshot"]["config"]["tokenizer"]["vocabulary"]
+    assert any(
+        isinstance(key, str) and key.startswith(sera_transfer.JSON_BYTES_PREFIX)
+        for key in vocab
+    )
+
+    from gpt_oss.cli import sera_chat
+
+    json_state = sera_chat._load_state(json_path)
+    pickle_state = pickle.loads((output / "sera_state.pkl").read_bytes())
+    assert (
+        json_state["sera_snapshot"]["config"]["tokenizer"]["vocabulary"]
+        == pickle_state["sera_snapshot"]["config"]["tokenizer"]["vocabulary"]
+    )
+
+
 def test_written_arrays_match_reference(tmp_path: Path) -> None:
     source = _create_checkpoint(tmp_path / "reference")
     output = tmp_path / "output"

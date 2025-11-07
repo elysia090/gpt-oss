@@ -94,6 +94,8 @@ def _config_to_dict(config):
                 continue
             result[name] = _config_to_dict(getattr(config, name))
         return result
+    if hasattr(config, "__dict__") and not isinstance(config, (str, bytes)):
+        return {key: _config_to_dict(value) for key, value in vars(config).items()}
     if isinstance(config, dict):
         return {key: _config_to_dict(value) for key, value in config.items()}
     if isinstance(config, (list, tuple)):
@@ -114,6 +116,32 @@ __all__ = [
 
 
 MAGIC_SERA_ARRAY = 0x53455241
+JSON_BYTES_PREFIX = "__sera_bytes__:"
+
+
+def _json_key(value: object) -> str:
+    if isinstance(value, bytes):
+        return JSON_BYTES_PREFIX + value.hex()
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _json_value(value: object):
+    if isinstance(value, dict):
+        return {
+            _json_key(key): _json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    if isinstance(value, bytes):
+        return JSON_BYTES_PREFIX + value.hex()
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "__dict__") and not isinstance(value, (str, bytes)):
+        return _json_value(vars(value))
+    return value
 
 
 def _flatten(values: Iterable) -> List[float]:
@@ -761,14 +789,28 @@ class ModelConfig:
 # Tensor utilities
 
 
-def load_tensors(path: Path) -> Dict[str, List]:
-    if safe_open is None:
-        raise ModuleNotFoundError(
-            "The `safetensors` package is required to load model checkpoints. "
-            "Install it via `pip install safetensors` or provide a preloaded tensor map."
-        )
+_SAFETENSORS_MISSING_MSG = (
+    "The `safetensors` package is required to load model checkpoints. "
+    "Install it via `pip install safetensors` or provide a preloaded tensor map."
+)
 
-    safe_open_is_stub = _looks_like_repo_stub_safe_open(safe_open)
+
+def _resolve_safe_open():
+    global safe_open
+    if safe_open is not None:
+        return safe_open
+    try:  # pragma: no cover - exercised when lazy import succeeds
+        from safetensors import safe_open as imported_safe_open
+    except ModuleNotFoundError as exc:  # pragma: no cover - defensive
+        raise ModuleNotFoundError(_SAFETENSORS_MISSING_MSG) from exc
+    safe_open = imported_safe_open
+    return safe_open
+
+
+def load_tensors(path: Path) -> Dict[str, List]:
+    safe_open_fn = _resolve_safe_open()
+
+    safe_open_is_stub = _looks_like_repo_stub_safe_open(safe_open_fn)
     stub_hint = (
         "The repository includes a JSON-only stub of `safetensors`. "
         "Install the official `safetensors` wheel (for example, via `pip install safetensors`) "
@@ -787,7 +829,7 @@ def load_tensors(path: Path) -> Dict[str, List]:
 
     tensors: Dict[str, List] = {}
     try:
-        with safe_open(path, framework="python") as f:
+        with safe_open_fn(path, framework="python") as f:
             for key in f.keys():
                 tensor = f.get_tensor(key)
                 try:
@@ -1558,6 +1600,21 @@ def convert(
         }
         with snapshot_path.open("wb") as fh:
             pickle.dump(snapshot, fh)
+
+        json_snapshot = _json_value(snapshot)
+        json_path = output / "sera_state.json"
+        with json_path.open("w", encoding="utf-8") as fh:
+            json.dump(json_snapshot, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+        try:  # pragma: no cover - msgpack is optional
+            import msgpack  # type: ignore
+        except ModuleNotFoundError:  # pragma: no cover - exercised when msgpack missing
+            pass
+        else:
+            msgpack_path = output / "sera_state.msgpack"
+            with msgpack_path.open("wb") as fh:
+                msgpack.pack(json_snapshot, fh, use_bin_type=True)
 
     try:
         _convert_inner()
