@@ -1072,8 +1072,6 @@ def load_tensors(path: Path) -> Dict[str, List]:
     open_kwargs: Dict[str, object] = {}
     if safe_open_is_stub:
         open_kwargs["framework"] = "python"
-    else:
-        open_kwargs["framework"] = "numpy"
 
     try:
         with safe_open_fn(path, **open_kwargs) as f:
@@ -2034,7 +2032,11 @@ def run_interactive_cli(
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert checkpoints into Sera Transfer Kit artefacts",
+        description=(
+            "Convert checkpoints into Sera Transfer Kit artefacts. "
+            "Supports the official safetensors wheel for binary payloads; "
+            "falls back to the repository's JSON stub for tests."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
