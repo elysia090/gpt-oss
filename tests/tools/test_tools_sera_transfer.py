@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import builtins
 import importlib
 import inspect
 import hashlib
@@ -20,7 +19,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from safetensors.numpy import save_file
+import gpt_oss._stubs.safetensors as safetensors_stub
+from gpt_oss._stubs.safetensors.numpy import save_file
 
 from gpt_oss.tools import sera_transfer
 
@@ -128,32 +128,21 @@ def _flatten_tensor(tensor) -> list[float]:
     return [float(tensor)]
 
 
-def test_load_tensors_requires_safetensors(monkeypatch):
-    for name in list(sys.modules):
-        if name == "safetensors" or name.startswith("safetensors."):
-            monkeypatch.delitem(sys.modules, name, raising=False)
+def test_load_tensors_requires_safetensors(tmp_path, monkeypatch):
+    module = importlib.reload(sera_transfer)
 
-    module_name = "gpt_oss.tools.sera_transfer"
-    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    # Force the stub to be used so that binary payloads trigger the guidance.
+    monkeypatch.setattr(module, "safe_open", safetensors_stub.safe_open)
 
-    original_import = builtins.__import__
-
-    def fake_import(name, *args, **kwargs):
-        if name == "safetensors" or name.startswith("safetensors."):
-            raise ModuleNotFoundError("No module named 'safetensors'")
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-
-    module = importlib.import_module(module_name)
+    binary_checkpoint = tmp_path / "model.safetensors"
+    binary_checkpoint.write_bytes(b"BIN\x00\x01")
 
     with pytest.raises(ModuleNotFoundError) as excinfo:
-        module.load_tensors(Path("/tmp/nonexistent.safetensors"))
+        module.load_tensors(binary_checkpoint)
 
     message = str(excinfo.value)
     assert "pip install safetensors" in message
 
-    monkeypatch.undo()
     importlib.reload(sera_transfer)
 
 
@@ -163,8 +152,7 @@ def test_load_tensors_stub_passes_python_framework(tmp_path, monkeypatch):
     assert module.safe_open is not None
     assert module._looks_like_repo_stub_safe_open(module.safe_open)
 
-    stub_module = sys.modules["safetensors"]
-    original_safe_open = stub_module.safe_open
+    original_safe_open = safetensors_stub.safe_open
     calls: list[str] = []
 
     def recording_safe_open(path, framework="python", **kwargs):
@@ -173,7 +161,6 @@ def test_load_tensors_stub_passes_python_framework(tmp_path, monkeypatch):
 
     recording_safe_open.__module__ = original_safe_open.__module__
 
-    monkeypatch.setattr(stub_module, "safe_open", recording_safe_open)
     monkeypatch.setattr(module, "safe_open", recording_safe_open)
 
     payload = {
@@ -336,9 +323,7 @@ def safe_open(path, framework="pt", **kwargs):
     importlib.invalidate_caches()
 
     # Ensure the stub is currently loaded to simulate an environment upgrade.
-    assert "safetensors" in sys.modules
-    original_module = sys.modules["safetensors"]
-    assert module._looks_like_repo_stub_safe_open(getattr(original_module, "safe_open", None))
+    assert module._looks_like_repo_stub_safe_open(module.safe_open)
 
     # Create a dummy file that only the real implementation accepts.
     checkpoint = tmp_path / "model.safetensors"
@@ -376,14 +361,7 @@ def test_convert_handles_stub_and_real_safetensors(tmp_path, monkeypatch, mode):
     (source / "config.json").write_text(json.dumps(config))
 
     if mode == "stub":
-        spec = importlib.util.spec_from_file_location(
-            "_sera_stub_safetensors", ROOT / "safetensors" / "__init__.py"
-        )
-        assert spec is not None and spec.loader is not None
-        stub_module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = stub_module
-        spec.loader.exec_module(stub_module)
-        stub_safe_open = stub_module.safe_open
+        stub_safe_open = safetensors_stub.safe_open
         monkeypatch.setattr(module, "_resolve_safe_open", lambda: stub_safe_open)
 
         payload = {
@@ -673,13 +651,15 @@ def test_convert_supports_stub_and_wheel_safe_open(tmp_path: Path, monkeypatch) 
     (stub_source / "model.safetensors").write_text(json.dumps(stub_payload))
 
     stub_frameworks: list[str] = []
-    stub_safe_open = sys.modules["safetensors"].safe_open
+    stub_safe_open = safetensors_stub.safe_open
 
     def recording_stub_safe_open(path, framework="python", **kwargs):
         stub_frameworks.append(framework)
         return stub_safe_open(path, framework=framework, **kwargs)
 
-    recording_stub_safe_open.__module__ = getattr(stub_safe_open, "__module__", "safetensors")
+    recording_stub_safe_open.__module__ = getattr(
+        stub_safe_open, "__module__", "gpt_oss._stubs.safetensors"
+    )
 
     monkeypatch.setattr(module, "_resolve_safe_open", lambda: recording_stub_safe_open)
 

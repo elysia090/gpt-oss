@@ -1,4 +1,4 @@
-"""Minimal helpers for writing JSON based safetensor stubs."""
+"""Helpers for writing JSON based safetensor stubs."""
 
 from __future__ import annotations
 
@@ -52,4 +52,3 @@ def save_file(tensors: Dict[str, Sequence], path: Path) -> None:
             "data": _flatten(tensor),
         }
     path.write_text(json.dumps(serialised))
-
