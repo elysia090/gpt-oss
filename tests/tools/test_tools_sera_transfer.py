@@ -570,6 +570,35 @@ def test_model_config_accepts_hf_config_fields() -> None:
     assert layer.b2.endswith("mlp.down_proj.bias")
 
 
+def test_model_config_infers_layers_from_generic_suffixes() -> None:
+    config = {
+        "hidden_size": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+    }
+
+    rng = random.Random(1)
+    tensors = {
+        "layer00.k_proj.weight": _create_matrix(4, 4, rng),
+        "layer00.o_proj.weight": _create_matrix(4, 4, rng),
+        "layer00.up_proj.weight": _create_matrix(8, 4, rng),
+        "layer00.down_proj.weight": _create_matrix(4, 8, rng),
+        "layer00.up_proj.bias": _create_vector(8, rng),
+        "layer00.down_proj.bias": _create_vector(4, rng),
+    }
+
+    cfg = sera_transfer.ModelConfig.from_dict(config, tensors=tensors)
+
+    assert len(cfg.layers) == 1
+    layer = cfg.layers[0]
+    assert layer.w_k.endswith("k_proj.weight")
+    assert layer.w_o.endswith("o_proj.weight")
+    assert layer.w1.endswith("up_proj.weight")
+    assert layer.w2.endswith("down_proj.weight")
+    assert layer.b1.endswith("up_proj.bias")
+    assert layer.b2.endswith("down_proj.bias")
+
+
 def test_model_config_missing_dim_fields_raises_helpful_error() -> None:
     with pytest.raises(ValueError) as excinfo:
         sera_transfer.ModelConfig.from_dict({"foo": "bar"})
