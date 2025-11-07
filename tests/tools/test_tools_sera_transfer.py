@@ -209,13 +209,15 @@ import pickle
 from pathlib import Path
 
 
+class SafetensorError(RuntimeError):
+    pass
+
+
 class _FakeSafeFile:
-    def __init__(self, path, framework="python"):
-        if framework != "numpy":
-            raise RuntimeError(f"Unexpected framework: {framework!r}")
+    def __init__(self, path):
         raw = Path(path).read_bytes()
         if not raw.startswith(b"BIN"):
-            raise ValueError("Unexpected payload")
+            raise SafetensorError("Unexpected payload")
         loaded = pickle.loads(raw[3:])
         self._tensors = {key: _FakeTensor(value) for key, value in loaded.items()}
 
@@ -240,8 +242,10 @@ class _FakeTensor:
         return self._payload
 
 
-def safe_open(path, framework="python"):
-    return _FakeSafeFile(path, framework)
+def safe_open(path, **kwargs):
+    if "framework" in kwargs:
+        raise SafetensorError(f"Unexpected framework: {kwargs['framework']!r}")
+    return _FakeSafeFile(path)
 """
     )
 
@@ -298,12 +302,10 @@ class _FakeTensor:
 
 
 class _FakeSafeFile:
-    def __init__(self, path, *, framework="numpy"):
-        if framework != "numpy":
-            raise RuntimeError(f"Expected numpy framework, got {framework!r}")
+    def __init__(self, path):
         raw = Path(path).read_bytes()
         if raw != b"real":
-            raise ValueError("Unexpected payload")
+            raise SafetensorError("Unexpected payload")
         self._payload = {"foo": _FakeTensor([[1.0]])}
 
     def __enter__(self):
@@ -319,8 +321,14 @@ class _FakeSafeFile:
         return self._payload[key]
 
 
-def safe_open(path, framework="numpy", **kwargs):
-    return _FakeSafeFile(path, framework=framework)
+class SafetensorError(RuntimeError):
+    pass
+
+
+def safe_open(path, **kwargs):
+    if "framework" in kwargs:
+        raise SafetensorError(f"Unexpected framework: {kwargs['framework']!r}")
+    return _FakeSafeFile(path)
 """
     )
 
@@ -354,6 +362,104 @@ def safe_open(path, framework="numpy", **kwargs):
         monkeypatch.undo()
         importlib.reload(sera_transfer)
 
+
+@pytest.mark.parametrize("mode", ["stub", "wheel"])
+def test_convert_handles_stub_and_real_safetensors(tmp_path, monkeypatch, mode):
+    module = importlib.reload(sera_transfer)
+
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+
+    config, tensors = _sample_checkpoint_contents()
+    (source / "config.json").write_text(json.dumps(config))
+
+    if mode == "stub":
+        spec = importlib.util.spec_from_file_location(
+            "_sera_stub_safetensors", ROOT / "safetensors" / "__init__.py"
+        )
+        assert spec is not None and spec.loader is not None
+        stub_module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = stub_module
+        spec.loader.exec_module(stub_module)
+        stub_safe_open = stub_module.safe_open
+        monkeypatch.setattr(module, "_resolve_safe_open", lambda: stub_safe_open)
+
+        payload = {
+            "tensors": {
+                key: {"shape": _tensor_shape(value), "data": _flatten_tensor(value)}
+                for key, value in tensors.items()
+            }
+        }
+        (source / "model.safetensors").write_text(json.dumps(payload))
+    else:
+        fake_impl = tmp_path / "fake_safetensors.py"
+        fake_impl.write_text(
+            """
+import pickle
+from pathlib import Path
+
+
+class SafetensorError(RuntimeError):
+    pass
+
+
+class _FakeTensor:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def tolist(self):
+        return self._payload
+
+
+class _FakeSafeFile:
+    def __init__(self, path):
+        raw = Path(path).read_bytes()
+        if not raw.startswith(b"BIN"):
+            raise SafetensorError("Unexpected payload")
+        payload = pickle.loads(raw[3:])
+        self._payload = {key: _FakeTensor(value) for key, value in payload.items()}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def keys(self):
+        return list(self._payload.keys())
+
+    def get_tensor(self, key):
+        return self._payload[key]
+
+
+def safe_open(path, **kwargs):
+    if "framework" in kwargs:
+        raise SafetensorError(f"Unexpected framework: {kwargs['framework']!r}")
+    return _FakeSafeFile(path)
+"""
+        )
+        spec = importlib.util.spec_from_file_location("fake_safetensors", fake_impl)
+        assert spec is not None and spec.loader is not None
+        fake_module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = fake_module
+        spec.loader.exec_module(fake_module)
+        fake_safe_open = fake_module.safe_open
+        monkeypatch.setattr(module, "_resolve_safe_open", lambda: fake_safe_open)
+
+        (source / "model.safetensors").write_bytes(b"BIN" + pickle.dumps(tensors))
+
+    safe_open_fn = module._resolve_safe_open()
+    assert module._looks_like_repo_stub_safe_open(safe_open_fn) is (mode == "stub")
+
+    tensors_loaded = module.load_tensors(source / "model.safetensors")
+    assert tensors_loaded.keys() == tensors.keys()
+
+    summary = module.convert(source, output, r=4, r_v=2, top_l=2)
+    assert summary.manifest_path.exists()
+    assert summary.output == output
+    assert summary.total_bytes > 0
 
 def test_model_config_accepts_hf_config_fields() -> None:
     config = {
