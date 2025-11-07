@@ -1544,11 +1544,13 @@ def convert(
 ) -> ConversionSummary:
     """Convert a checkpoint directory into a Sera Transfer Kit artefact.
 
-    The conversion expects a ``config.json`` and ``model.safetensors`` file. When
-    these files are missing from ``source`` directly, the function probes a small
-    set of common Hugging Face layouts – ``source/original`` and
-    ``source/original/model`` – before failing. Advanced users can supply an
-    explicit ``original_subdir`` to search an arbitrary additional location.
+    The conversion expects a ``config.json`` and ``model.safetensors`` file.
+    When these files are missing from ``source`` directly, the function probes
+    a small set of common Hugging Face layouts – ``source/original`` and
+    ``source/original/model`` – before failing. Callers that rely on the
+    quickstart helper must therefore retain the root-level metadata alongside
+    the ``original/`` directory. Advanced users can supply an explicit
+    ``original_subdir`` to search an arbitrary additional location.
     """
 
     source = source.resolve()
