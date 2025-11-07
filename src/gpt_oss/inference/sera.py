@@ -25,9 +25,24 @@ import struct
 import unicodedata
 import copy
 import threading
+import pickle
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Type, TypeVar
+from pathlib import Path
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
 
 try:  # pragma: no cover - exercised indirectly by the tests
     import numpy as np
@@ -48,6 +63,29 @@ class BudgetError(RuntimeError):
 
 
 T = TypeVar("T")
+
+
+_TRANSFER_JSON_BYTES_PREFIX = "__sera_bytes__:"
+_TRANSFER_STATE_FILENAMES: Tuple[str, ...] = (
+    "sera_state.pkl",
+    "sera_state.json",
+    "sera_state.msgpack",
+)
+_TRANSFER_ARRAY_MAGIC = 0x53455241
+_TRANSFER_MANIFEST_MAGIC = 0x5345524D
+_TRANSFER_ARRAY_STRUCT = struct.Struct("<I H H 5Q Q Q Q I I")
+_TRANSFER_DTYPE_CODES: Dict[int, str] = {
+    1: "f64",
+    2: "f32",
+    3: "i32",
+    4: "i16",
+    5: "i8",
+    6: "u8",
+    7: "q8_8",
+    8: "q4_12",
+    9: "bf16",
+}
+_CRC32C_TABLE: List[int] = []
 
 
 def _validate_prefix_free(vocabulary: Dict[bytes, int]) -> None:
@@ -3443,6 +3481,101 @@ class Sera:
         model._generation_pointer.publish(model.manifest_record())
         return model
 
+    @classmethod
+    def transfer(
+        cls,
+        artefact_root: Union[str, Path],
+        *,
+        state_file: Optional[Union[str, Path]] = None,
+    ) -> Tuple["Sera", Dict[str, object]]:
+        """Restore a model from a Sera Transfer Kit bundle (spec §17)."""
+
+        manifest_dir = Path(artefact_root).expanduser()
+        if manifest_dir.is_file():
+            manifest_path = manifest_dir.resolve()
+            manifest_dir = manifest_path.parent
+        else:
+            manifest_path = (manifest_dir / "sera_manifest.bin").resolve()
+
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"Sera manifest not found at {manifest_path}"  # pragma: no cover - defensive
+            )
+
+        with manifest_path.open("rb") as fh:
+            magic_raw = fh.read(4)
+        if len(magic_raw) != 4:
+            raise ValueError("Sera manifest file is truncated")
+        magic = struct.unpack("<I", magic_raw)[0]
+        if magic != _TRANSFER_MANIFEST_MAGIC:
+            raise ValueError("Invalid Sera manifest magic")
+
+        if state_file is not None:
+            state_path = Path(state_file).expanduser()
+            if not state_path.is_absolute():
+                state_path = manifest_dir / state_path
+            state_path = state_path.resolve()
+        else:
+            state_path = None
+            for name in _TRANSFER_STATE_FILENAMES:
+                candidate = (manifest_dir / name).resolve()
+                if candidate.exists():
+                    state_path = candidate
+                    break
+        if state_path is None or not state_path.exists():
+            raise FileNotFoundError(
+                "No Sera runtime snapshot found alongside the manifest"
+            )
+
+        state_blob = _load_transfer_state(state_path)
+        if not isinstance(state_blob, Mapping):
+            raise TypeError("Transfer snapshot must be a mapping")
+        state_blob = _strip_transfer_private_fields(state_blob)
+
+        runtime_blob_obj = state_blob.get("sera_snapshot")
+        if runtime_blob_obj is None:
+            runtime_blob = state_blob
+        elif isinstance(runtime_blob_obj, Mapping):
+            runtime_blob = _strip_transfer_private_fields(runtime_blob_obj)
+        else:
+            raise TypeError("Transfer snapshot 'sera_snapshot' must be a mapping")
+
+        arrays_meta = state_blob.get("artefacts")
+        if isinstance(arrays_meta, Mapping):
+            arrays_info = _validate_transfer_arrays(manifest_dir / "arrays", arrays_meta)
+        else:
+            arrays_info = {}
+
+        if isinstance(runtime_blob, Mapping) and "config" in runtime_blob:
+            model = cls.restore(dict(runtime_blob))
+        else:
+            config_blob = state_blob.get("model_config")
+            if not isinstance(config_blob, Mapping):
+                raise ValueError("Transfer snapshot missing model configuration")
+            config = SeraConfig(**config_blob)
+            model = cls(config)
+
+        metadata: Dict[str, object] = {
+            "manifest_path": manifest_path,
+            "state_path": state_path,
+            "arrays": {
+                name: {
+                    "dtype": info["dtype"],
+                    "shape": info["shape"],
+                    "byte_len": info["byte_len"],
+                    "path": info["path"],
+                    "sha256": info.get("sha256"),
+                }
+                for name, info in arrays_info.items()
+            },
+        }
+        if "metadata" in state_blob:
+            metadata["metadata"] = state_blob["metadata"]
+        if "model_config" in state_blob:
+            metadata["model_config"] = state_blob["model_config"]
+
+        return model, metadata
+
     # ------------------------------------------------------------------
     # Generation + Manifest
     # ------------------------------------------------------------------
@@ -3555,3 +3688,143 @@ def _hash_bytes(data: bytes) -> int:
     for byte in data:
         h = ((h * _HASH_BASE) + byte) & _HASH_MASK
     return h
+
+
+def _decode_transfer_blob(blob):
+    if isinstance(blob, str) and blob.startswith(_TRANSFER_JSON_BYTES_PREFIX):
+        return bytes.fromhex(blob[len(_TRANSFER_JSON_BYTES_PREFIX) :])
+    if isinstance(blob, Mapping):
+        return {
+            key: _decode_transfer_blob(value)
+            for key, value in blob.items()
+        }
+    if isinstance(blob, list):
+        return [_decode_transfer_blob(value) for value in blob]
+    if isinstance(blob, tuple):
+        return tuple(_decode_transfer_blob(value) for value in blob)
+    return blob
+
+
+def _strip_transfer_private_fields(blob):
+    if isinstance(blob, Mapping):
+        return {
+            key: _strip_transfer_private_fields(value)
+            for key, value in blob.items()
+            if not (isinstance(key, str) and key.startswith("_"))
+        }
+    if isinstance(blob, list):
+        return [_strip_transfer_private_fields(value) for value in blob]
+    if isinstance(blob, tuple):
+        return tuple(_strip_transfer_private_fields(value) for value in blob)
+    return blob
+
+
+def _load_transfer_state(path: Path):
+    suffix = path.suffix.lower()
+    if suffix in {".pkl", ".pickle"}:
+        with path.open("rb") as fh:
+            return pickle.load(fh)
+    if suffix == ".json":
+        with path.open("r", encoding="utf-8") as fh:
+            blob = json.load(fh)
+        return _decode_transfer_blob(blob)
+    if suffix in {".msgpack", ".mpk"}:
+        try:  # pragma: no cover - optional dependency
+            import msgpack  # type: ignore
+        except ModuleNotFoundError as exc:  # pragma: no cover - defensive
+            raise RuntimeError(
+                "Support for msgpack snapshots requires the 'msgpack' package"
+            ) from exc
+        with path.open("rb") as fh:
+            blob = msgpack.unpack(fh, raw=False)
+        return _decode_transfer_blob(blob)
+    raise RuntimeError(f"Unsupported snapshot format: {path}")
+
+
+def _parse_transfer_array_header(values: Sequence[int]) -> Dict[str, object]:
+    magic = int(values[0])
+    dtype_code = int(values[1])
+    rank = int(values[2])
+    dims = tuple(int(dim) for dim in values[3:8])
+    shape = tuple(dims[:rank]) if rank > 0 else tuple()
+    header = {
+        "magic": magic,
+        "dtype_code": dtype_code,
+        "dtype": _TRANSFER_DTYPE_CODES.get(dtype_code, f"code{dtype_code}"),
+        "rank": rank,
+        "dims": dims,
+        "shape": shape,
+        "byte_len": int(values[8]),
+        "crc32c": int(values[9]),
+        "sha256_low64": int(values[10]),
+        "flags": int(values[11]),
+        "reserved": int(values[12]),
+    }
+    return header
+
+
+def _validate_transfer_arrays(
+    array_dir: Path, artefacts: Mapping[str, Mapping[str, object]]
+) -> Dict[str, Dict[str, object]]:
+    arrays: Dict[str, Dict[str, object]] = {}
+    for name, record in sorted(artefacts.items()):
+        if not isinstance(record, Mapping):
+            raise TypeError("Array metadata entries must be mappings")
+        array_path = array_dir / f"{name}.bin"
+        if not array_path.exists():
+            raise FileNotFoundError(f"Required array {array_path} is missing")
+        with array_path.open("rb") as fh:
+            header_raw = fh.read(_TRANSFER_ARRAY_STRUCT.size)
+            if len(header_raw) != _TRANSFER_ARRAY_STRUCT.size:
+                raise ValueError(f"Array file {array_path} is truncated")
+            values = _TRANSFER_ARRAY_STRUCT.unpack(header_raw)
+            payload = fh.read()
+        header = _parse_transfer_array_header(values)
+        if header["magic"] != _TRANSFER_ARRAY_MAGIC:
+            raise ValueError(f"Invalid array magic for {array_path}")
+        if len(payload) != header["byte_len"]:
+            raise ValueError(
+                f"Array payload length mismatch for {array_path}: expected {header['byte_len']}, got {len(payload)}"
+            )
+        crc = _crc32c(payload)
+        if crc != header["crc32c"]:
+            raise ValueError(f"CRC32C mismatch for {array_path}")
+        sha_low64 = int.from_bytes(hashlib.sha256(payload).digest()[-8:], "little")
+        if sha_low64 != header["sha256_low64"]:
+            raise ValueError(f"sha256_low64 mismatch for {array_path}")
+        expected_sha = record.get("sha256")
+        if expected_sha:
+            digest = hashlib.sha256(payload).hexdigest()
+            if digest != expected_sha:
+                raise ValueError(
+                    f"Array {array_path} failed SHA-256 validation: expected {expected_sha}, got {digest}"
+                )
+        arrays[name] = {
+            "dtype": header["dtype"],
+            "shape": header["shape"],
+            "byte_len": header["byte_len"],
+            "path": array_path,
+            "sha256": expected_sha,
+        }
+    return arrays
+
+
+def _init_crc32c_table() -> None:
+    if _CRC32C_TABLE:
+        return
+    for i in range(256):
+        crc = i
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0x82F63B78
+            else:
+                crc >>= 1
+        _CRC32C_TABLE.append(crc & 0xFFFFFFFF)
+
+
+def _crc32c(data: bytes) -> int:
+    _init_crc32c_table()
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc = _CRC32C_TABLE[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    return (~crc) & 0xFFFFFFFF
