@@ -16,29 +16,12 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-sys.modules.pop("safetensors", None)
-sys.modules.pop("safetensors.numpy", None)
-
-_safetensors_spec = importlib.util.spec_from_file_location(
-    "safetensors", ROOT / "safetensors" / "__init__.py"
-)
-assert _safetensors_spec is not None and _safetensors_spec.loader is not None
-_safetensors_module = importlib.util.module_from_spec(_safetensors_spec)
-sys.modules["safetensors"] = _safetensors_module
-_safetensors_spec.loader.exec_module(_safetensors_module)
-
+import gpt_oss._stubs.safetensors as safetensors_stub
+from gpt_oss._stubs.safetensors.numpy import save_file
 import gpt_oss.tools.sera_quickstart as quickstart
 import pytest
 
-_safetensors_numpy_spec = importlib.util.spec_from_file_location(
-    "safetensors.numpy", ROOT / "safetensors" / "numpy.py"
-)
-assert _safetensors_numpy_spec is not None and _safetensors_numpy_spec.loader is not None
-_safetensors_numpy = importlib.util.module_from_spec(_safetensors_numpy_spec)
-sys.modules.setdefault("safetensors.numpy", _safetensors_numpy)
-_safetensors_numpy_spec.loader.exec_module(_safetensors_numpy)
-save_file = _safetensors_numpy.save_file
-quickstart.sera_transfer.safe_open = _safetensors_module.safe_open  # type: ignore[attr-defined]
+quickstart.sera_transfer.safe_open = safetensors_stub.safe_open  # type: ignore[attr-defined]
 
 
 def _create_matrix(rows: int, cols: int, rng: random.Random) -> list[list[float]]:

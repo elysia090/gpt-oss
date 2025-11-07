@@ -4,7 +4,7 @@ import random
 import sys
 from pathlib import Path
 
-from safetensors.numpy import save_file
+from gpt_oss._stubs.safetensors.numpy import save_file
 
 from gpt_oss.tools import sera_transfer
 

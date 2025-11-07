@@ -1,4 +1,4 @@
-"""A lightweight stub of the :mod:`safetensors` package used in the tests."""
+"""JSON-only stub implementations of the :mod:`safetensors` API used in tests."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
-__all__ = ["safe_open"]
+__all__ = ["safe_open", "is_stub_safe_open"]
 
 
 @dataclass
@@ -65,6 +65,20 @@ class _SafeOpen:
         return record.to_nested()
 
 
+STUB_SENTINEL = "gpt_oss._stubs.safetensors"
+
+
 def safe_open(path: str | Path, framework: str = "python", device: str | None = None) -> _SafeOpen:  # noqa: ARG001
+    """Return a context manager that reads JSON encoded tensor payloads."""
+
     return _SafeOpen(Path(path))
 
+
+safe_open.__gpt_oss_stub__ = True  # type: ignore[attr-defined]
+safe_open.__module__ = STUB_SENTINEL
+
+
+def is_stub_safe_open(func) -> bool:
+    """Return ``True`` if *func* is the JSON-only stub shipped with the repo."""
+
+    return bool(getattr(func, "__gpt_oss_stub__", False))

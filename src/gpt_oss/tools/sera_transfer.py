@@ -22,47 +22,25 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 try:  # pragma: no cover - exercised indirectly in environments with safetensors
-    from safetensors import safe_open
+    from safetensors import safe_open as _real_safe_open
 except ModuleNotFoundError:  # pragma: no cover - exercised in environments without safetensors
-    safe_open = None  # type: ignore[assignment]
+    _real_safe_open = None
+
+from gpt_oss._stubs.safetensors import is_stub_safe_open, safe_open as _stub_safe_open
+
+safe_open = _real_safe_open if _real_safe_open is not None else _stub_safe_open  # type: ignore[assignment]
 
 
 def _looks_like_repo_stub_safe_open(func) -> bool:
     if func is None:
         return False
 
-    module = inspect.getmodule(func)
-
-    module_file = None
-    if module is not None:
-        module_file = getattr(module, "__file__", None)
-    if module_file is None:
-        code = getattr(func, "__code__", None)
-        if code is not None:
-            module_file = code.co_filename
-
-    if not module_file:
-        return False
-
-    try:
-        module_path = Path(module_file).resolve()
-    except OSError:  # pragma: no cover - defensive
-        return False
-
-    try:
-        repo_root = Path(__file__).resolve().parents[3]
-    except IndexError:  # pragma: no cover - defensive
-        return False
-
-    stub_path = (repo_root / "safetensors" / "__init__.py").resolve()
-    if module_path == stub_path:
+    if is_stub_safe_open(func):
         return True
 
-    if module_path.name == "__init__.py" and module_path.parent.name == "safetensors":
-        try:
-            module_path.relative_to(repo_root)
-        except ValueError:
-            return False
+    module = inspect.getmodule(func)
+    module_name = getattr(module, "__name__", None)
+    if module_name == "gpt_oss._stubs.safetensors":
         return True
 
     return False
@@ -950,101 +928,28 @@ _SAFETENSORS_MISSING_MSG = (
 def _resolve_safe_open():
     global safe_open
 
-    try:
-        repo_root = Path(__file__).resolve().parents[3]
-        stub_dir_candidate = (repo_root / "safetensors").resolve()
-        if (stub_dir_candidate / "__init__.py").exists():
-            stub_dir: Optional[Path] = stub_dir_candidate
-        else:  # pragma: no cover - defensive
-            stub_dir = None
-    except Exception:  # pragma: no cover - defensive
-        stub_dir = None
-
-    removed_modules: List[Tuple[str, object]] = []
-    removed_paths: List[Tuple[int, str]] = []
-
-    def _maybe_remove_repo_stub() -> None:
-        if stub_dir is None:
-            return
-
-        for name in list(sys.modules):
-            if name != "safetensors" and not name.startswith("safetensors."):
-                continue
-            module = sys.modules.get(name)
-            if module is None:
-                continue
-            module_file = getattr(module, "__file__", None)
-            if not module_file:
-                continue
-            try:
-                module_path = Path(module_file).resolve()
-            except Exception:  # pragma: no cover - defensive
-                continue
-            try:
-                module_path.relative_to(stub_dir)
-            except ValueError:
-                continue
-            removed_modules.append((name, module))
-            del sys.modules[name]
-
-        for index in range(len(sys.path) - 1, -1, -1):
-            entry = sys.path[index]
-            try:
-                entry_path = Path(entry).resolve()
-            except Exception:  # pragma: no cover - defensive
-                continue
-            if entry_path == stub_dir or entry_path == stub_dir.parent:
-                removed_paths.append((index, entry))
-                sys.path.pop(index)
-
-    def _restore_paths() -> None:
-        for index, entry in sorted(removed_paths):
-            if entry not in sys.path:
-                sys.path.insert(index, entry)
-
-    def _restore_modules() -> None:
-        for name, module in removed_modules:
-            sys.modules[name] = module
-
-    def _import_safe_open(allow_missing: bool) -> Optional[Callable]:
-        try:
-            import importlib
-
-            importlib.invalidate_caches()
-            from safetensors import safe_open as imported_safe_open
-        except ModuleNotFoundError:
-            if allow_missing:
-                return None
-            raise
-        return imported_safe_open
-
     if safe_open is not None and not _looks_like_repo_stub_safe_open(safe_open):
         return safe_open
 
     if safe_open is not None and _looks_like_repo_stub_safe_open(safe_open):
-        _maybe_remove_repo_stub()
         try:
-            imported_safe_open = _import_safe_open(allow_missing=True)
-        except ModuleNotFoundError as exc:  # pragma: no cover - defensive
-            _restore_modules()
-            _restore_paths()
-            raise ModuleNotFoundError(_SAFETENSORS_MISSING_MSG) from exc
-        finally:
-            _restore_paths()
+            from safetensors import safe_open as imported_safe_open
+        except ModuleNotFoundError:
+            return safe_open
 
-        if imported_safe_open is None or _looks_like_repo_stub_safe_open(imported_safe_open):
-            _restore_modules()
+        if _looks_like_repo_stub_safe_open(imported_safe_open):
             return safe_open
 
         safe_open = imported_safe_open
         return safe_open
 
-    try:  # pragma: no cover - exercised when lazy import succeeds
-        imported_safe_open = _import_safe_open(allow_missing=False)
-    except ModuleNotFoundError as exc:  # pragma: no cover - defensive
-        raise ModuleNotFoundError(_SAFETENSORS_MISSING_MSG) from exc
+    try:
+        from safetensors import safe_open as imported_safe_open
+    except ModuleNotFoundError:
+        safe_open = _stub_safe_open
+    else:
+        safe_open = imported_safe_open
 
-    safe_open = imported_safe_open
     return safe_open
 
 
