@@ -348,6 +348,9 @@ the helper directly with `python -m gpt_oss.tools.sera_quickstart --chat`.
 
 The first invocation downloads `openai/gpt-oss-20b`, caches the Sera artefacts
 under `./gpt-oss-sera-20b`, and opens the default **Sera terminal UI (TUI)**.
+The helper scopes Hugging Face downloads to the `original/` checkpoint payload
+and tokenizer metadata so the quickstart avoids fetching the large converted
+variants present in the repository.
 Later runs reuse the cached artefacts unless you request a clean slate.
 
 When the TUI appears it presents three panels:
