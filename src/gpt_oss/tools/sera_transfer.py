@@ -3,23 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import inspect
 import importlib.util
 import io
 import json
 import logging
+import math
 import os
 import pickle
-import math
-import struct
-import textwrap
-import dataclasses
 import re
+import struct
+import sys
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
-import sys
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 try:  # pragma: no cover - exercised indirectly in environments with safetensors
     from safetensors import safe_open
@@ -107,7 +107,12 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ArrayHeader",
+    "ArrayInfo",
+    "ConversionSummary",
+    "SnapshotInfo",
     "crc32c",
+    "format_summary",
+    "run_interactive_cli",
     "sha256_low64",
     "SplitMix64",
     "convert",
@@ -286,6 +291,116 @@ def write_array(path: Path, data, dtype: str, flags: int = 0x1) -> bytes:
         f.write(header.to_bytes())
         f.write(payload)
     return payload
+
+
+@dataclass(frozen=True)
+class ArrayInfo:
+    """Lightweight description of an array artefact produced during conversion."""
+
+    name: str
+    path: Path
+    dtype: str
+    shape: Tuple[int, ...]
+    bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class SnapshotInfo:
+    """Metadata for auxiliary snapshot files persisted during conversion."""
+
+    kind: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class ConversionSummary:
+    """Summary of artefacts written by :func:`convert`."""
+
+    source: Path
+    output: Path
+    arrays: Tuple[ArrayInfo, ...]
+    manifest_path: Path
+    metadata_keys: Tuple[str, ...]
+    snapshots: Tuple[SnapshotInfo, ...]
+    total_bytes: int
+
+    @property
+    def array_count(self) -> int:
+        return len(self.arrays)
+
+    def to_dict(self) -> Dict[str, object]:
+        """Serialise the summary into JSON-serialisable primitives."""
+
+        return {
+            "source": str(self.source),
+            "output": str(self.output),
+            "manifest_path": str(self.manifest_path),
+            "metadata_keys": list(self.metadata_keys),
+            "arrays": [
+                {
+                    "name": info.name,
+                    "path": str(info.path),
+                    "dtype": info.dtype,
+                    "shape": list(info.shape),
+                    "bytes": info.bytes,
+                    "sha256": info.sha256,
+                }
+                for info in self.arrays
+            ],
+            "snapshots": [
+                {"kind": snapshot.kind, "path": str(snapshot.path)}
+                for snapshot in self.snapshots
+            ],
+            "total_bytes": self.total_bytes,
+        }
+
+
+def format_summary(summary: ConversionSummary) -> str:
+    """Return a human-friendly multi-line summary of conversion outputs."""
+
+    header = "Sera Transfer Conversion Summary"
+    lines = [header, "=" * len(header)]
+    lines.append(f"Source : {summary.source}")
+    lines.append(f"Output : {summary.output}")
+    lines.append(f"Manifest: {summary.manifest_path}")
+
+    if summary.metadata_keys:
+        lines.append(
+            "Metadata sections: " + ", ".join(sorted(summary.metadata_keys))
+        )
+
+    lines.append("")
+    lines.append("Arrays:")
+    if summary.arrays:
+        name_width = max(len(info.name) for info in summary.arrays)
+        dtype_width = max(len(info.dtype) for info in summary.arrays)
+        header_row = f"  {'Name'.ljust(name_width)}  {'DType'.ljust(dtype_width)}  Shape        Bytes"
+        lines.append(header_row)
+        lines.append("  " + "-" * (len(header_row) - 2))
+        for info in summary.arrays:
+            if info.shape:
+                shape_text = " × ".join(str(dim) for dim in info.shape)
+            else:
+                shape_text = "scalar"
+            lines.append(
+                "  "
+                + f"{info.name.ljust(name_width)}  {info.dtype.ljust(dtype_width)}  {shape_text:<11}  {info.bytes:>8}"
+            )
+    else:
+        lines.append("  <no arrays written>")
+
+    if summary.snapshots:
+        lines.append("")
+        lines.append("Snapshots:")
+        for snapshot in summary.snapshots:
+            lines.append(f"  {snapshot.kind:<8} {snapshot.path}")
+
+    lines.append("")
+    lines.append(
+        f"Total arrays: {summary.array_count} | Total payload bytes: {summary.total_bytes}"
+    )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1452,7 +1567,7 @@ def convert(
             logger.error(message)
         raise FileNotFoundError(message)
 
-    def _convert_inner() -> None:
+    def _convert_inner() -> ConversionSummary:
         config_path = find_file("config.json")
         model_path = find_file("model.safetensors")
         if verbose:
@@ -1473,17 +1588,32 @@ def convert(
         artefact_payloads: Dict[str, bytes] = {}
         artefact_records: Dict[str, Dict[str, object]] = {}
         metadata: Dict[str, object] = {}
+        array_infos: List[ArrayInfo] = []
+        snapshot_infos: List[SnapshotInfo] = []
 
         def store_array(name: str, data, dtype: str) -> None:
             path = arrays_dir / f"{name}.bin"
             payload = write_array(path, data, dtype)
+            shape = _infer_shape(data)
+            payload_len = len(payload)
             artefact_payloads[name] = payload
             artefact_records[name] = {
                 "path": str(path),
                 "dtype": dtype,
-                "shape": _infer_shape(data),
+                "shape": shape,
+                "bytes": payload_len,
                 "sha256": hashlib.sha256(payload).hexdigest(),
             }
+            array_infos.append(
+                ArrayInfo(
+                    name=name,
+                    path=path,
+                    dtype=dtype,
+                    shape=shape,
+                    bytes=payload_len,
+                    sha256=artefact_records[name]["sha256"],
+                )
+            )
 
         tokenizer_data, tokenizer_meta = tokenizer_arrays(cfg, tensors)
         for name, data in tokenizer_data.items():
@@ -1529,8 +1659,9 @@ def convert(
         store_array("peer_scores", bridge_data["peer_scores"], "i16")
         metadata["bridge"] = bridge_meta
 
+        manifest_path = output / "sera_manifest.bin"
         write_manifest(
-            output / "sera_manifest.bin",
+            manifest_path,
             cfg,
             artefact_payloads,
             r=local_r,
@@ -1600,12 +1731,14 @@ def convert(
         }
         with snapshot_path.open("wb") as fh:
             pickle.dump(snapshot, fh)
+        snapshot_infos.append(SnapshotInfo("pickle", snapshot_path))
 
         json_snapshot = _json_value(snapshot)
         json_path = output / "sera_state.json"
         with json_path.open("w", encoding="utf-8") as fh:
             json.dump(json_snapshot, fh, indent=2, sort_keys=True)
             fh.write("\n")
+        snapshot_infos.append(SnapshotInfo("json", json_path))
 
         try:  # pragma: no cover - msgpack is optional
             import msgpack  # type: ignore
@@ -1615,22 +1748,178 @@ def convert(
             msgpack_path = output / "sera_state.msgpack"
             with msgpack_path.open("wb") as fh:
                 msgpack.pack(json_snapshot, fh, use_bin_type=True)
+            snapshot_infos.append(SnapshotInfo("msgpack", msgpack_path))
+
+        total_bytes = sum(info.bytes for info in array_infos)
+        summary = ConversionSummary(
+            source=source,
+            output=output,
+            arrays=tuple(array_infos),
+            manifest_path=manifest_path,
+            metadata_keys=tuple(sorted(metadata)),
+            snapshots=tuple(snapshot_infos),
+            total_bytes=total_bytes,
+        )
+        if verbose:
+            formatted = format_summary(summary)
+            for line in formatted.splitlines():
+                logger.info(line)
+        return summary
 
     try:
-        _convert_inner()
+        return _convert_inner()
     except (ValueError, RuntimeError, FileNotFoundError) as exc:
         if verbose:
             logger.error("Conversion failed: %s", exc)
         raise
 
 
+def run_interactive_cli(
+    default_source: Path | None = None,
+    default_output: Path | None = None,
+    *,
+    r: int = 64,
+    r_v: int = 8,
+    top_l: int = 8,
+    original_subdir: str | Path | None = None,
+    verbose: bool = True,
+    input_func: Callable[[str], str] = input,
+    output_func: Callable[[str], None] = print,
+) -> ConversionSummary:
+    """Guide the user through conversion via a lightweight text UI."""
+
+    def _display(message: str = "") -> None:
+        output_func(message)
+
+    def _prompt_path(
+        prompt: str,
+        default: Path | None,
+        *,
+        must_exist: bool,
+    ) -> Path:
+        while True:
+            suffix = f" [{default}]" if default is not None else ""
+            response = input_func(f"{prompt}{suffix}: ").strip()
+            if not response:
+                if default is None:
+                    _display("Please provide a path.")
+                    continue
+                path = default
+            else:
+                path = Path(response)
+            path = path.expanduser()
+            if must_exist and not path.exists():
+                _display(f"Path {path} does not exist. Please try again.")
+                continue
+            return path
+
+    def _prompt_int(prompt: str, default: int) -> int:
+        while True:
+            response = input_func(f"{prompt} [{default}]: ").strip()
+            if not response:
+                return default
+            try:
+                value = int(response)
+            except ValueError:
+                _display("Please enter an integer value.")
+                continue
+            if value <= 0:
+                _display("Please provide a positive integer.")
+                continue
+            return value
+
+    def _prompt_optional_string(prompt: str, default: str | None) -> str | None:
+        suffix = f" [{default}]" if default else ""
+        response = input_func(f"{prompt}{suffix}: ").strip()
+        if not response:
+            return default
+        return response
+
+    def _prompt_confirm(prompt: str, default: bool = True) -> bool:
+        choice = "Y/n" if default else "y/N"
+        while True:
+            response = input_func(f"{prompt} ({choice}): ").strip().lower()
+            if not response:
+                return default
+            if response in {"y", "yes"}:
+                return True
+            if response in {"n", "no"}:
+                return False
+            _display("Please answer 'y' or 'n'.")
+
+    _display("Sera Transfer Conversion Assistant")
+    _display("=" * 36)
+    _display("Press Ctrl+C at any time to abort.\n")
+
+    source = _prompt_path(
+        "Checkpoint directory",
+        default_source or Path.cwd(),
+        must_exist=True,
+    )
+    output = _prompt_path(
+        "Output directory",
+        default_output or (source.parent / f"{source.name}-sera"),
+        must_exist=False,
+    )
+    selected_r = _prompt_int("Rank parameter r", r)
+    selected_rv = _prompt_int("Value rank rv", r_v)
+    selected_topl = _prompt_int("Top-L parameter", top_l)
+    selected_original = _prompt_optional_string(
+        "Original subdirectory (optional)",
+        str(original_subdir) if original_subdir is not None else None,
+    )
+
+    _display("\nConfiguration summary:")
+    summary_block = textwrap.dedent(
+        f"""
+        Source : {source}
+        Output : {output}
+        r / rv / topL : {selected_r} / {selected_rv} / {selected_topl}
+        Original subdir: {selected_original or '<auto>'}
+        """
+    ).strip("\n")
+    _display(summary_block)
+
+    if not _prompt_confirm("Proceed with conversion?", True):
+        raise KeyboardInterrupt("Conversion cancelled by user")
+
+    summary = convert(
+        source,
+        output,
+        r=selected_r,
+        r_v=selected_rv,
+        top_l=selected_topl,
+        original_subdir=selected_original,
+        verbose=verbose,
+    )
+    _display("")
+    _display(format_summary(summary))
+    return summary
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert checkpoints into Sera Transfer Kit artefacts")
-    parser.add_argument("--source", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--r", type=int, default=64)
-    parser.add_argument("--rv", type=int, default=8)
-    parser.add_argument("--topL", type=int, default=8)
+    parser = argparse.ArgumentParser(
+        description="Convert checkpoints into Sera Transfer Kit artefacts",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--source",
+        type=Path,
+        help="Path to the checkpoint directory containing config.json and model.safetensors",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Directory where the converted artefacts should be written",
+    )
+    parser.add_argument("--r", type=int, default=64, help="Rank compression parameter")
+    parser.add_argument(
+        "--rv",
+        type=int,
+        default=8,
+        help="Value compression rank used for rotary features",
+    )
+    parser.add_argument("--topL", type=int, default=8, help="Top-L sparse FFN parameter")
     parser.add_argument(
         "--original-subdir",
         type=str,
@@ -1650,6 +1939,18 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_false",
         help="Disable verbose logging",
     )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Launch an interactive text UI to guide the conversion",
+    )
+    parser.add_argument(
+        "--no-summary",
+        dest="print_summary",
+        action="store_false",
+        help="Do not print the conversion summary table",
+    )
+    parser.set_defaults(print_summary=True)
 
     args = parser.parse_args(argv)
 
@@ -1660,6 +1961,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         else:
             args.verbose = env_value.lower() not in {"", "0", "false", "no"}
 
+    if not args.interactive:
+        missing: List[str] = []
+        if args.source is None:
+            missing.append("--source")
+        if args.output is None:
+            missing.append("--output")
+        if missing:
+            parser.error(
+                " and ".join(missing) + " required unless --interactive is supplied"
+            )
+
     return args
 
 
@@ -1667,7 +1979,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
     if args.verbose:
         logging.basicConfig(level=logging.INFO)
-    convert(
+
+    if args.interactive:
+        run_interactive_cli(
+            args.source,
+            args.output,
+            r=args.r,
+            r_v=args.rv,
+            top_l=args.topL,
+            original_subdir=args.original_subdir,
+            verbose=args.verbose,
+        )
+        return
+
+    summary = convert(
         args.source,
         args.output,
         r=args.r,
@@ -1676,6 +2001,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         original_subdir=args.original_subdir,
         verbose=args.verbose,
     )
+    if args.print_summary:
+        print(format_summary(summary))
 
 
 if __name__ == "__main__":
