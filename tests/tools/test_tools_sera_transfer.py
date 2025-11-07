@@ -8,6 +8,7 @@ import os
 import pickle
 import random
 import struct
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -302,6 +303,32 @@ def test_cli_verbose_emits_search_hints(tmp_path: Path) -> None:
     assert "Model config keys" in log_output
     assert "d_model" in log_output
     assert "vocab_size" in log_output
+
+
+def test_convert_handles_stat_failure(tmp_path: Path, monkeypatch) -> None:
+    base = _create_checkpoint(tmp_path / "stat_failure_base")
+
+    source = tmp_path / "stat_failure"
+    source.mkdir()
+    shutil.copytree(base, source / "original")
+
+    output = tmp_path / "output"
+
+    original_exists = Path.exists
+    call_count = {"value": 0}
+
+    def flaky_exists(self: Path) -> bool:
+        call_count["value"] += 1
+        if call_count["value"] == 1:
+            raise OSError("mock stat failure")
+        return original_exists(self)
+
+    monkeypatch.setattr(Path, "exists", flaky_exists)
+
+    sera_transfer.convert(source, output, r=4, r_v=2, top_l=2)
+
+    assert call_count["value"] >= 1
+    assert (output / "sera_manifest.bin").exists()
 
 def test_deterministic_conversion(tmp_path: Path) -> None:
     source = _create_checkpoint(tmp_path / "deterministic")
