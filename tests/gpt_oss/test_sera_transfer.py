@@ -192,3 +192,31 @@ def test_convert_honours_original_subdir(tmp_path: Path, monkeypatch):
 
     assert captured_model_path["path"] == export / "model.safetensors"
     assert captured_config["data"]["location"] == "custom"
+
+
+def test_convert_returns_summary(tmp_path: Path, monkeypatch):
+    """`convert` should return a rich summary describing generated artefacts."""
+
+    source = tmp_path / "source"
+    original = source / "original"
+    original.mkdir(parents=True)
+
+    (original / "config.json").write_text(json.dumps({"location": "original"}))
+    (original / "model.safetensors").write_bytes(b"")
+
+    monkeypatch.setattr(sera_transfer, "load_tensors", lambda path: {})
+
+    output = tmp_path / "output"
+    output.mkdir()
+
+    summary = sera_transfer.convert(source, output, verbose=False)
+
+    assert isinstance(summary, sera_transfer.ConversionSummary)
+    assert summary.array_count > 0
+    assert summary.total_bytes >= 0
+    assert summary.manifest_path == output / "sera_manifest.bin"
+    assert any(info.kind == "json" for info in summary.snapshots)
+
+    formatted = sera_transfer.format_summary(summary)
+    assert "Sera Transfer Conversion Summary" in formatted
+    assert str(output) in formatted
