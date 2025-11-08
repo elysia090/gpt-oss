@@ -91,6 +91,46 @@ _TRANSFER_DTYPE_CODES: Dict[int, str] = {
 _CRC32C_TABLE: List[int] = []
 
 
+def _coerce_int(value: object) -> Optional[int]:
+    try:
+        if isinstance(value, bool):
+            return int(value)
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_float(value: object) -> Optional[float]:
+    try:
+        if isinstance(value, bool):
+            return float(value)
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_bytes_like(value: object) -> Optional[bytes]:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    if isinstance(value, str):
+        if value.startswith(_TRANSFER_JSON_BYTES_PREFIX):
+            try:
+                return bytes.fromhex(value[len(_TRANSFER_JSON_BYTES_PREFIX) :])
+            except ValueError:
+                return value.encode("utf-8")
+        return value.encode("utf-8")
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
+        try:
+            return bytes(int(v) & 0xFF for v in value)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _validate_prefix_free(vocabulary: Dict[bytes, int]) -> None:
     """Ensure the vocabulary is prefix-free (spec §2.1).
 
@@ -3099,6 +3139,141 @@ class SeraConfig:
         )
 
 
+def _model_config_to_sera_config(
+    model_config: Mapping[str, object],
+    metadata: Optional[Mapping[str, object]] = None,
+) -> SeraConfig:
+    if not isinstance(model_config, Mapping):
+        raise TypeError("Model config must be a mapping")
+
+    required_keys = {"tokenizer", "attention", "linear"}
+    if required_keys.issubset(model_config.keys()):
+        try:
+            return SeraConfig(**model_config)  # type: ignore[arg-type]
+        except Exception:
+            pass
+
+    base = SeraConfig()
+    meta = metadata if isinstance(metadata, Mapping) else {}
+
+    tokenizer_cfg = base.tokenizer
+    tokenizer_meta = meta.get("tokenizer") if isinstance(meta, Mapping) else None
+    if isinstance(tokenizer_meta, Mapping):
+        pieces_blob = tokenizer_meta.get("pieces")
+        vocabulary: Dict[bytes, int] = {}
+        if isinstance(pieces_blob, Iterable):
+            for entry in pieces_blob:
+                piece: Optional[bytes] = None
+                token_id: Optional[int] = None
+                if isinstance(entry, Mapping):
+                    piece = _coerce_bytes_like(entry.get("piece"))
+                    token_id = _coerce_int(entry.get("token"))
+                elif isinstance(entry, Sequence) and len(entry) >= 2:
+                    piece = _coerce_bytes_like(entry[0])
+                    token_id = _coerce_int(entry[1])
+                if piece is None or token_id is None:
+                    continue
+                vocabulary[piece] = token_id
+        max_piece_length = _coerce_int(tokenizer_meta.get("max_piece_length"))
+        if vocabulary:
+            edit_window = tokenizer_cfg.edit_window
+            if max_piece_length is not None:
+                edit_window = max(edit_window, max_piece_length)
+            tokenizer_cfg = dataclasses.replace(
+                tokenizer_cfg,
+                vocabulary=vocabulary,
+                max_piece_length=max_piece_length
+                if max_piece_length is not None
+                else tokenizer_cfg.max_piece_length,
+                edit_window=edit_window,
+            )
+        elif max_piece_length is not None and max_piece_length > tokenizer_cfg.max_piece_length:
+            tokenizer_cfg = dataclasses.replace(
+                tokenizer_cfg,
+                max_piece_length=max_piece_length,
+                edit_window=max(tokenizer_cfg.edit_window, max_piece_length),
+            )
+
+    d_model = _coerce_int(model_config.get("d_model"))
+    if d_model is None:
+        d_model = _coerce_int(model_config.get("hidden_size"))
+    if d_model is None or d_model <= 0:
+        d_model = base.attention.dim
+
+    attention_cfg = base.attention
+    attention_meta = meta.get("attention") if isinstance(meta, Mapping) else None
+    overlays_meta = meta.get("overlays") if isinstance(meta, Mapping) else None
+    features = None
+    tau = None
+    beta_floor = None
+    if isinstance(attention_meta, Mapping):
+        features = _coerce_int(attention_meta.get("features"))
+        tau = _coerce_float(attention_meta.get("tau"))
+        whitening = attention_meta.get("whitening_sig2")
+        if isinstance(whitening, Sequence):
+            positives: List[float] = []
+            for value in whitening:
+                coerced = _coerce_float(value)
+                if coerced is not None and coerced > 0.0:
+                    positives.append(float(coerced))
+            if positives:
+                beta_floor = max(1e-3, min(positives))
+    if tau is None:
+        tau = _coerce_float(model_config.get("tau"))
+    value_dim = None
+    if isinstance(overlays_meta, Mapping):
+        value_dim = _coerce_int(overlays_meta.get("cols"))
+        if value_dim is None:
+            value_dim = _coerce_int(overlays_meta.get("rank"))
+    if value_dim is None or value_dim <= 0:
+        value_dim = d_model if d_model > 0 else attention_cfg.value_dim
+    if features is None or features <= 0:
+        features = attention_cfg.features
+    if tau is None or tau <= 0.0:
+        tau = attention_cfg.tau
+    if beta_floor is None or beta_floor <= 0.0:
+        beta_floor = attention_cfg.beta_floor
+    attention_cfg = dataclasses.replace(
+        attention_cfg,
+        dim=d_model,
+        value_dim=value_dim,
+        features=features,
+        tau=tau,
+        beta_floor=beta_floor,
+    )
+
+    linear_cfg = base.linear
+    linear_meta = meta.get("linear") if isinstance(meta, Mapping) else None
+    if isinstance(linear_meta, Mapping):
+        capacity_candidates = [linear_cfg.capacity]
+        keys_blob = linear_meta.get("keys")
+        if isinstance(keys_blob, Sequence):
+            capacity_candidates.append(len(keys_blob))
+        slot_lookup = linear_meta.get("slot_lookup")
+        if isinstance(slot_lookup, Mapping):
+            capacity_candidates.append(len(slot_lookup))
+        capacity = max(value for value in capacity_candidates if value > 0)
+        linear_cfg = dataclasses.replace(linear_cfg, capacity=capacity)
+
+    bridge_cfg = base.bridge
+    bridge_meta = meta.get("bridge") if isinstance(meta, Mapping) else None
+    if isinstance(bridge_meta, Mapping):
+        legs = _coerce_int(bridge_meta.get("legs"))
+        if legs is not None and legs > 0:
+            bridge_cfg = dataclasses.replace(
+                bridge_cfg,
+                hub_window=max(bridge_cfg.hub_window, int(legs) * 4),
+            )
+
+    return dataclasses.replace(
+        base,
+        tokenizer=tokenizer_cfg,
+        attention=attention_cfg,
+        linear=linear_cfg,
+        bridge=bridge_cfg,
+    )
+
+
 def _append_window(samples: Tuple[float, ...], window: int, value: float) -> Tuple[float, ...]:
     """Append a value to a bounded window represented as a tuple."""
 
@@ -3611,7 +3786,9 @@ class Sera:
             config_blob = state_blob.get("model_config")
             if not isinstance(config_blob, Mapping):
                 raise ValueError("Transfer snapshot missing model configuration")
-            config = SeraConfig(**config_blob)
+            metadata_blob = state_blob.get("metadata")
+            metadata_map = metadata_blob if isinstance(metadata_blob, Mapping) else None
+            config = _model_config_to_sera_config(config_blob, metadata_map)
             model = cls(config)
 
         metadata: Dict[str, object] = {
