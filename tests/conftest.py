@@ -1,9 +1,12 @@
+import asyncio
+import inspect
 import os
 import sys
 from pathlib import Path
+from typing import Any, Generator
+from unittest.mock import MagicMock, Mock
+
 import pytest
-from typing import Generator, Any
-from unittest.mock import Mock, MagicMock
 from fastapi.testclient import TestClient
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -14,16 +17,16 @@ if str(ROOT_DIR) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from openai_harmony import (
-    HarmonyEncodingName,
-    load_harmony_encoding,
-)
+from openai_harmony import HarmonyEncodingName, HarmonyError, load_harmony_encoding
 from gpt_oss.api.responses.api_server import create_api_server
 
 
 @pytest.fixture(scope="session")
 def harmony_encoding():
-    return load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    try:
+        return load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    except HarmonyError:
+        pytest.skip("Harmony encoding unavailable for tests")
 
 
 @pytest.fixture
@@ -103,7 +106,7 @@ def reset_test_environment():
 @pytest.fixture
 def performance_timer():
     import time
-    
+
     class Timer:
         def __init__(self):
             self.start_time = None
@@ -121,5 +124,25 @@ def performance_timer():
             if self.start_time and self.end_time:
                 return self.end_time - self.start_time
             return None
-    
+
     return Timer()
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "asyncio: mark test as asynchronous")
+
+
+def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
+    testfunction = pyfuncitem.obj
+    if inspect.iscoroutinefunction(testfunction):
+        kwargs = {
+            name: pyfuncitem.funcargs[name]
+            for name in pyfuncitem._fixtureinfo.argnames  # type: ignore[attr-defined]
+        }
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(testfunction(**kwargs))
+        finally:
+            loop.close()
+        return True
+    return None
