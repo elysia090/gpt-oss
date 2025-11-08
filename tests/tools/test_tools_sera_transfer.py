@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import inspect
 import hashlib
 import json
 import os
@@ -15,13 +14,13 @@ from array import array
 from pathlib import Path
 
 import pytest
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import gpt_oss._stubs.safetensors as safetensors_stub
-from gpt_oss._stubs.safetensors.numpy import save_file
+from safetensors.numpy import save_file
 try:
     from gpt_oss.tools import sera_transfer
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
@@ -38,7 +37,11 @@ def _create_vector(length: int, rng: random.Random) -> list[float]:
     return [rng.uniform(-1.0, 1.0) for _ in range(length)]
 
 
-def _sample_checkpoint_contents() -> tuple[dict, dict[str, list]]:
+def _as_numpy_tensors(tensors: dict[str, list]) -> dict[str, np.ndarray]:
+    return {name: np.array(value, dtype=np.float32) for name, value in tensors.items()}
+
+
+def _sample_checkpoint_contents() -> tuple[dict, dict[str, np.ndarray]]:
     config = {
         "d_model": 4,
         "n_heads": 2,
@@ -71,7 +74,7 @@ def _sample_checkpoint_contents() -> tuple[dict, dict[str, list]]:
 
     tensors["tok_embeddings.weight"] = _create_matrix(config["vocab_size"], config["d_model"], rng)
     config["layers"] = layers
-    return config, tensors
+    return config, _as_numpy_tensors(tensors)
 
 
 def _create_checkpoint(root: Path) -> Path:
@@ -80,7 +83,7 @@ def _create_checkpoint(root: Path) -> Path:
 
     config, tensors = _sample_checkpoint_contents()
     (source / "config.json").write_text(json.dumps(config))
-    save_file(tensors, source / "model.safetensors")
+    save_file(_as_numpy_tensors(tensors), source / "model.safetensors")
     return source
 
 
@@ -99,7 +102,7 @@ def _create_openai_checkpoint(root: Path) -> Path:
     (source / "config.json").write_text(json.dumps(config))
 
     rng = random.Random(0)
-    tensors = {}
+    tensors: dict[str, list] = {}
     for idx in range(2):
         prefix = f"model.layers.{idx}"
         attn = f"{prefix}.attention"
@@ -114,7 +117,7 @@ def _create_openai_checkpoint(root: Path) -> Path:
         tensors[f"{mlp}.down_proj.bias"] = _create_vector(4, rng)
 
     tensors["tok_embeddings.weight"] = _create_matrix(config["vocab_size"], config["d_model"], rng)
-    save_file(tensors, source / "model.safetensors")
+    save_file(_as_numpy_tensors(tensors), source / "model.safetensors")
     return source
 
 
@@ -193,54 +196,52 @@ def gpt_oss_mxfp4_layout() -> tuple[dict[str, object], dict[str, list]]:
 def test_load_tensors_requires_safetensors(tmp_path, monkeypatch):
     module = importlib.reload(sera_transfer)
 
-    # Force the stub to be used so that binary payloads trigger the guidance.
-    monkeypatch.setattr(module, "safe_open", safetensors_stub.safe_open)
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"")
 
-    binary_checkpoint = tmp_path / "model.safetensors"
-    binary_checkpoint.write_bytes(b"BIN\x00\x01")
+    def missing_safe_open(*args, **kwargs):  # noqa: ARG001
+        raise ModuleNotFoundError(module._SAFETENSORS_MISSING_MSG)
+
+    monkeypatch.setattr(module, "safe_open", missing_safe_open)
 
     with pytest.raises(ModuleNotFoundError) as excinfo:
-        module.load_tensors(binary_checkpoint)
+        module.load_tensors(checkpoint)
 
-    message = str(excinfo.value)
-    assert "pip install safetensors" in message
-
-    importlib.reload(sera_transfer)
+    assert "pip install safetensors" in str(excinfo.value)
 
 
-def test_load_tensors_stub_passes_python_framework(tmp_path, monkeypatch):
+def test_load_tensors_passes_numpy_framework(tmp_path, monkeypatch):
     module = importlib.reload(sera_transfer)
 
-    assert module.safe_open is not None
-    assert module._looks_like_repo_stub_safe_open(module.safe_open)
+    calls: list[str] = []
 
-    original_safe_open = safetensors_stub.safe_open
-    calls: list[tuple[str, str | None]] = []
+    class _FakeSafeFile:
+        def __enter__(self):
+            return self
 
-    def recording_safe_open(*args, **kwargs):
-        if len(args) >= 2:
-            calls.append(("positional", args[1]))
-        else:
-            calls.append(("keyword", kwargs.get("framework")))
-        return original_safe_open(*args, **kwargs)
+        def __exit__(self, exc_type, exc, tb):
+            return False
 
-    recording_safe_open.__module__ = original_safe_open.__module__
+        def keys(self):
+            return ["foo"]
+
+        def get_tensor(self, key):
+            assert key == "foo"
+            return [[1.0, 2.0]]
+
+    def recording_safe_open(path, framework="numpy", **kwargs):  # noqa: ARG001
+        calls.append(framework)
+        return _FakeSafeFile()
 
     monkeypatch.setattr(module, "safe_open", recording_safe_open)
 
-    payload = {
-        "tensors": {
-            "foo": {"shape": [1, 2], "data": [1.0, 2.0]},
-        }
-    }
     checkpoint = tmp_path / "model.safetensors"
-    checkpoint.write_text(json.dumps(payload))
+    checkpoint.write_bytes(b"")
 
     tensors = module.load_tensors(checkpoint)
 
-    tensor = tensors["foo"]
-    assert tensor == [[1.0, 2.0]]
-    assert calls == [("positional", "python")]
+    assert tensors["foo"] == [[1.0, 2.0]]
+    assert calls == ["numpy"]
 
 
 def test_load_tensors_keyword_only_safe_open_backward_compat(tmp_path, monkeypatch):
@@ -310,293 +311,9 @@ def test_load_tensors_keyword_only_safe_open_backward_compat(tmp_path, monkeypat
     tensor = tensors["foo"]
     assert isinstance(tensor, _FakeTensor)
     assert tensor.tolist() == payload["foo"]
-    assert calls == [("keyword", "pt")]
+    assert calls == [("keyword", "numpy")]
 
 
-def test_load_tensors_prefers_real_safetensors_when_available(tmp_path, monkeypatch):
-    module = importlib.reload(sera_transfer)
-
-    assert module.safe_open is not None
-    assert module._looks_like_repo_stub_safe_open(module.safe_open)
-
-    for name in list(sys.modules):
-        if name == "safetensors" or name.startswith("safetensors."):
-            monkeypatch.delitem(sys.modules, name, raising=False)
-
-    real_impl_root = tmp_path / "real_impl"
-    real_pkg = real_impl_root / "safetensors"
-    real_pkg.mkdir(parents=True)
-    (real_pkg / "__init__.py").write_text(
-        """
-import pickle
-from pathlib import Path
-
-
-class SafetensorError(RuntimeError):
-    pass
-
-
-class _FakeSafeFile:
-    def __init__(self, path):
-        raw = Path(path).read_bytes()
-        if not raw.startswith(b"BIN"):
-            raise SafetensorError("Unexpected payload")
-        loaded = pickle.loads(raw[3:])
-        self._tensors = {key: _FakeTensor(value) for key, value in loaded.items()}
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-    def keys(self):
-        return list(self._tensors.keys())
-
-    def get_tensor(self, key):
-        return self._tensors[key]
-
-
-class _FakeTensor:
-    def __init__(self, payload):
-        self._payload = payload
-
-    def tolist(self):
-        return self._payload
-
-
-def safe_open(path, framework="pt", **kwargs):
-    if framework != "pt":
-        raise SafetensorError(f"Unexpected framework: {framework!r}")
-    return _FakeSafeFile(path)
-"""
-    )
-
-    monkeypatch.syspath_prepend(str(real_impl_root))
-    importlib.invalidate_caches()
-
-    expected = {"foo": [[1.0, 2.0], [3.0, 4.0]]}
-    payload = pickle.dumps(expected)
-    checkpoint = tmp_path / "model.safetensors"
-    checkpoint.write_bytes(b"BIN" + payload)
-
-    tensors = module.load_tensors(checkpoint)
-    assert tensors.keys() == expected.keys()
-    for name, tensor in tensors.items():
-        assert hasattr(tensor, "tolist")
-        assert tensor.tolist() == expected[name]
-
-    safe_open_fn = module._resolve_safe_open()
-    assert not module._looks_like_repo_stub_safe_open(safe_open_fn)
-    owning_module = inspect.getmodule(safe_open_fn)
-    assert owning_module is not None
-    assert Path(owning_module.__file__).resolve().parent == real_pkg.resolve()
-
-    for name in list(sys.modules):
-        if name == "safetensors" or name.startswith("safetensors."):
-            sys.modules.pop(name, None)
-
-    monkeypatch.undo()
-    importlib.reload(sera_transfer)
-
-
-def test_resolve_safe_open_prefers_real_wheel(tmp_path, monkeypatch):
-    module = importlib.reload(sera_transfer)
-
-    assert module.safe_open is not None
-    assert module._looks_like_repo_stub_safe_open(module.safe_open)
-
-    # Ensure the cached resolver currently points at the repository stub.
-    initial = module._resolve_safe_open()
-    assert module._looks_like_repo_stub_safe_open(initial)
-    assert initial is module.safe_open
-
-    real_root = tmp_path / "real_wheel"
-    real_pkg = real_root / "safetensors"
-    real_pkg.mkdir(parents=True)
-    (real_pkg / "__init__.py").write_text(
-        """
-from pathlib import Path
-
-
-class _FakeTensor:
-    def __init__(self, payload):
-        self._payload = payload
-
-    def tolist(self):
-        return self._payload
-
-
-class _FakeSafeFile:
-    def __init__(self, path):
-        raw = Path(path).read_bytes()
-        if raw != b"real":
-            raise SafetensorError("Unexpected payload")
-        self._payload = {"foo": _FakeTensor([[1.0]])}
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-    def keys(self):
-        return list(self._payload.keys())
-
-    def get_tensor(self, key):
-        return self._payload[key]
-
-
-class SafetensorError(RuntimeError):
-    pass
-
-
-def safe_open(path, framework="pt", **kwargs):
-    if framework != "pt":
-        raise SafetensorError(f"Unexpected framework: {framework!r}")
-    return _FakeSafeFile(path)
-"""
-    )
-
-    monkeypatch.syspath_prepend(str(real_root))
-    importlib.invalidate_caches()
-
-    # Ensure the stub is currently loaded to simulate an environment upgrade.
-    assert module._looks_like_repo_stub_safe_open(module.safe_open)
-
-    # Create a dummy file that only the real implementation accepts.
-    checkpoint = tmp_path / "model.safetensors"
-    checkpoint.write_bytes(b"real")
-
-    try:
-        resolved = module._resolve_safe_open()
-        assert not module._looks_like_repo_stub_safe_open(resolved)
-        owning_module = inspect.getmodule(resolved)
-        assert owning_module is not None
-        assert Path(owning_module.__file__).resolve().parent == real_pkg.resolve()
-
-        with resolved(checkpoint) as handle:
-            assert handle.keys() == ["foo"]
-            tensor = handle.get_tensor("foo")
-            assert tensor.tolist() == [[1.0]]
-    finally:
-        for name in list(sys.modules):
-            if name == "safetensors" or name.startswith("safetensors."):
-                sys.modules.pop(name, None)
-        monkeypatch.undo()
-        importlib.reload(sera_transfer)
-
-
-@pytest.mark.parametrize("mode", ["stub", "wheel"])
-def test_convert_handles_stub_and_real_safetensors(tmp_path, monkeypatch, mode):
-    module = importlib.reload(sera_transfer)
-
-    source = tmp_path / "source"
-    output = tmp_path / "output"
-    source.mkdir()
-    output.mkdir()
-
-    config, tensors = _sample_checkpoint_contents()
-    (source / "config.json").write_text(json.dumps(config))
-
-    if mode == "stub":
-        stub_safe_open = safetensors_stub.safe_open
-        monkeypatch.setattr(module, "_resolve_safe_open", lambda: stub_safe_open)
-
-        payload = {
-            "tensors": {
-                key: {"shape": _tensor_shape(value), "data": _flatten_tensor(value)}
-                for key, value in tensors.items()
-            }
-        }
-        (source / "model.safetensors").write_text(json.dumps(payload))
-    else:
-        fake_impl = tmp_path / "fake_safetensors.py"
-        fake_impl.write_text(
-            """
-import pickle
-from pathlib import Path
-
-
-class SafetensorError(RuntimeError):
-    pass
-
-
-class _FakeTensor:
-    def __init__(self, payload):
-        self._payload = payload
-
-    def tolist(self):
-        return self._payload
-
-    def __len__(self):
-        return len(self._payload)
-
-    def __iter__(self):
-        return iter(self._payload)
-
-    def __getitem__(self, index):
-        return self._payload[index]
-
-    @property
-    def shape(self):
-        dims = []
-        current = self._payload
-        while isinstance(current, list):
-            dims.append(len(current))
-            if not current:
-                break
-            current = current[0]
-        return tuple(dims)
-
-
-class _FakeSafeFile:
-    def __init__(self, path):
-        raw = Path(path).read_bytes()
-        if not raw.startswith(b"BIN"):
-            raise SafetensorError("Unexpected payload")
-        payload = pickle.loads(raw[3:])
-        self._payload = {key: _FakeTensor(value) for key, value in payload.items()}
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-    def keys(self):
-        return list(self._payload.keys())
-
-    def get_tensor(self, key):
-        return self._payload[key]
-
-
-def safe_open(path, framework="pt", **kwargs):
-    if framework != "pt":
-        raise SafetensorError(f"Unexpected framework: {framework!r}")
-    return _FakeSafeFile(path)
-"""
-        )
-        spec = importlib.util.spec_from_file_location("fake_safetensors", fake_impl)
-        assert spec is not None and spec.loader is not None
-        fake_module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = fake_module
-        spec.loader.exec_module(fake_module)
-        fake_safe_open = fake_module.safe_open
-        monkeypatch.setattr(module, "_resolve_safe_open", lambda: fake_safe_open)
-
-        (source / "model.safetensors").write_bytes(b"BIN" + pickle.dumps(tensors))
-
-    safe_open_fn = module._resolve_safe_open()
-    assert module._looks_like_repo_stub_safe_open(safe_open_fn) is (mode == "stub")
-
-    tensors_loaded = module.load_tensors(source / "model.safetensors")
-    assert tensors_loaded.keys() == tensors.keys()
-
-    summary = module.convert(source, output, r=4, r_v=2, top_l=2)
-    assert summary.manifest_path.exists()
-    assert summary.output == output
-    assert summary.total_bytes > 0
 
 def test_model_config_accepts_hf_config_fields() -> None:
     config = {
@@ -618,6 +335,7 @@ def test_model_config_accepts_hf_config_fields() -> None:
         "model.layers.0.mlp.gate_proj.bias": _create_vector(8, rng),
         "model.layers.0.mlp.down_proj.bias": _create_vector(4, rng),
     }
+    tensors = _as_numpy_tensors(tensors)
 
     cfg = sera_transfer.ModelConfig.from_dict(config, tensors=tensors)
 
@@ -654,6 +372,8 @@ def test_model_config_infers_layers_from_generic_suffixes() -> None:
         "layer00.up_proj.bias": _create_vector(8, rng),
         "layer00.down_proj.bias": _create_vector(4, rng),
     }
+    tensors = _as_numpy_tensors(tensors)
+    tensors = _as_numpy_tensors(tensors)
 
     cfg = sera_transfer.ModelConfig.from_dict(config, tensors=tensors)
 
@@ -677,7 +397,7 @@ def test_model_config_splits_fused_qkv_weights() -> None:
     }
 
     rng = random.Random(2)
-    qkv_weight = _create_matrix(12, 4, rng)
+    qkv_weight = np.array(_create_matrix(12, 4, rng), dtype=np.float32)
     tensors = {
         "model.layers.0.attention.qkv.weight": qkv_weight,
         "model.layers.0.attention.o_proj.weight": _create_matrix(4, 4, rng),
@@ -686,6 +406,7 @@ def test_model_config_splits_fused_qkv_weights() -> None:
         "model.layers.0.mlp.gate_proj.bias": _create_vector(8, rng),
         "model.layers.0.mlp.down_proj.bias": _create_vector(4, rng),
     }
+    tensors = _as_numpy_tensors(tensors)
 
     cfg = sera_transfer.ModelConfig.from_dict(config, tensors=tensors)
 
@@ -699,9 +420,9 @@ def test_model_config_splits_fused_qkv_weights() -> None:
     w_q = tensors[layer.w_q]
     w_k = tensors[layer.w_k]
     w_v = tensors[layer.w_v]
-    assert w_q == qkv_weight[:4]
-    assert w_k == qkv_weight[4:8]
-    assert w_v == qkv_weight[8:]
+    assert np.allclose(w_q, qkv_weight[:4])
+    assert np.allclose(w_k, qkv_weight[4:8])
+    assert np.allclose(w_v, qkv_weight[8:])
 
 
 def test_model_config_infers_head_dim_from_qkv_tensor() -> None:
@@ -713,7 +434,7 @@ def test_model_config_infers_head_dim_from_qkv_tensor() -> None:
     }
 
     rng = random.Random(3)
-    qkv_weight = _create_matrix(16, 4, rng)
+    qkv_weight = np.array(_create_matrix(16, 4, rng), dtype=np.float32)
     tensors = {
         "model.layers.0.attention.qkv.weight": qkv_weight,
         "model.layers.0.attention.o_proj.weight": _create_matrix(4, 4, rng),
@@ -722,14 +443,15 @@ def test_model_config_infers_head_dim_from_qkv_tensor() -> None:
         "model.layers.0.mlp.gate_proj.bias": _create_vector(8, rng),
         "model.layers.0.mlp.down_proj.bias": _create_vector(4, rng),
     }
+    tensors = _as_numpy_tensors(tensors)
 
     cfg = sera_transfer.ModelConfig.from_dict(config, tensors=tensors)
 
     assert cfg.head_dim == 4
     layer = cfg.layers[0]
-    assert tensors[layer.w_q] == qkv_weight[:8]
-    assert tensors[layer.w_k] == qkv_weight[8:12]
-    assert tensors[layer.w_v] == qkv_weight[12:]
+    assert np.allclose(tensors[layer.w_q], qkv_weight[:8])
+    assert np.allclose(tensors[layer.w_k], qkv_weight[8:12])
+    assert np.allclose(tensors[layer.w_v], qkv_weight[12:])
 
 
 def test_model_config_infers_kv_heads_from_gpt_oss_20b_shape() -> None:
@@ -1042,7 +764,7 @@ def test_convert_preserves_optional_config_metadata(tmp_path: Path) -> None:
     }
 
     (source / "config.json").write_text(json.dumps(config))
-    save_file(tensors, source / "model.safetensors")
+    save_file(_as_numpy_tensors(tensors), source / "model.safetensors")
 
     output = tmp_path / "output"
     sera_transfer.convert(source, output, r=4, r_v=2, top_l=2)
@@ -1126,7 +848,11 @@ def test_format_model_config_keys_preserves_remaining_order() -> None:
 
 def test_cli_reports_missing_safetensors(tmp_path: Path, monkeypatch, capsys) -> None:
     module = importlib.reload(sera_transfer)
-    monkeypatch.setattr(module, "_resolve_safe_open", lambda: safetensors_stub.safe_open)
+
+    def missing_safe_open(*args, **kwargs):  # noqa: ARG001
+        raise ModuleNotFoundError(module._SAFETENSORS_MISSING_MSG)
+
+    monkeypatch.setattr(module, "safe_open", missing_safe_open)
 
     source = tmp_path / "binary_source"
     source.mkdir()
@@ -1192,9 +918,10 @@ def test_convert_handles_stat_failure(tmp_path: Path, monkeypatch) -> None:
     call_count = {"value": 0}
 
     def flaky_exists(self: Path) -> bool:
-        call_count["value"] += 1
-        if call_count["value"] == 1:
-            raise OSError("mock stat failure")
+        if self == output:
+            call_count["value"] += 1
+            if call_count["value"] == 1:
+                raise OSError("mock stat failure")
         return original_exists(self)
 
     monkeypatch.setattr(Path, "exists", flaky_exists)
@@ -1204,110 +931,6 @@ def test_convert_handles_stat_failure(tmp_path: Path, monkeypatch) -> None:
     assert call_count["value"] >= 1
     assert (output / "sera_manifest.bin").exists()
 
-
-def test_convert_supports_stub_and_wheel_safe_open(tmp_path: Path, monkeypatch) -> None:
-    module = importlib.reload(sera_transfer)
-
-    stub_config, stub_tensors = _sample_checkpoint_contents()
-    stub_source = tmp_path / "stub_source"
-    stub_source.mkdir()
-    (stub_source / "config.json").write_text(json.dumps(stub_config))
-    stub_payload = {
-        "tensors": {
-            name: {"shape": _tensor_shape(data), "data": _flatten_tensor(data)}
-            for name, data in stub_tensors.items()
-        }
-    }
-    (stub_source / "model.safetensors").write_text(json.dumps(stub_payload))
-
-    stub_frameworks: list[str] = []
-    stub_safe_open = safetensors_stub.safe_open
-
-    def recording_stub_safe_open(path, framework="python", **kwargs):
-        stub_frameworks.append(framework)
-        return stub_safe_open(path, framework=framework, **kwargs)
-
-    recording_stub_safe_open.__module__ = getattr(
-        stub_safe_open, "__module__", "gpt_oss._stubs.safetensors"
-    )
-
-    monkeypatch.setattr(module, "_resolve_safe_open", lambda: recording_stub_safe_open)
-
-    stub_output = tmp_path / "stub_output"
-    module.convert(stub_source, stub_output, r=4, r_v=2, top_l=2)
-    assert stub_frameworks == ["python"]
-    assert (stub_output / "sera_manifest.bin").exists()
-
-    wheel_config, wheel_tensors = _sample_checkpoint_contents()
-    wheel_source = tmp_path / "wheel_source"
-    wheel_source.mkdir()
-    (wheel_source / "config.json").write_text(json.dumps(wheel_config))
-    wheel_source.joinpath("model.safetensors").write_bytes(b"BIN" + pickle.dumps(wheel_tensors))
-
-    wheel_frameworks: list[str] = []
-
-    class _WheelTensor:
-        def __init__(self, payload):
-            self._payload = payload
-
-        def tolist(self):
-            return self._payload
-
-        def __len__(self):
-            return len(self._payload)
-
-        def __iter__(self):
-            return iter(self._payload)
-
-        def __getitem__(self, index):
-            return self._payload[index]
-
-        @property
-        def shape(self):
-            dims: list[int] = []
-            current = self._payload
-            while isinstance(current, list):
-                dims.append(len(current))
-                if not current:
-                    break
-                current = current[0]
-            return tuple(dims)
-
-    class _WheelSafeFile:
-        def __init__(self, path, *, framework="numpy"):
-            wheel_frameworks.append(framework)
-            if framework != "numpy":
-                raise RuntimeError(f"Unexpected framework: {framework!r}")
-            raw = Path(path).read_bytes()
-            if not raw.startswith(b"BIN"):
-                raise ValueError("Unexpected payload")
-            loaded = pickle.loads(raw[3:])
-            self._tensors = {
-                key: _WheelTensor(value)
-                for key, value in loaded.items()
-            }
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def keys(self):
-            return list(self._tensors.keys())
-
-        def get_tensor(self, key):
-            return self._tensors[key]
-
-    def fake_safe_open(path, framework="numpy", **kwargs):
-        return _WheelSafeFile(path, framework=framework)
-
-    monkeypatch.setattr(module, "_resolve_safe_open", lambda: fake_safe_open)
-
-    wheel_output = tmp_path / "wheel_output"
-    module.convert(wheel_source, wheel_output, r=4, r_v=2, top_l=2)
-    assert wheel_frameworks == ["numpy"]
-    assert (wheel_output / "sera_manifest.bin").exists()
 
 def test_deterministic_conversion(tmp_path: Path) -> None:
     source = _create_checkpoint(tmp_path / "deterministic")
@@ -1458,12 +1081,12 @@ def test_array_checksums_regression(tmp_path: Path) -> None:
     }
 
     expected = {
-        "R_init.bin": "c1e397da306abc45e5fbe4f03330dab17cceb14a5c46561e3f51f7fc4a1f90e8",
-        "T_1.bin": "df5225054cae663ff1c726d803091622ffc765309c9e9b9e573c0bbd08105a37",
-        "T_2.bin": "067fece1127c0e37ff0bf1ff566b727f33dd3f5d5ba15431916b61adfebc2e5b",
-        "T_3.bin": "581fca69ff42c2b69b83ba1f128513e611ee8238448e0eb920a820e74b78de1a",
-        "T_4.bin": "1147d97ec1eae29ec741abdaabfb36c6db64485f9a5438e51a4656f98c6eb3ec",
-        "bridge_hubs.bin": "278257c861ac4de67792e075d1fc4b5d35cf9c2dace8a552c2b806968bbeb70a",
+        "R_init.bin": "fff3e23f6f09f684eaed383e8541a0ed6ebc70c70cae1c3630f01207c2d647cb",
+        "T_1.bin": "73eb364a1ab3b1fac44c3d8a4da823cfdc2271066b656124a03f3cb092acb172",
+        "T_2.bin": "43c497f02b244bda3e8e6c2e6f6de5c91d08c569684d155e361e551d3fb46486",
+        "T_3.bin": "0b180863ee0bc0ce88de74fbd47db8aebceed56d74a6b6eefd9416c589e0d327",
+        "T_4.bin": "376bb3022eb0bbd669e8caa915a162d23c62f3ae649814fb9bc2287e63f1c50d",
+        "bridge_hubs.bin": "543bf02d15f2d094217ea7c5e4cde813fbc25c09205c77d98169e4af9e861471",
         "bridge_qDin.bin": "ec0707f8cb38f54984497a0b51793e36473107ba8d294f96ac96164f5df4d1bd",
         "bridge_qDout.bin": "e2cb6dd3cda429569e818f29e4b102d9b5006f30e646d42460440922f1b55e32",
         "cuckoo_delta.bin": "a80189f45efc8626983c04226824ce57d66d8951d0711b27eb68125250a73d01",
@@ -1471,17 +1094,17 @@ def test_array_checksums_regression(tmp_path: Path) -> None:
         "linear_bias.bin": "1d9e0bc18f8893dee78d668f460c9385b3dd6e469c55c79bce634fd16a74e8ce",
         "linear_keys.bin": "1518b6e567af558a19594c82a37d7fedbeb5dfee23a48713a8733b8a997556a6",
         "linear_mphf.bin": "f956fb7578c0cbdd582777104c27a351021d4f1d4c7bc065727b68f54c7962c0",
-        "linear_weights.bin": "4ab874407f08958d85d2c0d0d6dec78366177538e4d0cb1662da81e98ed5a7f3",
+        "linear_weights.bin": "2a5737160321eb22b3ead2b20b6321c0628a263236eb9f0178681c2bf8326228",
         "memory_coeff.bin": "74e0abc5d53491b7328071ae92df330f5caaeec0d9cd183a2c583b2ea8e6b9e3",
-        "overlays_DeltaW.bin": "d154e8363c23c577f20ce3d845b8f3e635ffeac9f9ee1c9fed46191b5d8eab62",
-        "overlays_H.bin": "cc6c5558ac91886a9a65e73946a9037f3690a6af9889b297546d870d3998c058",
-        "overlays_U.bin": "877425be63ca60e31d1e668d384bcde42fe19c2ec2793856143f83b6e7e87aff",
-        "peer_scores.bin": "a2336c64b60dbc69d3353f8db55a2c07f280ae1859056482cbcfb6b209726820",
-        "prf_W.bin": "fc6134f0ec03aff0ca21bfc7e0a5a2c70afa8c73ab290f7b694fd9f008fe293b",
+        "overlays_DeltaW.bin": "c91aa3aa9f4060f051742a4bbc042b809702e4e52bf4a4ebfdfc8e316003a9f9",
+        "overlays_H.bin": "f7f38e43f4115082900d582263e3139a09064e81925e3232389bc14be971e979",
+        "overlays_U.bin": "d7c5f448fd374053c01203592454ebee8881a0a42b31ce6a4c30eb0a2eff1101",
+        "peer_scores.bin": "8264d6742c8b68a793ba8e111de9fff94e665a570b14823c6b117698bdb01e16",
+        "prf_W.bin": "cebae16fe13b3f0e1b6119a02eaeea04e4f478702edb435de5a9571d84d6de81",
         "s_init.bin": "4d848697b5664465351e1ba48be3e74ad691e88b1260ccb3e0b73db7118f55c4",
-        "tokenizer_fst.bin": "45da3c4be5bdb7c344bb6e2ede224d877de3e51d50e39788e98a437dc7109d2e",
+        "tokenizer_fst.bin": "bdf9b3bcb482cc598a1c3d91236c3f4bcb40bda5338deabe5b95b321998a192f",
         "whitening_mu.bin": "374708fff7719dd5979ec875d56cd2286f6d3cf7ec317a3b25632aab28ec37bb",
-        "whitening_sig2.bin": "3c6add9ce200ba6e99cb568fd4213c456fc2e4b79d36d82eefad6705493b265a",
+        "whitening_sig2.bin": "5f322bcb08ace86b1f79dc91756db00079d156d568e71797eb952dd7a73ad9cd",
     }
 
     assert checksums == expected

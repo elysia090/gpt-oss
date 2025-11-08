@@ -5,9 +5,10 @@ import random
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
-from gpt_oss._stubs.safetensors.numpy import save_file
+from safetensors.numpy import save_file
 
 try:
     from gpt_oss.tools import sera_transfer
@@ -58,7 +59,7 @@ def _create_checkpoint(root: Path) -> Path:
     }
     layers = []
     rng = random.Random(42)
-    tensors = {}
+    tensors: dict[str, list] = {}
     for idx in range(2):
         prefix = f"layers.{idx}"
         layer = {
@@ -81,7 +82,8 @@ def _create_checkpoint(root: Path) -> Path:
     tensors["tok_embeddings.weight"] = _create_matrix(config["vocab_size"], config["d_model"], rng)
     config["layers"] = layers
     (source / "config.json").write_text(json.dumps(config))
-    save_file(tensors, source / "model.safetensors")
+    array_tensors = {name: np.array(value, dtype=np.float32) for name, value in tensors.items()}
+    save_file(array_tensors, source / "model.safetensors")
     return source
 
 

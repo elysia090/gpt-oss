@@ -46,8 +46,11 @@ from typing import (
 
 try:  # pragma: no cover - exercised indirectly by the tests
     import numpy as np
-except ModuleNotFoundError:  # pragma: no cover - deterministic fallback for test envs
-    from gpt_oss._compat import numpy_stub as np
+except ModuleNotFoundError as exc:  # pragma: no cover - deterministic error message
+    raise ModuleNotFoundError(
+        "The numpy package is required for the Sera runtime. "
+        "Install it with 'pip install numpy'."
+    ) from exc
 import hashlib
 import json
 import zlib

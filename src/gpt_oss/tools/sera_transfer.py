@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
-import inspect
 import importlib.util
 import io
 import json
@@ -23,26 +22,15 @@ from pathlib import Path
 from collections.abc import MutableMapping
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
-try:  # pragma: no cover - exercised indirectly in environments with safetensors
-    from safetensors import safe_open as _real_safe_open
-except ModuleNotFoundError:  # pragma: no cover - exercised in environments without safetensors
-    _real_safe_open = None
+_SAFETENSORS_MISSING_MSG = (
+    "The `safetensors` package is required for Sera conversion. "
+    "Install it with 'pip install safetensors'."
+)
 
-from functools import wraps
-
-from gpt_oss._stubs.safetensors import is_stub_safe_open, safe_open as _stub_safe_open
-
-
-@wraps(_stub_safe_open)
-def _default_stub_safe_open(*args, **kwargs):
-    return _stub_safe_open(*args, **kwargs)
-
-
-_default_stub_safe_open.__gpt_oss_stub__ = getattr(_stub_safe_open, "__gpt_oss_stub__", True)
-_default_stub_safe_open.__module__ = getattr(_stub_safe_open, "__module__", _default_stub_safe_open.__module__)
-_default_stub_safe_open.__gpt_oss_default_stub__ = True  # type: ignore[attr-defined]
-
-safe_open = _default_stub_safe_open  # type: ignore[assignment]
+try:  # pragma: no cover - exercised indirectly when safetensors is installed
+    from safetensors import safe_open
+except ModuleNotFoundError as exc:  # pragma: no cover - deterministic error message
+    raise ModuleNotFoundError(_SAFETENSORS_MISSING_MSG) from exc
 
 _NUMPY_MISSING_MSG = (
     "The numpy package is required for Sera conversion. Install it with 'pip install numpy'."
@@ -56,7 +44,7 @@ else:  # pragma: no cover - executed when numpy is available
     _missing_numpy_apis = [
         name for name in ("stack", "ldexp", "split") if not hasattr(_np, name)
     ]
-    if getattr(_np, "__gpt_oss_numpy_stub__", False) or _missing_numpy_apis:
+    if _missing_numpy_apis:
         raise ModuleNotFoundError(_NUMPY_MISSING_MSG)
 
 try:  # pragma: no cover - optional dependency
@@ -109,22 +97,6 @@ def _parse_qkv_component(name: str) -> Tuple[str, str] | None:
         return None
     base, role = name.rsplit(_QKV_COMPONENT_MARKER, 1)
     return base, role
-
-
-def _looks_like_repo_stub_safe_open(func) -> bool:
-    if func is None:
-        return False
-
-    if is_stub_safe_open(func):
-        return True
-
-    module = inspect.getmodule(func)
-    module_name = getattr(module, "__name__", None)
-    if module_name == "gpt_oss._stubs.safetensors":
-        return True
-
-    return False
-
 def _load_sera_runtime():
     sera_path = Path(__file__).resolve().parents[1] / "inference" / "sera.py"
     spec = importlib.util.spec_from_file_location("_sera_runtime", sera_path)
@@ -1729,118 +1701,11 @@ class ModelConfig:
 # Tensor utilities
 
 
-_SAFETENSORS_MISSING_MSG = (
-    "The `safetensors` package is required to load model checkpoints. "
-    "Install the official wheel (for example, via `pip install safetensors`) to "
-    "handle binary `model.safetensors` payloads or provide a preloaded tensor map. "
-    "The repository bundles a JSON-only stub strictly for tests."
-)
-
-
-def _resolve_safe_open():
-    global safe_open
-
-    if safe_open is not None and not _looks_like_repo_stub_safe_open(safe_open):
-        return safe_open
-
-    if safe_open is not None and _looks_like_repo_stub_safe_open(safe_open):
-        if _real_safe_open is not None and safe_open is not _real_safe_open:
-            if not getattr(safe_open, "__gpt_oss_default_stub__", False):
-                # The environment already provided the real ``safetensors``
-                # implementation when the module was imported. Reaching this
-                # branch therefore means callers intentionally replaced
-                # ``safe_open`` with the repository stub (for example, in
-                # tests). Respect the override instead of importing the wheel
-                # again.
-                return safe_open
-
-        try:
-            existing_module = sys.modules.get("safetensors")
-            if existing_module is not None:
-                module_name = getattr(existing_module, "__name__", "")
-                if module_name == "gpt_oss._stubs.safetensors":
-                    sys.modules.pop("safetensors", None)
-            from safetensors import safe_open as imported_safe_open
-        except ModuleNotFoundError:
-            return safe_open
-
-        if _looks_like_repo_stub_safe_open(imported_safe_open):
-            return safe_open
-
-        safe_open = imported_safe_open
-        return safe_open
-
-    try:
-        from safetensors import safe_open as imported_safe_open
-    except ModuleNotFoundError:
-        safe_open = _stub_safe_open
-    else:
-        safe_open = imported_safe_open
-
-    return safe_open
-
-
 def load_tensors(path: Path) -> Dict[str, TensorLike]:
-    safe_open_fn = _resolve_safe_open()
-
-    safe_open_is_stub = _looks_like_repo_stub_safe_open(safe_open_fn)
-    stub_hint = _SAFETENSORS_MISSING_MSG
-
-    if safe_open_is_stub:
-        try:
-            with path.open("rb") as fh:
-                sample = fh.read(1024)
-        except OSError:
-            sample = b""
-
-        if sample and not sample.lstrip().startswith(b"{"):
-            raise ModuleNotFoundError(stub_hint)
-
     tensors: Dict[str, TensorLike] = {}
-
-    try:
-        framework_value: Optional[str]
-
-        try:
-            signature = inspect.signature(safe_open_fn)
-        except (TypeError, ValueError):  # pragma: no cover - builtins and mocks
-            framework_value = "python" if safe_open_is_stub else "pt"
-        else:
-            parameter = signature.parameters.get("framework")
-            if parameter is not None:
-                if parameter.default is inspect._empty:
-                    framework_value = "python" if safe_open_is_stub else "pt"
-                else:
-                    framework_value = parameter.default
-            elif any(
-                param.kind is inspect.Parameter.VAR_KEYWORD
-                for param in signature.parameters.values()
-            ):
-                framework_value = "python" if safe_open_is_stub else "pt"
-            else:
-                framework_value = None
-
-        def _open_file():
-            if framework_value is None:
-                return safe_open_fn(path)
-
-            try:
-                return safe_open_fn(path, framework_value)
-            except TypeError as exc:
-                try:
-                    return safe_open_fn(path, framework=framework_value)
-                except TypeError:
-                    raise exc
-
-        with _open_file() as f:
-            for key in f.keys():
-                # Preserve the tensor in its native representation (e.g. numpy or torch)
-                # so that downstream stages can leverage zero-copy views when available.
-                tensors[key] = f.get_tensor(key)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        if safe_open_is_stub:
-            raise ModuleNotFoundError(stub_hint) from exc
-        raise
+    with safe_open(path, framework="numpy") as tensor_file:
+        for key in tensor_file.keys():
+            tensors[key] = tensor_file.get_tensor(key)
     return tensors
 
 
@@ -2435,7 +2300,10 @@ def convert(
     source = _normalise_path(source)
     output = _normalise_path(output)
 
-    created_output_dir = not output.exists()
+    try:
+        created_output_dir = not output.exists()
+    except OSError:
+        created_output_dir = True
     output.mkdir(parents=True, exist_ok=True)
 
     if verbose and not logging.getLogger().handlers:

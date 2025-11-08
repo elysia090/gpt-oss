@@ -19,8 +19,9 @@ if str(SRC) not in sys.path:
 
 import pytest
 
-import gpt_oss._stubs.safetensors as safetensors_stub
-from gpt_oss._stubs.safetensors.numpy import save_file
+import numpy as np
+from safetensors import SafetensorError
+from safetensors.numpy import save_file
 
 try:
     import gpt_oss.tools.sera_quickstart as quickstart
@@ -28,9 +29,6 @@ except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
     if "pip install numpy" in str(exc):
         pytest.skip("Real numpy is required for Sera transfer tests", allow_module_level=True)
     raise
-
-quickstart.sera_transfer.safe_open = safetensors_stub.safe_open  # type: ignore[attr-defined]
-
 
 def _create_matrix(rows: int, cols: int, rng: random.Random) -> list[list[float]]:
     return [[rng.uniform(-1.0, 1.0) for _ in range(cols)] for _ in range(rows)]
@@ -83,7 +81,8 @@ def _create_checkpoint(tmp_path: Path, *, nested: bool = False) -> Path:
         "layers.0.ffn.w1.bias": _create_vector(8, rng),
         "layers.0.ffn.w2.bias": _create_vector(4, rng),
     }
-    save_file(tensors, payload_root / "model.safetensors")
+    array_tensors = {name: np.array(value, dtype=np.float32) for name, value in tensors.items()}
+    save_file(array_tensors, payload_root / "model.safetensors")
     return source
 
 
@@ -267,11 +266,11 @@ def test_quickstart_missing_checkpoint(tmp_path: Path, capsys) -> None:
 
 def test_quickstart_reports_missing_safetensors(tmp_path: Path, monkeypatch, capsys) -> None:
     module = importlib.reload(quickstart)
-    monkeypatch.setattr(
-        module.sera_transfer,
-        "_resolve_safe_open",
-        lambda: safetensors_stub.safe_open,
-    )
+
+    def missing_safe_open(*args, **kwargs):  # noqa: ARG001
+        raise ModuleNotFoundError(module.sera_transfer._SAFETENSORS_MISSING_MSG)
+
+    monkeypatch.setattr(module.sera_transfer, "safe_open", missing_safe_open)
 
     checkpoint_dir = tmp_path / "checkpoint"
     checkpoint_dir.mkdir()
@@ -307,7 +306,7 @@ def test_stub_safe_open_binary_blob(tmp_path: Path) -> None:
     binary_path = tmp_path / "model.safetensors"
     binary_path.write_bytes(b"\x00\x01binary")
 
-    with pytest.raises(ModuleNotFoundError, match="pip install safetensors"):
+    with pytest.raises(SafetensorError):
         quickstart.sera_transfer.load_tensors(binary_path)
 
 

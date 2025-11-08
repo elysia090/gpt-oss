@@ -1,17 +1,12 @@
 import hashlib
 import importlib.util
 import pathlib
-import importlib.util
-import pathlib
 import sys
 
 import pytest
 
 
-try:  # pragma: no cover - mirrors module fallback for test envs
-    import numpy as np
-except ModuleNotFoundError:  # pragma: no cover - deterministic fallback
-    from gpt_oss._compat import numpy_stub as np
+import numpy as np
 
 
 _SERA_PATH = pathlib.Path(__file__).resolve().parents[2] / "src" / "gpt_oss" / "inference" / "sera.py"
