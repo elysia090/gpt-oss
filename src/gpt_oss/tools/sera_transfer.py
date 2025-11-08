@@ -167,6 +167,16 @@ def _safe_exists(path: Path) -> bool:
         return False
 
 
+def _normalise_path(path: Path) -> Path:
+    """Return an absolute version of *path* tolerant of exotic links."""
+
+    path = path.expanduser()
+    try:
+        return path.resolve()
+    except OSError:  # pragma: no cover - exercised on Windows
+        return path.absolute()
+
+
 __all__ = [
     "ArrayHeader",
     "ArrayInfo",
@@ -2226,8 +2236,8 @@ def convert(
     ``original_subdir`` to search an arbitrary additional location.
     """
 
-    source = source.resolve()
-    output = output.resolve()
+    source = _normalise_path(source)
+    output = _normalise_path(output)
 
     if verbose and not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO)
