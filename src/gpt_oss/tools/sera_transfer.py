@@ -1734,9 +1734,9 @@ _SAFE_TENSOR_NUMPY_DTYPES = {
 
 def _decode_safetensor_entry(dtype: str, shape: Sequence[int], data: memoryview) -> TensorLike:
     if dtype == "BF16":
-        values = _np.frombuffer(data, dtype=_np.uint16).astype(_np.uint32)
-        values <<= 16
-        float_bits = values.view(_np.float32)
+        values = _np.frombuffer(data, dtype=_np.uint16)
+        float_bits = _np.empty(values.shape, dtype=_np.float32)
+        _np.left_shift(values, 16, out=float_bits.view(_np.uint32), dtype=_np.uint32)
         return float_bits.reshape(tuple(int(dim) for dim in shape))
     np_dtype = _SAFE_TENSOR_NUMPY_DTYPES.get(dtype)
     if np_dtype is None:
