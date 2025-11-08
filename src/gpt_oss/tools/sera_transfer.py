@@ -29,7 +29,7 @@ _SAFETENSORS_MISSING_MSG = (
 
 if importlib.util.find_spec("safetensors") is None:  # pragma: no cover - deterministic import guard
     raise ModuleNotFoundError(_SAFETENSORS_MISSING_MSG)
-from safetensors import safe_open
+from safetensors import SafetensorError, deserialize, safe_open
 
 _NUMPY_MISSING_MSG = (
     "The numpy package is required for Sera conversion. Install it with 'pip install numpy'."
@@ -1716,11 +1716,75 @@ class ModelConfig:
 # Tensor utilities
 
 
+_SAFE_TENSOR_NUMPY_DTYPES = {
+    "F64": _np.float64,
+    "F32": _np.float32,
+    "F16": _np.float16,
+    "I64": _np.int64,
+    "U64": _np.uint64,
+    "I32": _np.int32,
+    "U32": _np.uint32,
+    "I16": _np.int16,
+    "U16": _np.uint16,
+    "I8": _np.int8,
+    "U8": _np.uint8,
+    "BOOL": _np.bool_,
+}
+
+
+def _decode_safetensor_entry(dtype: str, shape: Sequence[int], data: memoryview) -> TensorLike:
+    if dtype == "BF16":
+        values = _np.frombuffer(data, dtype=_np.uint16)
+        float_bits = (values.astype(_np.uint32) << 16).view(_np.float32)
+        return float_bits.reshape(tuple(int(dim) for dim in shape))
+    np_dtype = _SAFE_TENSOR_NUMPY_DTYPES.get(dtype)
+    if np_dtype is None:
+        raise TypeError(f"Unsupported safetensors dtype: {dtype}")
+    array = _np.frombuffer(data, dtype=np_dtype)
+    return array.reshape(tuple(int(dim) for dim in shape))
+
+
+def _load_tensors_from_deserialize(
+    path: Path, keys: Optional[Sequence[str]] = None
+) -> Dict[str, TensorLike]:
+    with path.open("rb") as handle:
+        raw = handle.read()
+    flat = deserialize(raw)
+    tensors: Dict[str, TensorLike] = {}
+    wanted = set(keys) if keys is not None else None
+    for name, entry in flat.items():
+        if wanted is not None and name not in wanted:
+            continue
+        tensors[name] = _decode_safetensor_entry(
+            entry["dtype"], entry["shape"], entry["data"]
+        )
+    if wanted is not None and len(tensors) != len(wanted):
+        missing = sorted(set(wanted) - set(tensors))
+        raise KeyError(f"Missing tensors in safetensors file: {', '.join(missing)}")
+    return tensors
+
+
 def load_tensors(path: Path) -> Dict[str, TensorLike]:
     tensors: Dict[str, TensorLike] = {}
-    with safe_open(path, framework="numpy") as tensor_file:
-        for key in tensor_file.keys():
-            tensors[key] = tensor_file.get_tensor(key)
+    fallback_keys: List[str] = []
+    try:
+        with safe_open(path, framework="numpy") as tensor_file:
+            for key in tensor_file.keys():
+                try:
+                    tensors[key] = tensor_file.get_tensor(key)
+                except TypeError as exc:
+                    message = str(exc).lower()
+                    if "bfloat16" in message or "bf16" in message:
+                        fallback_keys.append(key)
+                    else:
+                        raise
+    except SafetensorError as exc:
+        if "bf16" not in str(exc).lower():
+            raise
+        return _load_tensors_from_deserialize(path)
+
+    if fallback_keys:
+        tensors.update(_load_tensors_from_deserialize(path, fallback_keys))
     return tensors
 
 
