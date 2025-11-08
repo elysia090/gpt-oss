@@ -699,6 +699,34 @@ def test_model_config_splits_fused_qkv_weights() -> None:
     assert w_v == qkv_weight[8:]
 
 
+def test_model_config_infers_head_dim_from_qkv_tensor() -> None:
+    config = {
+        "hidden_size": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 2,
+    }
+
+    rng = random.Random(3)
+    qkv_weight = _create_matrix(16, 4, rng)
+    tensors = {
+        "model.layers.0.attention.qkv.weight": qkv_weight,
+        "model.layers.0.attention.o_proj.weight": _create_matrix(4, 4, rng),
+        "model.layers.0.mlp.gate_proj.weight": _create_matrix(8, 4, rng),
+        "model.layers.0.mlp.down_proj.weight": _create_matrix(4, 8, rng),
+        "model.layers.0.mlp.gate_proj.bias": _create_vector(8, rng),
+        "model.layers.0.mlp.down_proj.bias": _create_vector(4, rng),
+    }
+
+    cfg = sera_transfer.ModelConfig.from_dict(config, tensors=tensors)
+
+    assert cfg.head_dim == 4
+    layer = cfg.layers[0]
+    assert tensors[layer.w_q] == qkv_weight[:8]
+    assert tensors[layer.w_k] == qkv_weight[8:12]
+    assert tensors[layer.w_v] == qkv_weight[12:]
+
+
 def test_model_config_records_optional_fields() -> None:
     config = {
         "hidden_size": 4,
