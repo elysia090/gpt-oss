@@ -973,6 +973,27 @@ def test_cli_verbose_emits_search_hints(tmp_path: Path) -> None:
     assert "vocab_size" in log_output
 
 
+def test_convert_handles_path_resolution_failures(tmp_path: Path, monkeypatch) -> None:
+    source = _create_openai_checkpoint(tmp_path / "resolve_error" / "checkpoint")
+    output = tmp_path / "resolve_error" / "output"
+
+    original_resolve = Path.resolve
+    failure_targets = {source, output}
+
+    def fake_resolve(self):
+        if any(self == target for target in failure_targets):
+            raise OSError("resolve failed")
+        return original_resolve(self)
+
+    monkeypatch.setattr(Path, "resolve", fake_resolve)
+
+    summary = sera_transfer.convert(source, output, r=4, r_v=2, top_l=2)
+
+    assert summary.output == output.absolute()
+    assert summary.output.exists()
+    assert summary.manifest_path.exists()
+
+
 def test_convert_handles_stat_failure(tmp_path: Path, monkeypatch) -> None:
     base = _create_checkpoint(tmp_path / "stat_failure_base")
 
