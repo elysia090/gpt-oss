@@ -99,7 +99,9 @@ def _create_openai_checkpoint(root: Path) -> Path:
         prefix = f"model.layers.{idx}"
         attn = f"{prefix}.attention"
         mlp = f"{prefix}.mlp"
+        tensors[f"{attn}.q_proj.weight"] = _create_matrix(4, 4, rng)
         tensors[f"{attn}.k_proj.weight"] = _create_matrix(4, 4, rng)
+        tensors[f"{attn}.v_proj.weight"] = _create_matrix(4, 4, rng)
         tensors[f"{attn}.o_proj.weight"] = _create_matrix(4, 4, rng)
         tensors[f"{mlp}.gate_proj.weight"] = _create_matrix(8, 4, rng)
         tensors[f"{mlp}.down_proj.weight"] = _create_matrix(4, 8, rng)
@@ -559,7 +561,9 @@ def test_model_config_accepts_hf_config_fields() -> None:
 
     rng = random.Random(0)
     tensors = {
+        "model.layers.0.attention.q_proj.weight": _create_matrix(4, 4, rng),
         "model.layers.0.attention.k_proj.weight": _create_matrix(4, 4, rng),
+        "model.layers.0.attention.v_proj.weight": _create_matrix(4, 4, rng),
         "model.layers.0.attention.o_proj.weight": _create_matrix(4, 4, rng),
         "model.layers.0.mlp.gate_proj.weight": _create_matrix(8, 4, rng),
         "model.layers.0.mlp.down_proj.weight": _create_matrix(4, 8, rng),
@@ -574,7 +578,9 @@ def test_model_config_accepts_hf_config_fields() -> None:
     assert cfg.head_dim == 2
     assert len(cfg.layers) == 1
     layer = cfg.layers[0]
+    assert layer.w_q.endswith("attention.q_proj.weight")
     assert layer.w_k.endswith("attention.k_proj.weight")
+    assert layer.w_v.endswith("attention.v_proj.weight")
     assert layer.w_o.endswith("attention.o_proj.weight")
     assert layer.w1.endswith("mlp.gate_proj.weight")
     assert layer.w2.endswith("mlp.down_proj.weight")
@@ -591,7 +597,9 @@ def test_model_config_infers_layers_from_generic_suffixes() -> None:
 
     rng = random.Random(1)
     tensors = {
+        "layer00.q_proj.weight": _create_matrix(4, 4, rng),
         "layer00.k_proj.weight": _create_matrix(4, 4, rng),
+        "layer00.v_proj.weight": _create_matrix(4, 4, rng),
         "layer00.o_proj.weight": _create_matrix(4, 4, rng),
         "layer00.up_proj.weight": _create_matrix(8, 4, rng),
         "layer00.down_proj.weight": _create_matrix(4, 8, rng),
@@ -603,12 +611,49 @@ def test_model_config_infers_layers_from_generic_suffixes() -> None:
 
     assert len(cfg.layers) == 1
     layer = cfg.layers[0]
+    assert layer.w_q.endswith("q_proj.weight")
     assert layer.w_k.endswith("k_proj.weight")
+    assert layer.w_v.endswith("v_proj.weight")
     assert layer.w_o.endswith("o_proj.weight")
     assert layer.w1.endswith("up_proj.weight")
     assert layer.w2.endswith("down_proj.weight")
     assert layer.b1.endswith("up_proj.bias")
     assert layer.b2.endswith("down_proj.bias")
+
+
+def test_model_config_splits_fused_qkv_weights() -> None:
+    config = {
+        "hidden_size": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+    }
+
+    rng = random.Random(2)
+    qkv_weight = _create_matrix(12, 4, rng)
+    tensors = {
+        "model.layers.0.attention.qkv.weight": qkv_weight,
+        "model.layers.0.attention.o_proj.weight": _create_matrix(4, 4, rng),
+        "model.layers.0.mlp.gate_proj.weight": _create_matrix(8, 4, rng),
+        "model.layers.0.mlp.down_proj.weight": _create_matrix(4, 8, rng),
+        "model.layers.0.mlp.gate_proj.bias": _create_vector(8, rng),
+        "model.layers.0.mlp.down_proj.bias": _create_vector(4, rng),
+    }
+
+    cfg = sera_transfer.ModelConfig.from_dict(config, tensors=tensors)
+
+    assert len(cfg.layers) == 1
+    layer = cfg.layers[0]
+    assert layer.w_q.startswith("model.layers.0.attention.qkv.weight")
+    assert layer.w_k.startswith("model.layers.0.attention.qkv.weight")
+    assert layer.w_v.startswith("model.layers.0.attention.qkv.weight")
+    assert layer.w_q != layer.w_k != layer.w_v
+
+    w_q = tensors[layer.w_q]
+    w_k = tensors[layer.w_k]
+    w_v = tensors[layer.w_v]
+    assert w_q == qkv_weight[:4]
+    assert w_k == qkv_weight[4:8]
+    assert w_v == qkv_weight[8:]
 
 
 def test_model_config_records_optional_fields() -> None:
@@ -633,7 +678,9 @@ def test_model_config_records_optional_fields() -> None:
 
     rng = random.Random(3)
     tensors = {
+        "model.layers.0.attention.q_proj.weight": _create_matrix(4, 4, rng),
         "model.layers.0.attention.k_proj.weight": _create_matrix(4, 4, rng),
+        "model.layers.0.attention.v_proj.weight": _create_matrix(4, 4, rng),
         "model.layers.0.attention.o_proj.weight": _create_matrix(4, 4, rng),
         "model.layers.0.mlp.gate_proj.weight": _create_matrix(16, 4, rng),
         "model.layers.0.mlp.down_proj.weight": _create_matrix(4, 16, rng),
@@ -700,7 +747,9 @@ def test_model_config_infers_layers_from_openai_layout(tmp_path: Path) -> None:
     assert len(cfg.layers) == 2
 
     first = cfg.layers[0]
+    assert first.w_q.endswith("attention.q_proj.weight")
     assert first.w_k.endswith("attention.k_proj.weight")
+    assert first.w_v.endswith("attention.v_proj.weight")
     assert first.w_o.endswith("attention.o_proj.weight")
     assert first.w1.endswith("mlp.gate_proj.weight")
     assert first.w2.endswith("mlp.down_proj.weight")
@@ -717,7 +766,7 @@ def test_model_config_handles_gpt_oss_mxfp4_layout() -> None:
         "tau": 0.5,
     }
 
-    attn_qkv = [[float(r * 4 + c) for c in range(4)] for r in range(4)]
+    attn_qkv = [[float(r * 4 + c) for c in range(4)] for r in range(12)]
     attn_out = [[float((r + 1) * (c + 1)) for c in range(4)] for r in range(4)]
     mlp1_blocks = _mxfp4_bytes(8, 2)
     mlp2_blocks = _mxfp4_bytes(4, 4)
@@ -741,7 +790,9 @@ def test_model_config_handles_gpt_oss_mxfp4_layout() -> None:
 
     assert len(cfg.layers) == 1
     layer = cfg.layers[0]
-    assert layer.w_k.endswith("attn.qkv.weight")
+    assert layer.w_q.startswith("block.0.attn.qkv.weight")
+    assert layer.w_k.startswith("block.0.attn.qkv.weight")
+    assert layer.w_v.startswith("block.0.attn.qkv.weight")
     assert layer.w_o.endswith("attn.out.weight")
     assert layer.w1.endswith("mlp.mlp1_weight")
     assert layer.w2.endswith("mlp.mlp2_weight")
@@ -752,6 +803,13 @@ def test_model_config_handles_gpt_oss_mxfp4_layout() -> None:
     decoded_shape_w2 = _tensor_shape(tensors[layer.w2])
     assert decoded_shape_w1 == [8, 4]
     assert decoded_shape_w2 == [4, 8]
+
+    w_q = tensors[layer.w_q]
+    w_k = tensors[layer.w_k]
+    w_v = tensors[layer.w_v]
+    assert w_q == attn_qkv[:4]
+    assert w_k == attn_qkv[4:8]
+    assert w_v == attn_qkv[8:]
 
     prf = sera_transfer.compute_prf(cfg, tensors, r=2)
     assert "prf_W" in prf and prf["prf_W"]
@@ -842,7 +900,9 @@ def test_convert_preserves_optional_config_metadata(tmp_path: Path) -> None:
 
     rng = random.Random(6)
     tensors = {
+        "model.layers.0.attention.q_proj.weight": _create_matrix(4, 4, rng),
         "model.layers.0.attention.k_proj.weight": _create_matrix(4, 4, rng),
+        "model.layers.0.attention.v_proj.weight": _create_matrix(4, 4, rng),
         "model.layers.0.attention.o_proj.weight": _create_matrix(4, 4, rng),
         "model.layers.0.mlp.gate_proj.weight": _create_matrix(16, 4, rng),
         "model.layers.0.mlp.down_proj.weight": _create_matrix(4, 16, rng),
@@ -1197,7 +1257,7 @@ def test_array_checksums_regression(tmp_path: Path) -> None:
         "T_2.bin": "067fece1127c0e37ff0bf1ff566b727f33dd3f5d5ba15431916b61adfebc2e5b",
         "T_3.bin": "581fca69ff42c2b69b83ba1f128513e611ee8238448e0eb920a820e74b78de1a",
         "T_4.bin": "1147d97ec1eae29ec741abdaabfb36c6db64485f9a5438e51a4656f98c6eb3ec",
-        "bridge_hubs.bin": "688d4e7d3b1c3204c0e3ac9c06ab96a0a7631d76c1737fc24250bc479e6f20e1",
+        "bridge_hubs.bin": "278257c861ac4de67792e075d1fc4b5d35cf9c2dace8a552c2b806968bbeb70a",
         "bridge_qDin.bin": "ec0707f8cb38f54984497a0b51793e36473107ba8d294f96ac96164f5df4d1bd",
         "bridge_qDout.bin": "e2cb6dd3cda429569e818f29e4b102d9b5006f30e646d42460440922f1b55e32",
         "cuckoo_delta.bin": "a80189f45efc8626983c04226824ce57d66d8951d0711b27eb68125250a73d01",
@@ -1210,7 +1270,7 @@ def test_array_checksums_regression(tmp_path: Path) -> None:
         "overlays_DeltaW.bin": "d154e8363c23c577f20ce3d845b8f3e635ffeac9f9ee1c9fed46191b5d8eab62",
         "overlays_H.bin": "cc6c5558ac91886a9a65e73946a9037f3690a6af9889b297546d870d3998c058",
         "overlays_U.bin": "877425be63ca60e31d1e668d384bcde42fe19c2ec2793856143f83b6e7e87aff",
-        "peer_scores.bin": "36d9d1d2694dd68a164ffaea6e4891a68bef887228851b1e7341a109a77eb638",
+        "peer_scores.bin": "a2336c64b60dbc69d3353f8db55a2c07f280ae1859056482cbcfb6b209726820",
         "prf_W.bin": "fc6134f0ec03aff0ca21bfc7e0a5a2c70afa8c73ab290f7b694fd9f008fe293b",
         "s_init.bin": "4d848697b5664465351e1ba48be3e74ad691e88b1260ccb3e0b73db7118f55c4",
         "tokenizer_fst.bin": "45da3c4be5bdb7c344bb6e2ede224d877de3e51d50e39788e98a437dc7109d2e",

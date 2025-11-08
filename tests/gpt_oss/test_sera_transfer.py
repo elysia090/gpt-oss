@@ -29,14 +29,32 @@ def patch_conversion_dependencies(monkeypatch):
     """Stub out heavyweight conversion helpers so tests remain lightweight."""
 
     dummy_layer = SimpleNamespace(
+        w_q="W_Q",
         w_k="W_K",
+        w_v="W_V",
         w_o="W_O",
         w1="FFN_W1",
         w2="FFN_W2",
         b1="FFN_B1",
         b2="FFN_B2",
     )
-    dummy_cfg = SimpleNamespace(d_model=16, vocab_size=8, layers=[dummy_layer])
+    dummy_cfg = SimpleNamespace(
+        d_model=16,
+        vocab_size=8,
+        layers=[dummy_layer],
+        rope_theta=None,
+        num_key_value_heads=None,
+        sliding_window=None,
+        initial_context_length=None,
+        rope_scaling_factor=None,
+        rope_ntk_alpha=None,
+        rope_ntk_beta=None,
+        tau=1.0,
+        num_experts=None,
+        experts_per_token=None,
+        intermediate_size=None,
+        swiglu_limit=None,
+    )
 
     def fake_from_dict(data, tensors=None):  # noqa: ARG001 - signature kept for compatibility
         return dummy_cfg
@@ -117,14 +135,32 @@ def test_convert_finds_files_in_original(tmp_path: Path, monkeypatch):
         return {}
 
     dummy_layer = SimpleNamespace(
+        w_q="W_Q",
         w_k="W_K",
+        w_v="W_V",
         w_o="W_O",
         w1="FFN_W1",
         w2="FFN_W2",
         b1="FFN_B1",
         b2="FFN_B2",
     )
-    dummy_cfg = SimpleNamespace(d_model=16, vocab_size=8, layers=[dummy_layer])
+    dummy_cfg = SimpleNamespace(
+        d_model=16,
+        vocab_size=8,
+        layers=[dummy_layer],
+        rope_theta=None,
+        num_key_value_heads=None,
+        sliding_window=None,
+        initial_context_length=None,
+        rope_scaling_factor=None,
+        rope_ntk_alpha=None,
+        rope_ntk_beta=None,
+        tau=1.0,
+        num_experts=None,
+        experts_per_token=None,
+        intermediate_size=None,
+        swiglu_limit=None,
+    )
 
     def fake_from_dict(data, tensors=None):  # noqa: ARG001 - compatibility with signature
         captured_config["data"] = data
@@ -165,14 +201,32 @@ def test_convert_honours_original_subdir(tmp_path: Path, monkeypatch):
         return {}
 
     dummy_layer = SimpleNamespace(
+        w_q="W_Q",
         w_k="W_K",
+        w_v="W_V",
         w_o="W_O",
         w1="FFN_W1",
         w2="FFN_W2",
         b1="FFN_B1",
         b2="FFN_B2",
     )
-    dummy_cfg = SimpleNamespace(d_model=16, vocab_size=8, layers=[dummy_layer])
+    dummy_cfg = SimpleNamespace(
+        d_model=16,
+        vocab_size=8,
+        layers=[dummy_layer],
+        rope_theta=None,
+        num_key_value_heads=None,
+        sliding_window=None,
+        initial_context_length=None,
+        rope_scaling_factor=None,
+        rope_ntk_alpha=None,
+        rope_ntk_beta=None,
+        tau=1.0,
+        num_experts=None,
+        experts_per_token=None,
+        intermediate_size=None,
+        swiglu_limit=None,
+    )
 
     def fake_from_dict(data, tensors=None):  # noqa: ARG001 - compatibility with signature
         captured_config["data"] = data

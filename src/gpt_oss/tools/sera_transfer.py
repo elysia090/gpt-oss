@@ -86,6 +86,20 @@ _MXFP4_FP4_VALUES = (
 )
 
 
+_QKV_COMPONENT_MARKER = "__sera_qkv__"
+
+
+def _qkv_component_name(base: str, role: str) -> str:
+    return f"{base}{_QKV_COMPONENT_MARKER}{role}"
+
+
+def _parse_qkv_component(name: str) -> Tuple[str, str] | None:
+    if not isinstance(name, str) or _QKV_COMPONENT_MARKER not in name:
+        return None
+    base, role = name.rsplit(_QKV_COMPONENT_MARKER, 1)
+    return base, role
+
+
 def _looks_like_repo_stub_safe_open(func) -> bool:
     if func is None:
         return False
@@ -718,7 +732,9 @@ def orthonormal_matrix(rows: int, cols: int, generator: Iterable[List[float]]) -
 @dataclass
 class LayerConfig:
     name: str
+    w_q: str
     w_k: str
+    w_v: str
     w_o: str
     w1: str
     w2: str
@@ -820,6 +836,59 @@ def _decode_mxfp4_pair(blocks: TensorLike, scales: TensorLike):
         return row
 
     return _decode_recursive(blocks_list, scales_list)
+
+
+def _split_qkv_tensor(tensor: TensorLike, expected_proj: int):
+    if expected_proj <= 0:
+        raise ValueError("Expected projection dimension must be positive for QKV split")
+
+    shape = _tensor_shape(tensor)
+    if len(shape) < 2:
+        raise ValueError("QKV tensor must be at least 2D to split into components")
+
+    rows, cols = shape[0], shape[1]
+    axis = None
+    parts = None
+    if cols == expected_proj and rows % expected_proj == 0:
+        axis = 0
+        parts = rows // expected_proj
+    elif rows == expected_proj and cols % expected_proj == 0:
+        axis = 1
+        parts = cols // expected_proj
+
+    if axis is None or parts != 3:
+        raise ValueError(
+            "Unable to split QKV tensor: expected dimensions compatible with 3-way split"
+        )
+
+    if _TORCH_TENSOR_TYPES and isinstance(tensor, _TORCH_TENSOR_TYPES):
+        chunks = tensor.split(expected_proj, dim=axis)
+        if len(chunks) != 3:
+            raise ValueError("QKV tensor did not split into 3 components as expected")
+        return tuple(chunks)
+
+    if _NP_ARRAY_TYPES and isinstance(tensor, _NP_ARRAY_TYPES):
+        chunks = _np.split(tensor, 3, axis=axis)
+        return tuple(chunks)
+
+    matrix = _as_nested_list(tensor)
+    if axis == 0:
+        step = len(matrix) // 3
+        return (
+            [row[:] for row in matrix[:step]],
+            [row[:] for row in matrix[step : 2 * step]],
+            [row[:] for row in matrix[2 * step : 3 * step]],
+        )
+
+    if not matrix or not matrix[0]:
+        raise ValueError("Unable to split empty QKV tensor")
+
+    step = len(matrix[0]) // 3
+    return (
+        [[row[idx] for idx in range(0, step)] for row in matrix],
+        [[row[idx] for idx in range(step, 2 * step)] for row in matrix],
+        [[row[idx] for idx in range(2 * step, 3 * step)] for row in matrix],
+    )
 
 
 @dataclass
@@ -963,7 +1032,9 @@ class ModelConfig:
                 layers.append(
                     LayerConfig(
                         name=str(layer_data.get("name", f"layer_{idx}")),
+                        w_q=str(layer_data.get("W_Q", layer_data["W_K"])),
                         w_k=str(layer_data["W_K"]),
+                        w_v=str(layer_data.get("W_V", layer_data["W_K"])),
                         w_o=str(layer_data["W_O"]),
                         w1=str(layer_data["FFN_W1"]),
                         w2=str(layer_data["FFN_W2"]),
@@ -984,6 +1055,13 @@ class ModelConfig:
             )
 
         if tensors is not None:
+            ModelConfig._materialize_qkv_layers(
+                layers,
+                tensors,
+                d_model=d_model,
+                n_heads=n_heads,
+                head_dim=head_dim,
+            )
             ModelConfig._materialize_mxfp4_layers(layers, tensors)
 
         if num_hidden_layers is None:
@@ -1025,6 +1103,25 @@ class ModelConfig:
         head_dim: int,
     ) -> List[LayerConfig]:
         role_suffixes = {
+            "W_Q": (
+                "attn.q.weight",
+                "attn.wq.weight",
+                "attn.q_proj.weight",
+                "attn.qproj.weight",
+                "attention.q.weight",
+                "attention.wq.weight",
+                "attention.q_proj.weight",
+                "attention.qproj.weight",
+                "self_attn.q_proj.weight",
+                "self_attn.qproj.weight",
+                "q_proj.weight",
+                "qproj.weight",
+                "query_proj.weight",
+                "queryproj.weight",
+                "query.weight",
+                "q_linear.weight",
+                "q.weight",
+            ),
             "W_K": (
                 "attn.k.weight",
                 "attn.wk.weight",
@@ -1043,8 +1140,25 @@ class ModelConfig:
                 "key.weight",
                 "k_linear.weight",
                 "k.weight",
-                "attn.qkv.weight",
-                "attention.qkv.weight",
+            ),
+            "W_V": (
+                "attn.v.weight",
+                "attn.wv.weight",
+                "attn.v_proj.weight",
+                "attn.vproj.weight",
+                "attention.v.weight",
+                "attention.wv.weight",
+                "attention.v_proj.weight",
+                "attention.vproj.weight",
+                "self_attn.v_proj.weight",
+                "self_attn.vproj.weight",
+                "v_proj.weight",
+                "vproj.weight",
+                "value_proj.weight",
+                "valueproj.weight",
+                "value.weight",
+                "v_linear.weight",
+                "v.weight",
             ),
             "W_O": (
                 "attn.o.weight",
@@ -1154,6 +1268,18 @@ class ModelConfig:
         expected_proj = n_heads * head_dim
         layer_map: Dict[str, Dict[str, str]] = {}
 
+        qkv_suffixes = (
+            "attn.qkv.weight",
+            "attention.qkv.weight",
+            "self_attn.qkv.weight",
+            "qkv.weight",
+            "qkv_proj.weight",
+        )
+        qkv_suffix_tokens = [
+            tuple(suffix.lower().split(".")) for suffix in qkv_suffixes
+        ]
+        qkv_sources: Dict[str, str] = {}
+
         role_suffix_tokens = {
             role: [tuple(suffix.lower().split(".")) for suffix in suffixes]
             for role, suffixes in role_suffixes.items()
@@ -1166,6 +1292,23 @@ class ModelConfig:
             shape = _tensor_shape(tensor)
             name_tokens = name.split(".")
             lower_tokens = [token.lower() for token in name_tokens]
+
+            matched_qkv = False
+            for suffix_tokens in qkv_suffix_tokens:
+                if len(lower_tokens) < len(suffix_tokens):
+                    continue
+                tail_tokens = lower_tokens[-len(suffix_tokens) :]
+                if not ModelConfig._tokens_match(tail_tokens, suffix_tokens):
+                    continue
+                prefix_tokens = name_tokens[: -len(suffix_tokens)]
+                prefix = ".".join(prefix_tokens).rstrip(".")
+                if prefix:
+                    qkv_sources.setdefault(prefix, name)
+                matched_qkv = True
+                break
+
+            if matched_qkv:
+                continue
 
             for role, suffix_token_sets in role_suffix_tokens.items():
                 matched = False
@@ -1192,7 +1335,21 @@ class ModelConfig:
                 if matched:
                     break
 
-        required_roles = {"W_K", "W_O", "FFN_W1", "FFN_W2", "FFN_B1", "FFN_B2"}
+        for prefix, base_name in qkv_sources.items():
+            layer_roles = layer_map.setdefault(prefix, {})
+            for role in ("W_Q", "W_K", "W_V"):
+                layer_roles.setdefault(role, _qkv_component_name(base_name, role))
+
+        required_roles = {
+            "W_Q",
+            "W_K",
+            "W_V",
+            "W_O",
+            "FFN_W1",
+            "FFN_W2",
+            "FFN_B1",
+            "FFN_B2",
+        }
         incomplete = [
             prefix
             for prefix, roles in layer_map.items()
@@ -1223,7 +1380,9 @@ class ModelConfig:
             layers.append(
                 LayerConfig(
                     name=prefix.replace(".", "_"),
+                    w_q=roles["W_Q"],
                     w_k=roles["W_K"],
+                    w_v=roles["W_V"],
                     w_o=roles["W_O"],
                     w1=roles["FFN_W1"],
                     w2=roles["FFN_W2"],
@@ -1232,6 +1391,51 @@ class ModelConfig:
                 )
             )
         return layers
+
+    @staticmethod
+    def _materialize_qkv_layers(
+        layers: Sequence[LayerConfig],
+        tensors: Mapping[str, TensorLike],
+        *,
+        d_model: int,
+        n_heads: int,
+        head_dim: int,
+    ) -> None:
+        if not isinstance(tensors, MutableMapping):
+            raise TypeError(
+                "Tensor mapping must be mutable to decode fused QKV weights"
+            )
+
+        expected_proj = n_heads * head_dim if n_heads and head_dim else d_model
+        cache: Dict[str, Dict[str, TensorLike]] = {}
+
+        for layer in layers:
+            for attr, role in (("w_q", "W_Q"), ("w_k", "W_K"), ("w_v", "W_V")):
+                name = getattr(layer, attr)
+                parsed = _parse_qkv_component(name)
+                if parsed is None:
+                    continue
+                base, parsed_role = parsed
+                components = cache.get(base)
+                if components is None:
+                    tensor = tensors.get(base)
+                    if tensor is None:
+                        raise ValueError(
+                            "Unable to decode fused QKV tensor; missing source "
+                            f"'{base}' for role '{parsed_role}'"
+                        )
+                    q, k, v = _split_qkv_tensor(tensor, expected_proj)
+                    components = {"W_Q": q, "W_K": k, "W_V": v}
+                    cache[base] = components
+                component = components.get(parsed_role)
+                if component is None:
+                    raise ValueError(
+                        "Fused QKV tensor did not provide component for role "
+                        f"'{parsed_role}'"
+                    )
+                component_name = _qkv_component_name(base, parsed_role)
+                tensors[component_name] = component
+                setattr(layer, attr, component_name)
 
     @staticmethod
     def _materialize_mxfp4_layers(
@@ -1305,7 +1509,7 @@ class ModelConfig:
         if len(shape) < 2:
             return True
         rows, cols = shape[0], shape[1]
-        if role == "W_K":
+        if role in {"W_Q", "W_K", "W_V"}:
             return expected_proj in {rows, cols}
         if role == "W_O":
             return expected_proj in {rows, cols}
@@ -1704,7 +1908,16 @@ def memory_coefficients(cfg: ModelConfig) -> Tuple[Dict[str, List], Dict[str, ob
 
 def _layer_seed(layer: LayerConfig, tensors: Mapping[str, TensorLike]) -> int:
     digest = hashlib.sha256()
-    for name in (layer.w_k, layer.w_o, layer.w1, layer.w2, layer.b1, layer.b2):
+    for name in (
+        layer.w_q,
+        layer.w_k,
+        layer.w_v,
+        layer.w_o,
+        layer.w1,
+        layer.w2,
+        layer.b1,
+        layer.b2,
+    ):
         tensor = tensors.get(name)
         if tensor is None:
             continue
