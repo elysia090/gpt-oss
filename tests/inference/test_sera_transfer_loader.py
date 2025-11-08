@@ -164,7 +164,14 @@ def test_transfer_loader_fallback_without_runtime_snapshot(tmp_path: Path) -> No
     assert "y_out" in step_result
 
 
-def _make_transfer_array_header(byte_len: int, crc32c: int, sha_low64: int) -> bytes:
+def _make_transfer_array_header(
+    byte_len: int,
+    crc32c: int,
+    sha_low64: int,
+    *,
+    flags: int = 0x1,
+    reserved: int = 0,
+) -> bytes:
     dims = (byte_len, 0, 0, 0, 0)
     return _TRANSFER_ARRAY_STRUCT.pack(
         _TRANSFER_ARRAY_MAGIC,
@@ -174,8 +181,8 @@ def _make_transfer_array_header(byte_len: int, crc32c: int, sha_low64: int) -> b
         byte_len,
         crc32c,
         sha_low64,
-        0,
-        0,
+        flags,
+        reserved,
     )
 
 
@@ -201,6 +208,7 @@ def test_validate_transfer_arrays_streams_large_payload(tmp_path: Path) -> None:
         {"large": {"sha256": digest.hex()}},
     )
     assert arrays["large"]["byte_len"] == size
+    assert arrays["large"]["flags"] == 0x1
 
 
 @pytest.mark.parametrize(
@@ -245,3 +253,32 @@ def test_validate_transfer_arrays_streaming_detects_corruption(
 
     with pytest.raises(ValueError, match=message):
         _validate_transfer_arrays(arrays_dir, {f"large_{modifier}": record})
+
+
+@pytest.mark.parametrize(
+    "flags,reserved,message",
+    [
+        (0x0, 0, "row-major layout"),
+        (0x8, 0, "unsupported flag bits"),
+        (0x1, 1, "reserved header field must be zero"),
+    ],
+)
+def test_validate_transfer_arrays_rejects_invalid_header_flags(
+    tmp_path: Path, flags: int, reserved: int, message: str
+) -> None:
+    arrays_dir = tmp_path / "arrays"
+    arrays_dir.mkdir()
+    payload = _generate_payload(64)
+    digest = hashlib.sha256(payload).digest()
+    header = _make_transfer_array_header(
+        len(payload),
+        _crc32c(payload),
+        int.from_bytes(digest[-8:], "little"),
+        flags=flags,
+        reserved=reserved,
+    )
+    array_path = arrays_dir / "bad_flags.bin"
+    array_path.write_bytes(header + payload)
+
+    with pytest.raises(ValueError, match=message):
+        _validate_transfer_arrays(arrays_dir, {"bad_flags": {"sha256": digest.hex()}})
