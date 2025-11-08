@@ -41,11 +41,12 @@ try:  # pragma: no cover - optional dependency
 except Exception as exc:  # pragma: no cover - defensive
     raise ModuleNotFoundError(_NUMPY_MISSING_MSG) from exc
 else:  # pragma: no cover - executed when numpy is available
-    _missing_numpy_apis = [
-        name for name in ("stack", "ldexp", "split") if not hasattr(_np, name)
-    ]
-    if _missing_numpy_apis:
-        raise ModuleNotFoundError(_NUMPY_MISSING_MSG)
+    if not getattr(_np, "__gpt_oss_numpy_stub__", False):
+        _missing_numpy_apis = [
+            name for name in ("stack", "ldexp", "split") if not hasattr(_np, name)
+        ]
+        if _missing_numpy_apis:
+            raise ModuleNotFoundError(_NUMPY_MISSING_MSG)
 
 try:  # pragma: no cover - optional dependency
     import torch as _torch
@@ -60,7 +61,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing helper
 else:  # pragma: no cover - runtime alias
     TensorLike = Any
 
-_NP_ARRAY_TYPES = (_np.ndarray,) if _np is not None else ()
+if getattr(_np, "__gpt_oss_numpy_stub__", False):
+    _NP_ARRAY_TYPES: tuple[type, ...] = ()
+else:
+    _NP_ARRAY_TYPES = (_np.ndarray,) if _np is not None else ()
 _TORCH_TENSOR_TYPES = (_torch.Tensor,) if _torch is not None else ()
 
 _MXFP4_SUFFIXES = (".blocks", ".scales")
@@ -1033,7 +1037,7 @@ class ModelConfig:
                 if d_model % kv_heads == 0:
                     head_dim = d_model // kv_heads
         if head_dim is None and d_model is not None and n_heads is not None:
-            doc_hint = "docs/howto-sera-transfer.md"
+            doc_hint = "docs/operations/sera-transfer.md"
             raise ValueError(
                 "Model config does not provide 'head_dim'. Provide the Sera schema "
                 "(d_model/n_heads/head_dim) or a Hugging Face config with "
@@ -1042,7 +1046,7 @@ class ModelConfig:
             )
 
         if d_model is None or n_heads is None or head_dim is None:
-            doc_hint = "docs/howto-sera-transfer.md"
+            doc_hint = "docs/operations/sera-transfer.md"
             raise ValueError(
                 "Model config must define d_model, n_heads, and head_dim (or provide "
                 "their Hugging Face equivalents such as hidden_size, "

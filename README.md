@@ -21,32 +21,102 @@ We're releasing two flavors of these open models:
 Both models were trained using our [harmony response format][harmony] and should only be used with this format; otherwise, they will not work correctly.
 
 ## Table of Contents
+- [Overview](#overview)
+- [Model lineup](#model-lineup)
 - [Highlights](#highlights)
-- [Inference examples](#inference-examples)
-- [About this repository](#about-this-repository)
-- [Setup](#setup)
-- [Download the model](#download-the-model)
-- [Reference PyTorch implementation](#reference-pytorch-implementation)
-- [Reference Triton implementation (single GPU)](#reference-triton-implementation-single-gpu)
-- [Reference Metal implementation](#reference-metal-implementation)
-- [Harmony format & tools](#harmony-format--tools)
-- [Clients](#clients)
-- [Tools](#tools)
+- [Getting started](#getting-started)
+  - [Requirements](#requirements)
+  - [Install the packages](#install-the-packages)
+  - [Download model weights](#download-model-weights)
+- [Running the models](#running-the-models)
+  - [Transformers](#transformers)
+  - [vLLM](#vllm)
+  - [Reference runtimes](#reference-runtimes)
+- [Harmony format and native tools](#harmony-format-and-native-tools)
+  - [Harmony chat format](#harmony-chat-format)
+  - [Browser tool](#browser-tool)
+  - [Python tool](#python-tool)
+  - [Apply Patch tool](#apply-patch-tool)
+  - [Sera terminal experience](#sera-terminal-experience)
+- [Repository guide](#repository-guide)
+  - [Layout](#layout)
+  - [Local development](#local-development)
+- [Additional clients](#additional-clients)
 - [Other details](#other-details)
+  - [Precision format](#precision-format)
+  - [Recommended sampling parameters](#recommended-sampling-parameters)
 - [Contributing](#contributing)
+- [Citation](#citation)
 
-### Highlights
+## Overview
+
+The gpt-oss project provides production-grade reference implementations, tooling, and documentation to help developers evaluate, deploy, and extend the gpt-oss-120b and gpt-oss-20b models. Each component in this repository is designed to demonstrate best practices for running the models reliably across a range of environments—from single GPU developer rigs to multi-GPU inference clusters.
+
+## Model lineup
+
+| Model | Best for | Hardware profile |
+| --- | --- | --- |
+| `gpt-oss-120b` | Highest-quality, general-purpose reasoning | Fits on a single 80GB GPU (H100 or MI300X) using MXFP4 quantization |
+| `gpt-oss-20b` | Latency-sensitive, local, and specialized deployments | Runs within 16GB of memory |
+
+Both models expose the full chain-of-thought via the Harmony format to facilitate debugging, agentic orchestration, and advanced tooling integrations.
+
+## Highlights
 
 - **Permissive Apache 2.0 license:** Build freely without copyleft restrictions or patent risk—ideal for experimentation, customization, and commercial deployment.
 - **Configurable reasoning effort:** Easily adjust the reasoning effort (low, medium, high) based on your specific use case and latency needs.
 - **Full chain-of-thought:** Provides complete access to the model's reasoning process, facilitating easier debugging and greater trust in outputs. This information is not intended to be shown to end users.
 - **Fine-tunable:** Fully customize models to your specific use case through parameter fine-tuning.
-- **Agentic capabilities:** Use the models' native capabilities for function calling, [web browsing](#browser), [Python code execution](#python), and Structured Outputs.
+- **Agentic capabilities:** Use the models' native capabilities for function calling, [web browsing](#browser-tool), [Python code execution](#python-tool), and Structured Outputs.
 - **MXFP4 quantization:** The models were post-trained with MXFP4 quantization of the MoE weights, making `gpt-oss-120b` run on a single 80GB GPU (like NVIDIA H100 or AMD MI300X) and the `gpt-oss-20b` model run within 16GB of memory. All evals were performed with the same MXFP4 quantization.
 
-### Inference examples
+## Getting started
 
-#### Transformers
+### Requirements
+
+- Python 3.12
+- On macOS: install the Xcode CLI tools (`xcode-select --install`).
+- On Linux: CUDA-capable hardware is required for the reference GPU runtimes.
+- On Windows: the reference implementations have not been tested. Use solutions like Ollama for local evaluation.
+
+### Install the packages
+
+Install the package from [PyPI](https://pypi.org/project/gpt-oss/) based on the components you plan to use:
+
+```shell
+# tooling only
+pip install gpt-oss
+# PyTorch reference runtime
+pip install gpt-oss[torch]
+# Triton reference runtime
+pip install gpt-oss[triton]
+```
+
+To develop locally or experiment with the Metal runtime, clone the repository and install in editable mode:
+
+```shell
+git clone https://github.com/openai/gpt-oss.git
+cd gpt-oss
+GPTOSS_BUILD_METAL=1 pip install -e ".[metal]"
+```
+
+### Download model weights
+
+You can download the model weights from the [Hugging Face Hub](https://huggingface.co/collections/openai/gpt-oss-68911959590a1634ba11c7a4) using the CLI:
+
+```shell
+# gpt-oss-120b
+hf download openai/gpt-oss-120b --include "original/*" --local-dir gpt-oss-120b/
+
+# gpt-oss-20b
+hf download openai/gpt-oss-20b --include "original/*" --local-dir gpt-oss-20b/
+```
+
+Check out our [awesome list](./awesome-gpt-oss.md) for a broader collection of gpt-oss resources and inference partners.
+
+## Running the models
+
+### Transformers
 
 You can use `gpt-oss-120b` and `gpt-oss-20b` with the Transformers library. If you use Transformers' chat template, it will automatically apply the [harmony response format][harmony]. If you use `model.generate` directly, you need to apply the harmony format manually using the chat template or use our [`openai-harmony`][harmony] package.
 
@@ -76,7 +146,7 @@ print(outputs[0]["generated_text"][-1])
 
 [Learn more about how to use gpt-oss with Transformers.](https://cookbook.openai.com/articles/gpt-oss/run-transformers)
 
-#### vLLM
+### vLLM
 
 vLLM recommends using [`uv`](https://docs.astral.sh/uv/) for Python dependency management. You can use vLLM to spin up an OpenAI-compatible web server. The following command will automatically download the model and start the server.
 
@@ -110,13 +180,13 @@ from openai_harmony import (
     SystemContent,
     DeveloperContent,
 )
- 
+
 from vllm import LLM, SamplingParams
 import os
 
 # --- 1) Render the prefill with Harmony ---
 encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
- 
+
 convo = Conversation.from_messages(
     [
         Message.from_role_and_content(Role.SYSTEM, SystemContent.new()),
@@ -127,12 +197,12 @@ convo = Conversation.from_messages(
         Message.from_role_and_content(Role.USER, "What is the weather like in SF?"),
     ]
 )
- 
+
 prefill_ids = encoding.render_conversation_for_completion(convo, Role.ASSISTANT)
- 
+
 # Harmony stop tokens (pass to sampler so they won't be included in output)
 stop_token_ids = encoding.stop_tokens_for_assistant_actions()
- 
+
 # --- 2) Run vLLM with prefill ---
 llm = LLM(
     model="openai/gpt-oss-20b",
@@ -142,82 +212,147 @@ llm = LLM(
     max_model_len=5000,
     tensor_parallel_size=1
 )
- 
+
 sampling = SamplingParams(
     max_tokens=128,
     temperature=1,
     stop_token_ids=stop_token_ids,
 )
- 
+
 outputs = llm.generate(
     prompt_token_ids=[prefill_ids],   # batch of size 1
     sampling_params=sampling,
 )
- 
+
 # vLLM gives you both text and token IDs
 gen = outputs[0].outputs[0]
 text = gen.text
 output_tokens = gen.token_ids  # <-- these are the completion token IDs (no prefill)
- 
+
 # --- 3) Parse the completion token IDs back into structured Harmony messages ---
 entries = encoding.parse_messages_from_completion_tokens(output_tokens, Role.ASSISTANT)
- 
+
 # 'entries' is a sequence of structured conversation entries (assistant messages, tool calls, etc.).
 for message in entries:
     print(f"{json.dumps(message.to_dict())}")
 ```
 
-#### PyTorch / Triton / Metal
+### Reference runtimes
 
-These implementations are largely reference implementations for educational purposes and are not expected to be run in production.
+#### PyTorch
 
-[Learn more below.](#reference-pytorch-implementation)
+We include an educational PyTorch implementation in [src/gpt_oss/torch/model.py](src/gpt_oss/torch/model.py). It mirrors the model architecture with minimal optimizations and supports tensor parallelism in the MoE layers so that the large model can run on 4×H100 or 2×H200 GPUs. The runtime upcasts weights to BF16.
 
-#### Ollama
+```shell
+pip install -e ".[torch]"
 
-If you are trying to run `gpt-oss` on consumer hardware, you can use Ollama by running the following commands after [installing Ollama](https://ollama.com/download).
-
-```bash
-# gpt-oss-20b
-ollama pull gpt-oss:20b
-ollama run gpt-oss:20b
-
-# gpt-oss-120b
-ollama pull gpt-oss:120b
-ollama run gpt-oss:120b
+# On 4×H100
+torchrun --nproc-per-node=4 -m gpt_oss.cli.generate_cli gpt-oss-120b/original/
 ```
 
-[Learn more about how to use gpt-oss with Ollama.](https://cookbook.openai.com/articles/gpt-oss/run-locally-ollama)
+#### Triton (single GPU)
 
-#### LM Studio
+The optimized Triton runtime relies on [the Triton MoE kernel](https://github.com/triton-lang/triton/tree/main/python/triton_kernels/triton_kernels) with MXFP4 support and reduced-memory attention kernels. Install Triton from source alongside the gpt-oss extras to run `gpt-oss-120b` on a single 80GB GPU.
 
-If you are using [LM Studio](https://lmstudio.ai/) you can use the following commands to download.
+```shell
+# Install Triton from source
+git clone https://github.com/triton-lang/triton
+cd triton/
+pip install -r python/requirements.txt
+pip install -e . --verbose --no-build-isolation
+pip install -e python/triton_kernels
 
-```bash
-# gpt-oss-20b
-lms get openai/gpt-oss-20b
-# gpt-oss-120b
-lms get openai/gpt-oss-120b
+# Install the gpt-oss Triton runtime
+pip install -e ".[triton]"
+
+# On 1×H100
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+python -m gpt_oss.cli.generate_cli --backend triton gpt-oss-120b/original/
 ```
 
-Check out our [awesome list](./awesome-gpt-oss.md) for a broader collection of gpt-oss resources and inference partners.
+Turn on the expandable allocator if you encounter `torch.OutOfMemoryError` when loading weights.
 
-## About this repository
+#### Metal
 
-This repository provides a collection of reference implementations:
+The Metal reference runtime targets Apple Silicon and is accurate to the PyTorch implementation. Install with the Metal extra to trigger compilation:
 
-- **Inference:**
-  - [`inference/torch`](#reference-pytorch-implementation) — a non-optimized [PyTorch](https://pytorch.org/) implementation for educational purposes only. Requires at least 4× H100 GPUs due to lack of optimization.
-  - [`inference/triton`](#reference-triton-implementation-single-gpu) — a more optimized implementation using [PyTorch](https://pytorch.org/) & [Triton](https://github.com/triton-lang/triton) incl. using CUDA graphs and basic caching
-  - [`inference/metal`](#reference-metal-implementation) — a Metal-specific implementation for running the models on Apple Silicon hardware
-- **Tools:**
-  - [`browser`](#browser) — a reference implementation of the browser tool the models got trained on
-  - [`python`](#python) — a stateless reference implementation of the python tool the model got trained on
-- **Client examples:**
-  - [`cli/chat`](#terminal-chat) — a basic terminal chat application that uses the PyTorch or Triton implementations for inference along with the python and browser tools
-  - [`api/responses`](#responses-api) — an example Responses API compatible server that implements the browser tool along with other Responses-compatible functionality
+```shell
+GPTOSS_BUILD_METAL=1 pip install -e ".[metal]"
+```
 
-### Repository layout
+Before running inference, convert the SafeTensor weights:
+
+```shell
+python src/gpt_oss/metal/scripts/create-local-model.py -s <model_dir> -d <output_file>
+```
+
+Or download pre-converted weights:
+
+```shell
+hf download openai/gpt-oss-120b --include "metal/*" --local-dir gpt-oss-120b/metal/
+hf download openai/gpt-oss-20b --include "metal/*" --local-dir gpt-oss-20b/metal/
+```
+
+Test the runtime with:
+
+```shell
+python src/gpt_oss/metal/examples/generate.py gpt-oss-20b/metal/model.bin -p "why did the chicken cross the road?"
+```
+
+## Harmony format and native tools
+
+### Harmony chat format
+
+The gpt-oss models expect prompts encoded with the Harmony chat format. The [`openai-harmony` library][harmony] provides helpers to render structured conversations, reason about stop tokens, and parse tool calls emitted by the model. Refer to the [Harmony guide](https://cookbook.openai.com/articles/openai-harmony) for the full specification.
+
+### Browser tool
+
+The browser tool exposes a crawl-and-cite workflow where the model scrolls through content, caches results, and emits citations in responses. The implementation lives in [src/gpt_oss/tools/browser](src/gpt_oss/tools/browser). Always create a fresh browser instance for each request so cached state remains isolated.
+
+### Python tool
+
+The Python tool allows the model to execute code snippets inside a sandboxed environment as part of its reasoning loop. The stateless reference implementation overrides the default Harmony description, so remember to embed the tool definition in the system message.
+
+```python
+import datetime
+from gpt_oss.tools.python_docker.docker_tool import PythonTool
+from openai_harmony import SystemContent, Message, Conversation, Role, load_harmony_encoding, HarmonyEncodingName
+
+encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+python_tool = PythonTool()
+
+system_message_content = SystemContent.new().with_conversation_start_date(
+    datetime.datetime.now().strftime("%Y-%m-%d")
+)
+
+system_message_content = system_message_content.with_tools(python_tool.tool_config)
+
+system_message = Message.from_role_and_content(Role.SYSTEM, system_message_content)
+messages = [system_message, Message.from_role_and_content(Role.USER, "What's the square root of 9001?")]
+conversation = Conversation.from_messages(messages)
+
+token_ids = encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+# ... run inference ...
+messages = encoding.parse_messages_from_completion_tokens(output_tokens, Role.ASSISTANT)
+if messages[-1].recipient == "python":
+    response_messages = await python_tool.process(messages[-1])
+    messages.extend(response_messages)
+```
+
+> [!WARNING]
+> The Python tool runs inside a permissive Docker container and is intended only as a reference. Harden the sandbox and enforce your own security controls before deploying in production.
+
+### Apply Patch tool
+
+`apply_patch` can be used to create, update, or delete files locally. It serves as a minimal example of file-editing workflows driven by the model.
+
+### Sera terminal experience
+
+The [Sera runtime](docs/sera.md) ships with a rich terminal client exposed through the `gpt-oss-sera-chat` console script. It downloads checkpoints, prepares the Sera manifest, and launches a split-pane interface with conversation, tool status, and diagnostics panes. Consult the CLI help (`gpt-oss-sera-chat --help`) for advanced options and review the [Sera Transfer guide](docs/operations/sera-transfer.md) if you need to materialize assets manually.
+
+## Repository guide
+
+### Layout
 
 ```
 .
@@ -233,556 +368,48 @@ This repository provides a collection of reference implementations:
 └── tests/data/          # Test resource files consumed by the suite
 ```
 
-The `src/` based layout keeps the importable package separate from auxiliary tooling, while the `tools/` and `tests/` directories group developer utilities and quality checks in predictable locations.
+The `src/` layout keeps the importable package separate from auxiliary tooling, while the `tools/` and `tests/` directories group developer utilities and quality checks in predictable locations.
 
-## Setup
+### Local development
 
-### Requirements
-
-- Python 3.12
-- On macOS: Install the Xcode CLI tools --> `xcode-select --install`
-- On Linux: These reference implementations require CUDA
-- On Windows: These reference implementations have not been tested on Windows. Try using solutions like Ollama if you are trying to run the model locally.
-
-### Installation
-
-If you want to try any of the code you can install it directly from [PyPI](https://pypi.org/project/gpt-oss/)
+Install the development extras (`pip install -e .[dev]`) to pull in linting and test dependencies. The repository relies on [pytest](https://docs.pytest.org/), [ruff](https://docs.astral.sh/ruff/), and [mypy](https://mypy-lang.org/) for validation. Run the following commands before sending changes:
 
 ```shell
-# if you just need the tools
-pip install gpt-oss
-# if you want to try the torch implementation
-pip install gpt-oss[torch]
-# if you want to try the triton implementation
-pip install gpt-oss[triton]
+pytest
+ruff check src tests
+mypy src
 ```
 
-If you want to modify the code or try the metal implementation set the project up locally:
+## Additional clients
 
-```shell
-git clone https://github.com/openai/gpt-oss.git
-GPTOSS_BUILD_METAL=1 pip install -e ".[metal]"
-```
+The models run well on popular community runtimes:
 
-### Quickstart: Sera terminal chat
+- **Ollama**
 
-The [Sera runtime](docs/sera.md) includes a full-featured terminal interface
-exposed through the `gpt-oss-sera-quickstart` console script. The helper takes
-care of downloading the published checkpoint, preparing the lightweight Sera
-artefacts, and starting an interactive session for you. By default the
-Quickstart reuses the Hugging Face cache so no extra copy of the checkpoint is
-created; pass `--materialize-download` if you need the files duplicated into a
-separate directory.
+  ```bash
+  # gpt-oss-20b
+  ollama pull gpt-oss:20b
+  ollama run gpt-oss:20b
 
-Follow the manual setup below to install the helper and launch the chat from a
-local environment.
+  # gpt-oss-120b
+  ollama pull gpt-oss:120b
+  ollama run gpt-oss:120b
+  ```
 
-#### Working from a local checkout
+  [Learn more about how to use gpt-oss with Ollama.](https://cookbook.openai.com/articles/gpt-oss/run-locally-ollama)
 
-Follow the manual setup if you intend to clone the repository, make local
-changes, or control the virtual environment explicitly.
+- **LM Studio**
 
-##### Prerequisites
+  ```bash
+  # gpt-oss-20b
+  lms get openai/gpt-oss-20b
+  # gpt-oss-120b
+  lms get openai/gpt-oss-120b
+  ```
 
-Confirm the following before you begin:
+  [Learn more about how to use gpt-oss with LM Studio.](https://cookbook.openai.com/articles/gpt-oss/run-locally-lmstudio)
 
-- Python **3.12** (or newer) with `pip` available on your `$PATH`.
-- A Hugging Face access token stored locally (`hf auth login`). Tokens
-  can be generated from the [Hugging Face settings
-  page](https://huggingface.co/settings/tokens).
-- A development environment capable of building wheels (virtual environment,
-  compiler toolchain, `git`, etc.).
-- The official [`safetensors`](https://pypi.org/project/safetensors/) wheel.
-  The repository includes a JSON-only stub for tests, but converting binary
-  checkpoints requires installing the published package (for example,
-  `pip install safetensors`). With the wheel present the converter loads
-  `model.safetensors` archives directly.
-- [`prompt_toolkit`](https://python-prompt-toolkit.readthedocs.io/) for the
-  richer terminal UI. Without it the helper gracefully falls back to a plain
-  prompt.
-
-> **Tip:** On shared machines, create a dedicated virtual environment so the
-> editable install and helper dependencies remain isolated.
-
-##### Step 1 — clone and install
-
-```shell
-git clone https://github.com/openai/gpt-oss.git
-cd gpt-oss
-python -m venv .venv && source .venv/bin/activate  # optional but recommended
-pip install -e .
-pip install huggingface-hub prompt_toolkit         # runtime + TUI dependency
-hf auth login                                      # skip if already authenticated
-```
-
-> **Working from a fork?** Use the commands that match your setup:
->
-> | Situation | Command(s) |
-> | --- | --- |
-> | Fresh clone of your fork | <code>git clone https://github.com/&lt;your-username&gt;/gpt-oss.git</code> |
-> | Keep your fork in sync | <code>git remote add upstream https://github.com/openai/gpt-oss.git</code> (run once per clone) |
-> | Already cloned <code>openai/gpt-oss</code> but meant to use your fork | <code>git remote set-url origin https://github.com/&lt;your-username&gt;/gpt-oss.git</code> (no reclone needed) |
->
-> After updating remotes you can `git fetch upstream` and `git merge upstream/main`
-> (or your preferred sync strategy) to bring your fork up to date.
-
-> **Windows tip:** Replace `source .venv/bin/activate` in the snippet above with
-> the activation command for your shell:
->
-> - PowerShell: <code>.\.venv\Scripts\Activate.ps1</code>
-> - Command Prompt: <code>.\.venv\Scripts\activate.bat</code>
-
-> **Note:** If the `hf` command is not on your `PATH`, especially on Windows,
-> invoke it with the full path (for example, `.\\.venv\\Scripts\\hf.exe auth login`).
-> Non-interactive environments can pass the token directly with
-> `hf auth login --token <your_token>`.
-
-##### Step 2 — start the chat
-
-```shell
-gpt-oss-sera-quickstart --chat
-```
-
-Once the environment is activated, the `gpt-oss-sera-quickstart --chat`
-entrypoint is available on your `PATH`. If the script is unavailable, invoke
-the helper directly with `python -m gpt_oss.tools.sera_quickstart --chat`.
-
-The first invocation downloads `openai/gpt-oss-20b`, caches the Sera artefacts
-under `./gpt-oss-sera-20b`, and opens the default **Sera terminal UI (TUI)**.
-The helper scopes Hugging Face downloads to the `original/` checkpoint payload
-and tokenizer metadata so the quickstart avoids fetching the large converted
-variants present in the repository.
-Later runs reuse the cached artefacts unless you request a clean slate.
-
-When the TUI appears it presents three panels:
-
-- **Conversation** – running transcript of the session.
-- **Operations** – enabled tools, hotkeys, and manifest metadata.
-- **Diagnostics** – live metrics refreshed according to `--stats-refresh`.
-
-Common key bindings include:
-
-| Key            | Action |
-|----------------|--------|
-| `F2`, `F3`     | Toggle optional tools (`browser`, `python`) |
-| `F9`           | Print manifest metadata into the transcript |
-| `F10`          | Export the latest diagnostics snapshot to `sera_diagnostics_*.json` |
-| `Ctrl+C` / `Esc` | Exit the session |
-
-#### Additional flags
-
-You can forward arguments directly to the chat CLI with repeated `--chat-arg`
-flags. Common examples:
-
-- `--force-clean` — delete cached artefacts before downloading.
-- `--chat-arg --tool --chat-arg python` — pre-enable the Python tool.
-- `--chat-arg --metrics --chat-arg plain` — show per-turn metrics in the
-  transcript (use `json` for structured logs).
-- `--chat-arg --plain` — skip the TUI and stay in the legacy prompt.
-
-Run `gpt-oss-sera-quickstart --help` (or `python -m gpt_oss.tools.sera_quickstart --help`
-if the console script is unavailable) for the full list of supported flags and
-environment variables. The underlying `gpt-oss-sera-chat` CLI exposes the
-`--tui` (default) and `--plain` switches directly, so there is no separate
-`--chat` flag to look for on the helper.
-
-## Download the model
-
-You can download the model weights from the [Hugging Face Hub](https://huggingface.co/collections/openai/gpt-oss-68911959590a1634ba11c7a4) directly from Hugging Face CLI:
-
-```shell
-# gpt-oss-120b
-hf download openai/gpt-oss-120b --include "original/*" --local-dir gpt-oss-120b/
-
-# gpt-oss-20b
-hf download openai/gpt-oss-20b --include "original/*" --local-dir gpt-oss-20b/
-```
-
-## Reference PyTorch implementation
-
-We include an inefficient reference PyTorch implementation in [src/gpt_oss/torch/model.py](src/gpt_oss/torch/model.py). This code uses basic PyTorch operators to show the exact model architecture, with a small addition of supporting tensor parallelism in MoE so that the larger model can run with this code (e.g., on 4xH100 or 2xH200). In this implementation, we upcast all weights to BF16 and run the model in BF16.
-
-To run the reference implementation, install the dependencies:
-
-```shell
-pip install -e ".[torch]"
-```
-
-And then run:
-
-```shell
-# On 4xH100:
-torchrun --nproc-per-node=4 -m gpt_oss.cli.generate_cli gpt-oss-120b/original/
-```
-
-## Reference Triton implementation (single GPU)
-
-We also include an optimized reference implementation that uses [an optimized triton MoE kernel](https://github.com/triton-lang/triton/tree/main/python/triton_kernels/triton_kernels) that supports MXFP4. It also has some optimization on the attention code to reduce the memory cost. To run this implementation, the nightly version of triton and torch will be installed. This version can be run on a single 80GB GPU for `gpt-oss-120b`.
-
-To install the reference Triton implementation run
-
-```shell
-# You need to install triton from source to use the triton implementation
-git clone https://github.com/triton-lang/triton
-cd triton/
-pip install -r python/requirements.txt
-pip install -e . --verbose --no-build-isolation
-pip install -e python/triton_kernels
-
-# Install the gpt-oss triton implementation
-pip install -e ".[triton]"
-```
-
-And then run:
-
-```shell
-# On 1xH100
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-python -m gpt_oss.cli.generate_cli --backend triton gpt-oss-120b/original/
-```
-
-If you encounter `torch.OutOfMemoryError`, make sure to turn on the expandable allocator to avoid crashes when loading weights from the checkpoint.
-
-## Reference Metal implementation
-
-Additionally we are providing a reference implementation for Metal to run on Apple Silicon. This implementation is not production-ready but is accurate to the PyTorch implementation.
-
-The implementation will get automatically compiled when running the `.[metal]` installation on an Apple Silicon device:
-
-```shell
-GPTOSS_BUILD_METAL=1 pip install -e ".[metal]"
-```
-
-To perform inference you'll need to first convert the SafeTensor weights from Hugging Face into the right format using:
-
-```shell
-python src/gpt_oss/metal/scripts/create-local-model.py -s <model_dir> -d <output_file>
-```
-
-Or download the pre-converted weights:
-
-```shell
-hf download openai/gpt-oss-120b --include "metal/*" --local-dir gpt-oss-120b/metal/
-hf download openai/gpt-oss-20b --include "metal/*" --local-dir gpt-oss-20b/metal/
-```
-
-To test it you can run:
-
-```shell
-python src/gpt_oss/metal/examples/generate.py gpt-oss-20b/metal/model.bin -p "why did the chicken cross the road?"
-```
-
-## Harmony format & tools
-
-Along with the model, we are also releasing a new chat format library `harmony` to interact with the model. Check [this guide](https://cookbook.openai.com/articles/openai-harmony) for more info about harmony.
-
-We also include two system tools for the model: browsing and python container. Check [src/gpt_oss/tools](src/gpt_oss/tools) for the tool implementation.
-
-## Clients
-
-### Terminal Chat
-
-The terminal chat application is a basic example of how to use the harmony format together with the PyTorch, Triton, and vLLM implementations. It also exposes both the python and browser tool as optional tools that can be used.
-
-If you just want to try the Sera runtime, run the quickstart helper described in
-[Quickstart: Sera terminal chat](#quickstart-sera-terminal-chat). It handles the
-download, conversion, and launches `gpt-oss-sera-chat` for you.
-
-```bash
-usage: python -m gpt_oss.cli.chat_cli [-h] [-r REASONING_EFFORT] [-a] [-b] [--show-browser-results] [-p] [--developer-message DEVELOPER_MESSAGE] [-c CONTEXT] [--raw] [--backend {triton,torch,vllm}] FILE
-
-Chat example
-
-positional arguments:
-  FILE                  Path to the SafeTensors checkpoint
-
-options:
-  -h, --help            show this help message and exit
-  -r REASONING_EFFORT, --reasoning-effort REASONING_EFFORT
-                        Reasoning effort (default: low)
-  -a, --apply-patch     Make apply_patch tool available to the model (default: False)
-  -b, --browser         Use browser tool (default: False)
-  --show-browser-results
-                        Show browser results (default: False)
-  -p, --python          Use python tool (default: False)
-  --developer-message DEVELOPER_MESSAGE
-                        Developer message (default: )
-  -c CONTEXT, --context CONTEXT
-                        Max context length (default: 8192)
-  --raw                 Raw mode (does not render Harmony encoding) (default: False)
-  --backend {triton,torch,vllm}
-                        Inference backend (default: triton)
-```
-
-> [!NOTE]
-> The torch and triton implementations require original checkpoint under `gpt-oss-120b/original/` and `gpt-oss-20b/original/` respectively. While vLLM uses the Hugging Face converted checkpoint under `gpt-oss-120b/` and `gpt-oss-20b/` root directory respectively.
-
-#### Sera manifest snapshots
-
-The Sera reference implementation can also be driven from the lightweight
-transfer manifest generated by `python -m gpt_oss.tools.sera_transfer`. Once
-you have produced the artefacts you can chat with the model using either the
-module entry point or the installed console script. The end-to-end flow looks
-like this:
-
-```bash
-# 1. Download the checkpoint from Hugging Face (requires `pip install hf-transfer`).
-hf download openai/gpt-oss-20b --local-dir gpt-oss-20b
-
-# 2. Convert it into a Sera manifest snapshot.
-python -m gpt_oss.tools.sera_transfer --source gpt-oss-20b --output gpt-oss-sera-20b
-
-# 3. Launch the streaming chat CLI against the converted artefacts.
-gpt-oss-sera-chat --manifest gpt-oss-sera-20b --tool python --prompt "hello" --metrics plain
-```
-
-The manifest directory must contain `sera_manifest.bin`, an `arrays/` directory,
-and a runtime snapshot such as `sera_state.pkl`. You can omit `--manifest` when
-the `GPT_OSS_SERA_MANIFEST` environment variable points to a manifest
-directory. Tools are optional and can be enabled with repeated `--tool` flags
-(currently `browser` and `python`).
-
-By default `gpt-oss-sera-chat` now launches a prompt_toolkit-powered terminal
-UI with three panes: a scrolling transcript, live diagnostics, and an
-operations sidebar. The sidebar lists hotkeys for toggling optional tools (`F2`
-for `browser`, `F3` for `python`), viewing manifest metadata (`F9`), exporting
-the latest diagnostics without leaving the chat (`F10`), and exiting. Metrics
-selected via `--metrics` are reflected in both the transcript and diagnostics
-pane. Use `--plain` to restore the legacy single-pane text interface or pass
-`--tui` explicitly if you disable it in shell aliases.
-
-An asciinema recording that previews the layout and hotkeys is available at
-`docs/media/sera-tui-demo.cast`:
-
-```bash
-asciinema play docs/media/sera-tui-demo.cast
-```
-
-The CLI still streams decoded tokens as they are returned by the runtime and
-can mirror per-turn trust/latency summaries in plain text or JSON by using the
-`--metrics` flag.
-
-### Responses API
-
-We also include an example Responses API server. This server does not implement every feature and event of the Responses API but should be compatible with most of the basic use cases and serve as inspiration for anyone building their own server. Some of our inference partners are also offering their own Responses API.
-
-You can start this server with the following inference backends:
-
-- `triton` — uses the triton implementation
-- `metal` — uses the metal implementation on Apple Silicon only
-- `ollama` — uses the Ollama /api/generate API as an inference solution
-- `vllm` — uses your installed vllm version to perform inference
-- `transformers` — uses your installed transformers version to perform local inference
-
-```bash
-usage: python -m gpt_oss.api.responses.serve [-h] [--checkpoint FILE] [--port PORT] [--inference-backend BACKEND]
-
-Responses API server
-
-options:
-  -h, --help                    show this help message and exit
-  --checkpoint FILE             Path to the SafeTensors checkpoint
-  --port PORT                   Port to run the server on
-  --inference-backend BACKEND   Inference backend to use
-```
-
-### Codex
-
-We support [codex](https://github.com/openai/codex) as a client for gpt-oss. To run the 20b version, set this to `~/.codex/config.toml`:
-
-```
-disable_response_storage = true
-show_reasoning_content = true
-
-[model_providers.local]
-name = "local"
-base_url = "http://localhost:11434/v1"
-
-[profiles.oss]
-model = "gpt-oss:20b"
-model_provider = "local"
-```
-
-This will work with any chat completions-API compatible server listening on port 11434, like ollama. Start the server and point codex to the oss model:
-
-```
-ollama run gpt-oss:20b
-codex -p oss
-```
-
-## Tools
-
-### Sera conversion and chat CLI
-
-The repository ships with a Sera Transfer tool that deterministically converts a
-checkpoint into the [Sera runtime](docs/specs/Sera-Transfer.txt) artefacts and a
-companion chat CLI for quick experiments.
-
-Before running the converter make sure the official `safetensors` wheel is
-installed. The repository ships a JSON-only stub for unit tests; installing the
-upstream package (for example via `pip install safetensors`) enables loading
-binary checkpoints during conversion.
-
-1. Convert the original model (example for `gpt-oss-20b`):
-
-   ```bash
-   python -m gpt_oss.tools.sera_transfer \
-       --source /path/to/gpt-oss-20b \
-       --output /path/to/gpt-oss-sera-20b \
-       --r 512 \
-       --rv 12 \
-       --topL 12
-   ```
-
-   The command writes `sera_manifest.bin`, binary array artefacts, and a
-   `sera_state.pkl` snapshot that can be restored via
-   :func:`gpt_oss.inference.sera.Sera.restore`.
-
-2. Launch the Sera chat CLI:
-
-   ```bash
-   gpt-oss-sera-chat --artifacts /path/to/gpt-oss-sera-20b
-   ```
-
-   You can also set ``GPT_OSS_SERA_ARTIFACTS`` to point at the artefact directory
-   and run ``gpt-oss-sera-chat`` without arguments. For automated smoke tests the
-   CLI exposes ``--prompt`` to execute a single turn and exit.
-
-### Browser
-
-> [!WARNING]
-> This implementation is purely for educational purposes and should not be used in production. You should implement your own equivalent of the [`YouComBackend`](src/gpt_oss/tools/simple_browser/backend.py) class with your own browsing environment. Currently we have available `YouComBackend` and `ExaBackend`.
-
-Both gpt-oss models were trained with the capability to browse using the `browser` tool that exposes the following three methods:
-
-- `search` to search for key phrases
-- `open` to open a particular page
-- `find` to look for contents on a page
-
-#### Usage
-
-To enable the browser tool, you'll have to place the definition into the `system` message of your harmony formatted prompt. You can either use the `with_browser_tool()` method if your tool implements the full interface or modify the definition using `with_tools()`. For example:
-
-```python
-import datetime
-from gpt_oss.tools.simple_browser import SimpleBrowserTool
-from gpt_oss.tools.simple_browser.backend import YouComBackend
-from openai_harmony import SystemContent, Message, Conversation, Role, load_harmony_encoding, HarmonyEncodingName
-
-encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-
-# Depending on the choice of the browser backend you need corresponding env variables setup
-# In case you use You.com backend requires you to have set the YDC_API_KEY environment variable,
-# while for Exa you might need EXA_API_KEY environment variable set
-backend = YouComBackend(
-    source="web",
-)
-# backend = ExaBackend(
-#  source="web",
-# )
-browser_tool = SimpleBrowserTool(backend=backend)
-
-# create a basic system prompt
-system_message_content = SystemContent.new().with_conversation_start_date(
-    datetime.datetime.now().strftime("%Y-%m-%d")
-)
-
-# if you want to use the browser tool
-if use_browser_tool:
-    # enables the tool
-    system_message_content = system_message_content.with_tools(browser_tool.tool_config)
-    # alternatively you could use the following if your tool is not stateless
-    system_message_content = system_message_content.with_browser_tool()
-
-# construct the system message
-system_message = Message.from_role_and_content(Role.SYSTEM, system_message_content)
-
-# create the overall prompt
-messages = [system_message, Message.from_role_and_content(Role.USER, "What's the weather in SF?")]
-conversation = Conversation.from_messages(messages)
-
-# convert to tokens
-token_ids = encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
-
-# perform inference
-# ...
-
-# parse the output
-messages = encoding.parse_messages_from_completion_tokens(output_tokens, Role.ASSISTANT)
-last_message = messages[-1]
-if last_message.recipient.startswith("browser"):
-  # perform browser call
-  response_messages = await browser_tool.process(last_message)
-
-  # extend the current messages and run inference again
-  messages.extend(response_messages)
-```
-
-#### Details
-
-To control the context window size this tool uses a scrollable window of text that the model can interact with. So it might fetch the first 50 lines of a page and then scroll to the next 20 lines after that. The model has also been trained to then use citations from this tool in its answers.
-
-To improve performance the tool caches requests so that the model can revisit a different part of a page without having to reload the page. For that reason you should create a new browser instance for every request.
-
-### Python
-
-The model was trained to use a python tool to perform calculations and other actions as part of its chain-of-thought. During the training the model used a stateful tool which makes running tools between CoT loops easier. This reference implementation, however, uses a stateless mode. As a result the PythonTool defines its own tool description to override the definition in [`openai-harmony`][harmony].
-
-> [!WARNING]
-> This implementation runs in a permissive Docker container which could be problematic in cases like prompt injections. It's serving as an example and you should consider implementing your own container restrictions in production.
-
-#### Usage
-
-To enable the python tool, you'll have to place the definition into the `system` message of your harmony formatted prompt. You can either use the `with_python()` method if your tool implements the full interface or modify the definition using `with_tools()`. For example:
-
-```python
-import datetime
-from gpt_oss.tools.python_docker.docker_tool import PythonTool
-from openai_harmony import SystemContent, Message, Conversation, Role, load_harmony_encoding, HarmonyEncodingName
-
-encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-
-python_tool = PythonTool()
-
-# create a basic system prompt
-system_message_content = SystemContent.new().with_conversation_start_date(
-    datetime.datetime.now().strftime("%Y-%m-%d")
-)
-
-# if you want to use the python tool
-if use_python_tool:
-    # enables the tool making sure that the prompt gets set with the stateless tool description
-    system_message_content = system_message_content.with_tools(python_tool.tool_config)
-    # alternatively you could use the following if your tool is not stateless
-    system_message_content = system_message_content.with_python()
-
-# construct the system message
-system_message = Message.from_role_and_content(Role.SYSTEM, system_message_content)
-
-# create the overall prompt
-messages = [system_message, Message.from_role_and_content(Role.USER, "What's the square root of 9001?")]
-conversation = Conversation.from_messages(messages)
-
-# convert to tokens
-token_ids = encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
-
-# perform inference
-# ...
-
-# parse the output
-messages = encoding.parse_messages_from_completion_tokens(output_tokens, Role.ASSISTANT)
-last_message = messages[-1]
-if last_message.recipient == "python":
-  # perform python call
-  response_messages = await python_tool.process(last_message)
-
-  # extend the current messages and run inference again
-  messages.extend(response_messages)
-```
-
-### Apply Patch
-
-`apply_patch` can be used to create, update or delete files locally.
+- **Awesome gpt-oss** — community adapters, tools, and integrations curated in [awesome-gpt-oss.md](./awesome-gpt-oss.md).
 
 ## Other details
 
@@ -793,9 +420,9 @@ We released the models with native quantization support. Specifically, we use [M
 - `tensor.blocks` stores the actual fp4 values. We pack every two values in one `uint8` value.
 - `tensor.scales` stores the block scale. The block scaling is done among the last dimension for all MXFP4 tensors.
 
-All other tensors will be in BF16. We also recommend using BF16 as the activation precision for the model.
+All other tensors are stored in BF16. We recommend using BF16 as the activation precision for the model.
 
-### Recommended Sampling Parameters
+### Recommended sampling parameters
 
 We recommend sampling with `temperature=1.0` and `top_p=1.0`.
 
@@ -809,12 +436,12 @@ The reference implementations in this repository are meant as a starting point a
 
 ```bibtex
 @misc{openai2025gptoss120bgptoss20bmodel,
-      title={gpt-oss-120b & gpt-oss-20b Model Card}, 
+      title={gpt-oss-120b & gpt-oss-20b Model Card},
       author={OpenAI},
       year={2025},
       eprint={2508.10925},
       archivePrefix={arXiv},
       primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2508.10925}, 
+      url={https://arxiv.org/abs/2508.10925},
 }
 ```
