@@ -907,6 +907,4 @@ the bridge stanza is missing, the external bridge MUST run in a fully OFF mode:
   - No modification of y_base by external references.
   - Diagnostics for O(0) hits and guard are set to zero or inactive.
 
-This is a valid Sera v2.3 configuration.
-
 
