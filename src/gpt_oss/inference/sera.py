@@ -3796,6 +3796,7 @@ class Sera:
                     "byte_len": info["byte_len"],
                     "path": info["path"],
                     "sha256": info.get("sha256"),
+                    "flags": info.get("flags", 0),
                 }
                 for name, info in arrays_info.items()
             },
@@ -4062,12 +4063,27 @@ def _validate_transfer_arrays(
                 raise ValueError(
                     f"Array {array_path} failed SHA-256 validation: expected {expected_sha}, got {digest_bytes.hex()}"
                 )
+        flags = header["flags"]
+        if flags & ~0x7:
+            raise ValueError(
+                f"Array {array_path} declares unsupported flag bits: 0x{flags:X}"
+            )
+        if not (flags & 0x1):
+            raise ValueError(
+                f"Array {array_path} must declare row-major layout via flag bit 0"
+            )
+        if header["reserved"]:
+            raise ValueError(
+                f"Array {array_path} reserved header field must be zero"
+            )
+
         arrays[name] = {
             "dtype": header["dtype"],
             "shape": header["shape"],
             "byte_len": header["byte_len"],
             "path": array_path,
             "sha256": expected_sha,
+            "flags": flags,
         }
     return arrays
 
