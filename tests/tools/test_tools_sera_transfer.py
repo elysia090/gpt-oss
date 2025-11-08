@@ -573,7 +573,7 @@ def test_model_config_missing_dim_fields_raises_helpful_error() -> None:
 
     message = str(excinfo.value)
     assert "d_model" in message
-    assert "docs/howto-sera-transfer.md" in message
+    assert "docs/operations/sera-transfer.md" in message
 
 
 def _read_header(path: Path) -> sera_transfer.ArrayHeader:
