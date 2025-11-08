@@ -667,12 +667,25 @@ def gram_schmidt(columns: List[List[float]]) -> List[List[float]]:
 
 
 def orthonormal_matrix(rows: int, cols: int, generator: Iterable[List[float]]) -> List[List[float]]:
-    columns = []
+    orth: List[List[float]] = []
     for column in generator:
-        columns.append(column[:rows])
-        if len(columns) == cols:
+        vec = list(column[:rows])
+        if len(vec) < rows:
+            vec.extend([0.0] * (rows - len(vec)))
+        for basis in orth:
+            dot = sum(a * b for a, b in zip(vec, basis))
+            vec = [a - dot * b for a, b in zip(vec, basis)]
+        norm = math.sqrt(sum(a * a for a in vec))
+        if norm < 1e-12:
+            continue
+        vec = [a / norm for a in vec]
+        orth.append(vec)
+        if len(orth) == cols:
             break
-    orth = gram_schmidt(columns)
+    if len(orth) < cols:
+        raise ValueError(
+            "Unable to construct orthonormal basis (insufficient independent vectors)"
+        )
     return transpose(orth)
 
 
@@ -715,6 +728,17 @@ class ModelConfig:
     tau: float
     layers: List[LayerConfig]
     rope_theta: float | None = None
+    num_hidden_layers: int | None = None
+    num_experts: int | None = None
+    experts_per_token: int | None = None
+    intermediate_size: int | None = None
+    swiglu_limit: float | None = None
+    num_key_value_heads: int | None = None
+    sliding_window: int | None = None
+    initial_context_length: int | None = None
+    rope_scaling_factor: float | None = None
+    rope_ntk_alpha: float | None = None
+    rope_ntk_beta: float | None = None
 
     @staticmethod
     def from_dict(
@@ -737,6 +761,16 @@ class ModelConfig:
             except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
                 raise ValueError(
                     f"Model config field '{name}' must be an integer, got {value!r}"
+                ) from exc
+
+        def _coerce_float(name: str, value: object | None) -> float | None:
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
+                raise ValueError(
+                    f"Model config field '{name}' must be a float, got {value!r}"
                 ) from exc
 
         d_model = _coerce_int(
@@ -796,6 +830,26 @@ class ModelConfig:
         vocab_size = int(data.get("vocab_size", 0) or 0)
         tau = float(data.get("tau", 1.0))
         rope_theta = data.get("rope_theta")
+        num_hidden_layers = _coerce_int("num_hidden_layers", raw.get("num_hidden_layers"))
+        num_experts = _coerce_int("num_experts", raw.get("num_experts"))
+        experts_per_token = _coerce_int("experts_per_token", raw.get("experts_per_token"))
+        intermediate_size = _coerce_int("intermediate_size", raw.get("intermediate_size"))
+        swiglu_limit = _coerce_float("swiglu_limit", raw.get("swiglu_limit"))
+        sliding_window = _coerce_int("sliding_window", raw.get("sliding_window"))
+        initial_context_length = _coerce_int(
+            "initial_context_length", raw.get("initial_context_length")
+        )
+        rope_scaling_factor = _coerce_float(
+            "rope_scaling_factor", raw.get("rope_scaling_factor")
+        )
+        rope_ntk_alpha = _coerce_float("rope_ntk_alpha", raw.get("rope_ntk_alpha"))
+        rope_ntk_beta = _coerce_float("rope_ntk_beta", raw.get("rope_ntk_beta"))
+        if num_hidden_layers is None and "n_layers" in raw:
+            num_hidden_layers = _coerce_int("n_layers", raw.get("n_layers"))
+        if num_hidden_layers is None and "num_layers" in raw:
+            num_hidden_layers = _coerce_int("num_layers", raw.get("num_layers"))
+        if intermediate_size is None and "ffn_dim" in raw:
+            intermediate_size = _coerce_int("ffn_dim", raw.get("ffn_dim"))
 
         layer_entries = list(data.get("layers", []) or [])
         layers: List[LayerConfig]
@@ -826,6 +880,15 @@ class ModelConfig:
                 head_dim=head_dim,
             )
 
+        if num_hidden_layers is None:
+            num_hidden_layers = len(layers)
+        elif num_hidden_layers != len(layers):
+            logger.warning(
+                "Model config reports %s hidden layers but %s were inferred",
+                num_hidden_layers,
+                len(layers),
+            )
+
         return ModelConfig(
             d_model=d_model,
             n_heads=n_heads,
@@ -834,6 +897,17 @@ class ModelConfig:
             tau=tau,
             layers=layers,
             rope_theta=float(rope_theta) if rope_theta is not None else None,
+            num_hidden_layers=num_hidden_layers,
+            num_experts=num_experts,
+            experts_per_token=experts_per_token,
+            intermediate_size=intermediate_size,
+            swiglu_limit=swiglu_limit,
+            num_key_value_heads=kv_heads,
+            sliding_window=sliding_window,
+            initial_context_length=initial_context_length,
+            rope_scaling_factor=rope_scaling_factor,
+            rope_ntk_alpha=rope_ntk_alpha,
+            rope_ntk_beta=rope_ntk_beta,
         )
 
     @staticmethod
@@ -1121,6 +1195,11 @@ def _resolve_safe_open():
                 return safe_open
 
         try:
+            existing_module = sys.modules.get("safetensors")
+            if existing_module is not None:
+                module_name = getattr(existing_module, "__name__", "")
+                if module_name == "gpt_oss._stubs.safetensors":
+                    sys.modules.pop("safetensors", None)
             from safetensors import safe_open as imported_safe_open
         except ModuleNotFoundError:
             return safe_open
@@ -1284,9 +1363,13 @@ def compute_prf(cfg: ModelConfig, tensors: Mapping[str, TensorLike], r: int) -> 
 
 
 def hadamard_generator(prng: SplitMix64, rows: int, cols: int) -> Iterable[List[float]]:
-    for _ in range(cols):
+    produced = 0
+    while True:
         column = [1.0 if (prng.next() & 1) == 0 else -1.0 for _ in range(rows)]
+        produced += 1
         yield column
+        if cols > 0 and produced >= cols:
+            cols = 0  # allow additional columns if the caller needs more
 
 
 def gaussian_matrix(prng: SplitMix64, rows: int, cols: int) -> List[List[float]]:
@@ -1889,11 +1972,24 @@ def convert(
         prf = compute_prf(cfg, tensors, local_r)
         for name, data in prf.items():
             store_array(name, data, "f32")
-        metadata["attention"] = {
+        attention_meta = {
             "features": local_r,
             "tau": getattr(cfg, "tau", 1.0),
             "whitening_sig2": prf.get("whitening_sig2", []),
         }
+        optional_attention = {
+            "rope_theta": cfg.rope_theta,
+            "num_key_value_heads": cfg.num_key_value_heads,
+            "sliding_window": cfg.sliding_window,
+            "initial_context_length": cfg.initial_context_length,
+            "rope_scaling_factor": cfg.rope_scaling_factor,
+            "rope_ntk_alpha": cfg.rope_ntk_alpha,
+            "rope_ntk_beta": cfg.rope_ntk_beta,
+        }
+        for key, value in optional_attention.items():
+            if value is not None:
+                attention_meta[key] = value
+        metadata["attention"] = attention_meta
 
         overlays = compute_overlays(cfg, tensors, local_r, local_r_v)
         for name, data in overlays.items():
@@ -1911,6 +2007,16 @@ def convert(
         store_array("linear_weights", linear_data["linear_weights"], "f32")
         store_array("linear_bias", linear_data["linear_bias"], "f32")
         store_array("cuckoo_delta", linear_data["cuckoo_delta"], "u8")
+        linear_meta = dict(linear_meta)
+        optional_linear = {
+            "num_experts": cfg.num_experts,
+            "experts_per_token": cfg.experts_per_token,
+            "intermediate_size": cfg.intermediate_size,
+            "swiglu_limit": cfg.swiglu_limit,
+        }
+        for key, value in optional_linear.items():
+            if value is not None:
+                linear_meta[key] = value
         metadata["linear"] = linear_meta
 
         memory_data, memory_meta = memory_coefficients(cfg)

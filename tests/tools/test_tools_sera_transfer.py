@@ -599,6 +599,56 @@ def test_model_config_infers_layers_from_generic_suffixes() -> None:
     assert layer.b2.endswith("down_proj.bias")
 
 
+def test_model_config_records_optional_fields() -> None:
+    config = {
+        "hidden_size": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "vocab_size": 8,
+        "num_hidden_layers": 1,
+        "num_experts": 32,
+        "experts_per_token": 4,
+        "intermediate_size": 16,
+        "swiglu_limit": 7.0,
+        "sliding_window": 128,
+        "initial_context_length": 4096,
+        "rope_theta": 150000.0,
+        "rope_scaling_factor": 32.0,
+        "rope_ntk_alpha": 1.0,
+        "rope_ntk_beta": 32.0,
+        "tau": 0.75,
+    }
+
+    rng = random.Random(3)
+    tensors = {
+        "model.layers.0.attention.k_proj.weight": _create_matrix(4, 4, rng),
+        "model.layers.0.attention.o_proj.weight": _create_matrix(4, 4, rng),
+        "model.layers.0.mlp.gate_proj.weight": _create_matrix(16, 4, rng),
+        "model.layers.0.mlp.down_proj.weight": _create_matrix(4, 16, rng),
+        "model.layers.0.mlp.gate_proj.bias": _create_vector(16, rng),
+        "model.layers.0.mlp.down_proj.bias": _create_vector(4, rng),
+    }
+
+    cfg = sera_transfer.ModelConfig.from_dict(config, tensors=tensors)
+
+    assert cfg.num_hidden_layers == 1
+    assert cfg.num_experts == 32
+    assert cfg.experts_per_token == 4
+    assert cfg.intermediate_size == 16
+    assert cfg.swiglu_limit == pytest.approx(7.0)
+    assert cfg.sliding_window == 128
+    assert cfg.initial_context_length == 4096
+    assert cfg.rope_scaling_factor == pytest.approx(32.0)
+    assert cfg.rope_ntk_alpha == pytest.approx(1.0)
+    assert cfg.rope_ntk_beta == pytest.approx(32.0)
+
+    serialised = sera_transfer._config_to_dict(cfg)
+    assert serialised["num_experts"] == 32
+    assert serialised["experts_per_token"] == 4
+    assert serialised["rope_scaling_factor"] == pytest.approx(32.0)
+    assert serialised["rope_ntk_beta"] == pytest.approx(32.0)
+
+
 def test_model_config_missing_dim_fields_raises_helpful_error() -> None:
     with pytest.raises(ValueError) as excinfo:
         sera_transfer.ModelConfig.from_dict({"foo": "bar"})
@@ -694,6 +744,62 @@ def test_cli_round_trip(tmp_path: Path, factory) -> None:
     assert snapshot["metadata"]["attention"]["features"] == 4
 
 
+def test_convert_preserves_optional_config_metadata(tmp_path: Path) -> None:
+    source = tmp_path / "optional_config"
+    source.mkdir()
+
+    config = {
+        "hidden_size": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 2,
+        "vocab_size": 8,
+        "num_hidden_layers": 1,
+        "num_experts": 32,
+        "experts_per_token": 4,
+        "intermediate_size": 16,
+        "swiglu_limit": 7.0,
+        "sliding_window": 128,
+        "initial_context_length": 4096,
+        "rope_theta": 150000.0,
+        "rope_scaling_factor": 32.0,
+        "rope_ntk_alpha": 1.0,
+        "rope_ntk_beta": 32.0,
+        "tau": 0.5,
+    }
+
+    rng = random.Random(6)
+    tensors = {
+        "model.layers.0.attention.k_proj.weight": _create_matrix(4, 4, rng),
+        "model.layers.0.attention.o_proj.weight": _create_matrix(4, 4, rng),
+        "model.layers.0.mlp.gate_proj.weight": _create_matrix(16, 4, rng),
+        "model.layers.0.mlp.down_proj.weight": _create_matrix(4, 16, rng),
+        "model.layers.0.mlp.gate_proj.bias": _create_vector(16, rng),
+        "model.layers.0.mlp.down_proj.bias": _create_vector(4, rng),
+    }
+
+    (source / "config.json").write_text(json.dumps(config))
+    save_file(tensors, source / "model.safetensors")
+
+    output = tmp_path / "output"
+    sera_transfer.convert(source, output, r=4, r_v=2, top_l=2)
+
+    snapshot = pickle.loads((output / "sera_state.pkl").read_bytes())
+    model_cfg = snapshot["model_config"]
+    assert model_cfg["num_hidden_layers"] == 1
+    assert model_cfg["num_experts"] == 32
+    assert model_cfg["rope_scaling_factor"] == pytest.approx(32.0)
+
+    attention_meta = snapshot["metadata"]["attention"]
+    assert attention_meta["rope_theta"] == pytest.approx(150000.0)
+    assert attention_meta["rope_scaling_factor"] == pytest.approx(32.0)
+    assert attention_meta["sliding_window"] == 128
+    assert attention_meta["num_key_value_heads"] == 2
+
+    linear_meta = snapshot["metadata"]["linear"]
+    assert linear_meta["num_experts"] == 32
+    assert linear_meta["experts_per_token"] == 4
+    assert linear_meta["swiglu_limit"] == pytest.approx(7.0)
 def test_cli_verbose_emits_search_hints(tmp_path: Path) -> None:
     source = _create_openai_checkpoint(tmp_path / "verbose_logging")
     output = tmp_path / "output"
