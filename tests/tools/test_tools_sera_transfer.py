@@ -1098,6 +1098,12 @@ def test_cli_verbose_emits_search_hints(tmp_path: Path) -> None:
     assert "Model config keys" in log_output
     assert "d_model" in log_output
     assert "vocab_size" in log_output
+    assert "Generating tokenizer arrays" in log_output
+    assert "Generating PRF arrays" in log_output
+    assert "Computing attention overlays" in log_output
+    assert "Collapsing FFN weights" in log_output
+    assert "Computing memory coefficients" in log_output
+    assert "Constructing bridge records" in log_output
 
 
 def test_format_model_config_keys_preserves_remaining_order() -> None:
