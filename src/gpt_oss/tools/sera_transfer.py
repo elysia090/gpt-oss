@@ -19,7 +19,7 @@ import sys
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import MutableMapping
+from collections.abc import Iterable as _Iterable, Mapping as _Mapping, MutableMapping
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
 _SAFETENSORS_MISSING_MSG = (
@@ -1744,6 +1744,36 @@ def _decode_safetensor_entry(dtype: str, shape: Sequence[int], data: memoryview)
     return array.reshape(tuple(int(dim) for dim in shape))
 
 
+def _iter_deserialized_entries(raw: Any) -> Iterable[tuple[str, Mapping[str, Any]]]:
+    if not isinstance(raw, _Iterable):
+        raise TypeError("Expected iterable safetensors payload")
+    for entry in raw:
+        name: Any
+        payload: Any
+        if isinstance(entry, tuple) and len(entry) == 2:
+            name, payload = entry
+        elif isinstance(entry, dict):
+            if "name" not in entry:
+                raise TypeError("Missing 'name' field in safetensors entry")
+            name = entry["name"]
+            if "tensor" in entry:
+                payload = entry["tensor"]
+            elif "value" in entry:
+                payload = entry["value"]
+            else:
+                payload = entry
+        else:
+            raise TypeError("Unrecognised safetensors entry structure")
+
+        if not isinstance(payload, _Mapping):
+            raise TypeError("Safetensors entry payload must be a mapping")
+
+        if not {"dtype", "shape", "data"}.issubset(payload.keys()):
+            raise TypeError("Safetensors entry payload missing required keys")
+
+        yield str(name), payload
+
+
 def _load_tensors_from_deserialize(
     path: Path, keys: Optional[Sequence[str]] = None
 ) -> Dict[str, TensorLike]:
@@ -1752,7 +1782,16 @@ def _load_tensors_from_deserialize(
     flat = deserialize(raw)
     tensors: Dict[str, TensorLike] = {}
     wanted = set(keys) if keys is not None else None
-    for name, entry in flat.items():
+
+    if isinstance(flat, _Mapping):
+        entries = flat.items()
+    else:
+        try:
+            entries = list(_iter_deserialized_entries(flat))
+        except TypeError as exc:
+            raise TypeError("Unsupported safetensors deserialization format") from exc
+
+    for name, entry in entries:
         if wanted is not None and name not in wanted:
             continue
         tensors[name] = _decode_safetensor_entry(
