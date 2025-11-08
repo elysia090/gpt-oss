@@ -1569,7 +1569,8 @@ class ModelConfig:
 _SAFETENSORS_MISSING_MSG = (
     "The `safetensors` package is required to load model checkpoints. "
     "Install the official wheel (for example, via `pip install safetensors`) to "
-    "handle binary `model.safetensors` payloads or provide a preloaded tensor map."
+    "handle binary `model.safetensors` payloads or provide a preloaded tensor map. "
+    "The repository bundles a JSON-only stub strictly for tests."
 )
 
 
@@ -1620,11 +1621,7 @@ def load_tensors(path: Path) -> Dict[str, TensorLike]:
     safe_open_fn = _resolve_safe_open()
 
     safe_open_is_stub = _looks_like_repo_stub_safe_open(safe_open_fn)
-    stub_hint = (
-        "The repository includes a JSON-only stub of `safetensors`. "
-        "Install the official `safetensors` wheel (for example, via `pip install safetensors`) "
-        "to load binary checkpoints."
-    )
+    stub_hint = _SAFETENSORS_MISSING_MSG
 
     if safe_open_is_stub:
         try:
@@ -2796,15 +2793,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         return
 
-    summary = convert(
-        args.source,
-        args.output,
-        r=args.r,
-        r_v=args.rv,
-        top_l=args.topL,
-        original_subdir=args.original_subdir,
-        verbose=args.verbose,
-    )
+    try:
+        summary = convert(
+            args.source,
+            args.output,
+            r=args.r,
+            r_v=args.rv,
+            top_l=args.topL,
+            original_subdir=args.original_subdir,
+            verbose=args.verbose,
+        )
+    except ModuleNotFoundError as exc:
+        message = str(exc) or _SAFETENSORS_MISSING_MSG
+        print(f"sera_transfer: {message}", file=sys.stderr)
+        raise SystemExit(1) from exc
 
     try:
         rendered = render_summary(summary, format=args.summary_format)
