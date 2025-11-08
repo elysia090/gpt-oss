@@ -1287,6 +1287,7 @@ class ModelConfig:
 
         expected_proj = n_heads * head_dim
         layer_map: Dict[str, Dict[str, str]] = {}
+        role_priorities: Dict[str, Dict[str, int]] = {}
 
         qkv_suffixes = (
             "attn.qkv.weight",
@@ -1303,6 +1304,18 @@ class ModelConfig:
         role_suffix_tokens = {
             role: [tuple(suffix.lower().split(".")) for suffix in suffixes]
             for role, suffixes in role_suffixes.items()
+        }
+        mxfp_priority_suffix_tokens = {
+            "FFN_W1": {
+                tuple("mlp.mlp1_weight.blocks".split(".")),
+                tuple("mlp.mlp1_weight.scales".split(".")),
+            },
+            "FFN_W2": {
+                tuple("mlp.mlp2_weight.blocks".split(".")),
+                tuple("mlp.mlp2_weight.scales".split(".")),
+            },
+            "FFN_B1": {tuple("mlp.mlp1_bias".split("."))},
+            "FFN_B2": {tuple("mlp.mlp2_bias".split("."))},
         }
 
         for name, tensor in tensors.items():
@@ -1348,7 +1361,17 @@ class ModelConfig:
                         continue
 
                     layer_roles = layer_map.setdefault(prefix, {})
-                    layer_roles.setdefault(role, name)
+                    priorities = role_priorities.setdefault(prefix, {})
+                    suffix_key = tuple(suffix_tokens)
+                    priority = (
+                        1
+                        if suffix_key in mxfp_priority_suffix_tokens.get(role, set())
+                        else 0
+                    )
+                    existing_priority = priorities.get(role, -1)
+                    if priority > existing_priority:
+                        layer_roles[role] = name
+                        priorities[role] = priority
                     matched = True
                     break
 
