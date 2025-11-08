@@ -1074,7 +1074,7 @@ class ModelConfig:
             )
 
         if tensors is not None:
-            ModelConfig._materialize_qkv_layers(
+            head_dim = ModelConfig._materialize_qkv_layers(
                 layers,
                 tensors,
                 d_model=d_model,
@@ -1444,15 +1444,14 @@ class ModelConfig:
         n_heads: int,
         head_dim: int,
         num_key_value_heads: int | None,
-    ) -> None:
+    ) -> int:
         if not isinstance(tensors, MutableMapping):
             raise TypeError(
                 "Tensor mapping must be mutable to decode fused QKV weights"
             )
 
-        q_dim = n_heads * head_dim if n_heads and head_dim else d_model
         kv_heads = num_key_value_heads if num_key_value_heads else n_heads
-        kv_dim = kv_heads * head_dim if kv_heads and head_dim else q_dim
+        head_dim_local = head_dim
         cache: Dict[str, Dict[str, TensorLike]] = {}
 
         for layer in layers:
@@ -1470,7 +1469,29 @@ class ModelConfig:
                             "Unable to decode fused QKV tensor; missing source "
                             f"'{base}' for role '{parsed_role}'"
                         )
-                    q, k, v = _split_qkv_tensor(tensor, q_dim, kv_dim, kv_dim)
+                    q_dim = (
+                        n_heads * head_dim_local
+                        if n_heads and head_dim_local
+                        else d_model
+                    )
+                    kv_dim = (
+                        kv_heads * head_dim_local
+                        if kv_heads and head_dim_local
+                        else q_dim
+                    )
+                    try:
+                        q, k, v = _split_qkv_tensor(tensor, q_dim, kv_dim, kv_dim)
+                    except ValueError:
+                        inferred = ModelConfig._infer_qkv_split_dims(
+                            tensor,
+                            d_model=d_model,
+                            n_heads=n_heads,
+                            kv_heads=kv_heads,
+                        )
+                        if inferred is None:
+                            raise
+                        q_dim, kv_dim, head_dim_local = inferred
+                        q, k, v = _split_qkv_tensor(tensor, q_dim, kv_dim, kv_dim)
                     components = {"W_Q": q, "W_K": k, "W_V": v}
                     cache[base] = components
                 component = components.get(parsed_role)
@@ -1482,6 +1503,43 @@ class ModelConfig:
                 component_name = _qkv_component_name(base, parsed_role)
                 tensors[component_name] = component
                 setattr(layer, attr, component_name)
+
+        return head_dim_local
+
+    @staticmethod
+    def _infer_qkv_split_dims(
+        tensor: TensorLike,
+        *,
+        d_model: int,
+        n_heads: int,
+        kv_heads: int,
+    ) -> Tuple[int, int, int] | None:
+        shape = _tensor_shape(tensor)
+        if len(shape) < 2:
+            return None
+
+        dims = [shape[0], shape[1]]
+        fused_dim: int | None = None
+        for dim in dims:
+            if dim != d_model:
+                fused_dim = dim
+                break
+        if fused_dim is None:
+            fused_dim = dims[0]
+
+        total_heads = n_heads + 2 * kv_heads
+        if total_heads <= 0:
+            return None
+        if fused_dim % total_heads != 0:
+            return None
+
+        head_dim = fused_dim // total_heads
+        if head_dim <= 0:
+            return None
+
+        q_dim = head_dim * n_heads
+        kv_dim = head_dim * kv_heads
+        return q_dim, kv_dim, head_dim
 
     @staticmethod
     def _materialize_mxfp4_layers(
