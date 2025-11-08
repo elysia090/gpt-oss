@@ -482,6 +482,7 @@ class ConversionSummary:
     metadata_keys: Tuple[str, ...]
     snapshots: Tuple[SnapshotInfo, ...]
     total_bytes: int
+    log_path: Path | None
 
     @property
     def array_count(self) -> int:
@@ -495,6 +496,7 @@ class ConversionSummary:
             "output": str(self.output),
             "manifest_path": str(self.manifest_path),
             "metadata_keys": list(self.metadata_keys),
+            "log_path": str(self.log_path) if self.log_path is not None else None,
             "arrays": [
                 {
                     "name": info.name,
@@ -522,6 +524,8 @@ def format_summary(summary: ConversionSummary) -> str:
     lines.append(f"Source : {summary.source}")
     lines.append(f"Output : {summary.output}")
     lines.append(f"Manifest: {summary.manifest_path}")
+    if summary.log_path:
+        lines.append(f"Log file: {summary.log_path}")
 
     if summary.metadata_keys:
         lines.append(
@@ -2420,280 +2424,308 @@ def convert(
     source = _normalise_path(source)
     output = _normalise_path(output)
 
+    output.mkdir(parents=True, exist_ok=True)
+
     if verbose and not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO)
 
-    if verbose:
-        logger.info("Resolved source path: %s", source)
-        logger.info("Resolved output path: %s", output)
-
-    search_roots: List[Path] = []
-
-    def add_root(candidate: Path | str) -> None:
-        path = candidate if isinstance(candidate, Path) else Path(candidate)
-        if not path.is_absolute():
-            path = source / path
-        if path not in search_roots:
-            search_roots.append(path)
-            if verbose:
-                logger.info("Registered search root: %s", path)
-
-    add_root(source)
-    if original_subdir is not None:
-        add_root(original_subdir)
-    else:
-        expected_files = ("config.json", "model.safetensors")
-        need_probe = any(
-            not _safe_exists(source / filename)
-            for filename in expected_files
-        )
-        if need_probe:
-            add_root("original")
-            add_root(Path("original") / "model")
-
-    def find_file(filename: str) -> Path:
-        for root in search_roots:
-            candidate = root / filename
-            if verbose:
-                logger.info("Probing %s", candidate)
-            if _safe_exists(candidate):
-                if verbose:
-                    logger.info("Located %s at %s", filename, candidate)
-                return candidate
-        search_list = ", ".join(str(root) for root in search_roots)
-        message = f"Unable to locate {filename!r}; searched: {search_list or source}"
-        if verbose:
-            logger.error(message)
-        raise FileNotFoundError(message)
-
-    def _convert_inner() -> ConversionSummary:
-        config_path = find_file("config.json")
-        model_path = find_file("model.safetensors")
-        if verbose:
-            logger.info("Reading model configuration from %s", config_path)
-        config_data = json.loads(config_path.read_text())
-        if verbose and isinstance(config_data, Mapping):
-            config_keys = _format_model_config_keys(config_data)
-            logger.info("Model config keys: %s", config_keys)
-        tensors = load_tensors(model_path)
-        cfg = ModelConfig.from_dict(config_data, tensors=tensors)
-
-        local_r = min(r, cfg.d_model)
-        local_r_v = min(r_v, local_r)
-
-        arrays_dir = output / "arrays"
-        arrays_dir.mkdir(parents=True, exist_ok=True)
-
-        artefact_payloads: Dict[str, bytes] = {}
-        artefact_records: Dict[str, Dict[str, object]] = {}
-        metadata: Dict[str, object] = {}
-        array_infos: List[ArrayInfo] = []
-        snapshot_infos: List[SnapshotInfo] = []
-
-        def store_array(name: str, data, dtype: str) -> None:
-            path = arrays_dir / f"{name}.bin"
-            payload = write_array(path, data, dtype)
-            shape = _infer_shape(data)
-            payload_len = len(payload)
-            artefact_payloads[name] = payload
-            artefact_records[name] = {
-                "path": str(path),
-                "dtype": dtype,
-                "shape": shape,
-                "bytes": payload_len,
-                "sha256": hashlib.sha256(payload).hexdigest(),
-            }
-            array_infos.append(
-                ArrayInfo(
-                    name=name,
-                    path=path,
-                    dtype=dtype,
-                    shape=shape,
-                    bytes=payload_len,
-                    sha256=artefact_records[name]["sha256"],
-                )
-            )
-
-        tokenizer_data, tokenizer_meta = tokenizer_arrays(cfg, tensors)
-        for name, data in tokenizer_data.items():
-            store_array(name, data, "u8")
-        metadata["tokenizer"] = tokenizer_meta
-
-        prf = compute_prf(cfg, tensors, local_r)
-        for name, data in prf.items():
-            store_array(name, data, "f32")
-        attention_meta = {
-            "features": local_r,
-            "tau": getattr(cfg, "tau", 1.0),
-            "whitening_sig2": prf.get("whitening_sig2", []),
-        }
-        optional_attention = {
-            "rope_theta": cfg.rope_theta,
-            "num_key_value_heads": cfg.num_key_value_heads,
-            "sliding_window": cfg.sliding_window,
-            "initial_context_length": cfg.initial_context_length,
-            "rope_scaling_factor": cfg.rope_scaling_factor,
-            "rope_ntk_alpha": cfg.rope_ntk_alpha,
-            "rope_ntk_beta": cfg.rope_ntk_beta,
-        }
-        for key, value in optional_attention.items():
-            if value is not None:
-                attention_meta[key] = value
-        metadata["attention"] = attention_meta
-
-        overlays = compute_overlays(cfg, tensors, local_r, local_r_v)
-        for name, data in overlays.items():
-            store_array(name, data, "f32")
-        metadata["overlays"] = {
-            "rank": local_r,
-            "rank_value": local_r_v,
-            "rows": len(overlays.get("overlays_H", [])),
-            "cols": len(overlays.get("overlays_U", [])),
-        }
-
-        linear_data, linear_meta = collapse_ffn(cfg, tensors, top_l)
-        store_array("linear_mphf", linear_data["linear_mphf"], "u8")
-        store_array("linear_keys", linear_data["linear_keys"], "u8")
-        store_array("linear_weights", linear_data["linear_weights"], "f32")
-        store_array("linear_bias", linear_data["linear_bias"], "f32")
-        store_array("cuckoo_delta", linear_data["cuckoo_delta"], "u8")
-        linear_meta = dict(linear_meta)
-        optional_linear = {
-            "num_experts": cfg.num_experts,
-            "experts_per_token": cfg.experts_per_token,
-            "intermediate_size": cfg.intermediate_size,
-            "swiglu_limit": cfg.swiglu_limit,
-        }
-        for key, value in optional_linear.items():
-            if value is not None:
-                linear_meta[key] = value
-        metadata["linear"] = linear_meta
-
-        memory_data, memory_meta = memory_coefficients(cfg)
-        store_array("memory_coeff", memory_data["memory_coeff"], "f64")
-        store_array("delaybuf_init", memory_data["delaybuf_init"], "f32")
-        metadata["memory"] = memory_meta
-
-        bridge_data, bridge_meta = bridge_records(cfg, tensors, cfg.vocab_size)
-        store_array("bridge_hubs", bridge_data["bridge_hubs"], "u8")
-        store_array("bridge_qDin", bridge_data["bridge_qDin"], "i16")
-        store_array("bridge_qDout", bridge_data["bridge_qDout"], "i16")
-        store_array("peer_scores", bridge_data["peer_scores"], "i16")
-        metadata["bridge"] = bridge_meta
-
-        manifest_path = output / "sera_manifest.bin"
-        write_manifest(
-            manifest_path,
-            cfg,
-            artefact_payloads,
-            r=local_r,
-            r_v=local_r_v,
-            vocab_size=cfg.vocab_size or 16,
-        )
-
-        sera_cls, sera_config_cls = _load_sera_runtime()
-        try:
-            base_config = sera_config_cls()
-        except Exception:  # pragma: no cover - extremely defensive
-            base_config = None
-
-        if base_config is not None and dataclasses.is_dataclass(base_config):
-            pieces = tokenizer_meta.get("pieces", [])
-            tokenizer_vocab = {piece: token for piece, token in pieces}
-            max_piece_length = tokenizer_meta.get(
-                "max_piece_length", base_config.tokenizer.max_piece_length
-            )
-            tokenizer_config = dataclasses.replace(
-                base_config.tokenizer,
-                vocabulary=tokenizer_vocab,
-                max_piece_length=max_piece_length,
-            )
-            whitening_sig2 = metadata["attention"].get("whitening_sig2") or [1.0]
-            beta_floor = max(1e-3, min(float(value) for value in whitening_sig2))
-            value_dim = len(overlays.get("overlays_U", [])) or cfg.d_model
-            attention_config = dataclasses.replace(
-                base_config.attention,
-                dim=cfg.d_model,
-                value_dim=value_dim,
-                features=local_r,
-                tau=getattr(cfg, "tau", base_config.attention.tau),
-                beta_floor=beta_floor,
-            )
-            linear_capacity = max(
-                len(linear_meta.get("keys", [])), base_config.linear.capacity
-            )
-            linear_config = dataclasses.replace(base_config.linear, capacity=linear_capacity)
-            bridge_config = dataclasses.replace(
-                base_config.bridge,
-                hub_window=max(
-                    base_config.bridge.hub_window, bridge_meta.get("legs", 0) * 4
-                ),
-            )
-            sera_config = dataclasses.replace(
-                base_config,
-                tokenizer=tokenizer_config,
-                attention=attention_config,
-                linear=linear_config,
-                bridge=bridge_config,
-            )
-            sera_model = sera_cls(sera_config)
-            runtime_snapshot = sera_model.snapshot()
-        else:
-            config_instance = base_config if base_config is not None else object()
-            sera_model = sera_cls(config_instance)
-            runtime_snapshot = sera_model.snapshot()
-
-        snapshot_path = output / "sera_state.pkl"
-        snapshot = {
-            "model_config": _config_to_dict(cfg),
-            "artefacts": artefact_records,
-            "metadata": metadata,
-            "manifest_path": str(output / "sera_manifest.bin"),
-            "sera_snapshot": runtime_snapshot,
-        }
-        with snapshot_path.open("wb") as fh:
-            pickle.dump(snapshot, fh)
-        snapshot_infos.append(SnapshotInfo("pickle", snapshot_path))
-
-        json_snapshot = _json_value(snapshot)
-        json_path = output / "sera_state.json"
-        with json_path.open("w", encoding="utf-8") as fh:
-            json.dump(json_snapshot, fh, indent=2, sort_keys=True)
-            fh.write("\n")
-        snapshot_infos.append(SnapshotInfo("json", json_path))
-
-        try:  # pragma: no cover - msgpack is optional
-            import msgpack  # type: ignore
-        except ModuleNotFoundError:  # pragma: no cover - exercised when msgpack missing
-            pass
-        else:
-            msgpack_path = output / "sera_state.msgpack"
-            with msgpack_path.open("wb") as fh:
-                msgpack.pack(json_snapshot, fh, use_bin_type=True)
-            snapshot_infos.append(SnapshotInfo("msgpack", msgpack_path))
-
-        total_bytes = sum(info.bytes for info in array_infos)
-        summary = ConversionSummary(
-            source=source,
-            output=output,
-            arrays=tuple(array_infos),
-            manifest_path=manifest_path,
-            metadata_keys=tuple(sorted(metadata)),
-            snapshots=tuple(snapshot_infos),
-            total_bytes=total_bytes,
-        )
-        if verbose:
-            formatted = format_summary(summary)
-            for line in formatted.splitlines():
-                logger.info(line)
-        return summary
+    log_path = output / "conversion.log"
+    file_handler: logging.Handler | None = None
+    previous_level = logger.level
 
     try:
-        return _convert_inner()
-    except (ValueError, RuntimeError, FileNotFoundError) as exc:
-        if verbose:
-            logger.error("Conversion failed: %s", exc)
-        raise
+        file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        logger.addHandler(file_handler)
+        logger.setLevel(logging.DEBUG)
+
+        def log_verbose(message: str, *args: object) -> None:
+            if verbose:
+                logger.info(message, *args)
+            else:
+                logger.debug(message, *args)
+
+        def log_notice(message: str, *args: object) -> None:
+            logger.info(message, *args)
+
+        log_notice("Writing conversion log to %s", log_path)
+        log_notice("Resolved source path: %s", source)
+        log_notice("Resolved output path: %s", output)
+
+        search_roots: List[Path] = []
+
+        def add_root(candidate: Path | str) -> None:
+            path = candidate if isinstance(candidate, Path) else Path(candidate)
+            if not path.is_absolute():
+                path = source / path
+            if path not in search_roots:
+                search_roots.append(path)
+                log_verbose("Registered search root: %s", path)
+
+        add_root(source)
+        if original_subdir is not None:
+            add_root(original_subdir)
+        else:
+            expected_files = ("config.json", "model.safetensors")
+            need_probe = any(
+                not _safe_exists(source / filename)
+                for filename in expected_files
+            )
+            if need_probe:
+                add_root("original")
+                add_root(Path("original") / "model")
+
+        def find_file(filename: str) -> Path:
+            for root in search_roots:
+                candidate = root / filename
+                log_verbose("Probing %s", candidate)
+                if _safe_exists(candidate):
+                    log_notice("Located %s at %s", filename, candidate)
+                    return candidate
+            search_list = ", ".join(str(root) for root in search_roots)
+            message = f"Unable to locate {filename!r}; searched: {search_list or source}"
+            logger.error(message)
+            raise FileNotFoundError(message)
+
+        def _convert_inner() -> ConversionSummary:
+            config_path = find_file("config.json")
+            model_path = find_file("model.safetensors")
+            log_notice("Reading model configuration from %s", config_path)
+            config_data = json.loads(config_path.read_text())
+            if isinstance(config_data, Mapping):
+                config_keys = _format_model_config_keys(config_data)
+                log_verbose("Model config keys: %s", config_keys)
+            tensors = load_tensors(model_path)
+            cfg = ModelConfig.from_dict(config_data, tensors=tensors)
+
+            local_r = min(r, cfg.d_model)
+            local_r_v = min(r_v, local_r)
+
+            arrays_dir = output / "arrays"
+            arrays_dir.mkdir(parents=True, exist_ok=True)
+
+            artefact_payloads: Dict[str, bytes] = {}
+            artefact_records: Dict[str, Dict[str, object]] = {}
+            metadata: Dict[str, object] = {}
+            array_infos: List[ArrayInfo] = []
+            snapshot_infos: List[SnapshotInfo] = []
+
+            def store_array(name: str, data, dtype: str) -> None:
+                path = arrays_dir / f"{name}.bin"
+                payload = write_array(path, data, dtype)
+                shape = _infer_shape(data)
+                payload_len = len(payload)
+                artefact_payloads[name] = payload
+                artefact_records[name] = {
+                    "path": str(path),
+                    "dtype": dtype,
+                    "shape": shape,
+                    "bytes": payload_len,
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+                array_infos.append(
+                    ArrayInfo(
+                        name=name,
+                        path=path,
+                        dtype=dtype,
+                        shape=shape,
+                        bytes=payload_len,
+                        sha256=artefact_records[name]["sha256"],
+                    )
+                )
+
+            tokenizer_data, tokenizer_meta = tokenizer_arrays(cfg, tensors)
+            for name, data in tokenizer_data.items():
+                store_array(name, data, "u8")
+            metadata["tokenizer"] = tokenizer_meta
+
+            prf = compute_prf(cfg, tensors, local_r)
+            for name, data in prf.items():
+                store_array(name, data, "f32")
+            attention_meta = {
+                "features": local_r,
+                "tau": getattr(cfg, "tau", 1.0),
+                "whitening_sig2": prf.get("whitening_sig2", []),
+            }
+            optional_attention = {
+                "rope_theta": cfg.rope_theta,
+                "num_key_value_heads": cfg.num_key_value_heads,
+                "sliding_window": cfg.sliding_window,
+                "initial_context_length": cfg.initial_context_length,
+                "rope_scaling_factor": cfg.rope_scaling_factor,
+                "rope_ntk_alpha": cfg.rope_ntk_alpha,
+                "rope_ntk_beta": cfg.rope_ntk_beta,
+            }
+            for key, value in optional_attention.items():
+                if value is not None:
+                    attention_meta[key] = value
+            metadata["attention"] = attention_meta
+
+            overlays = compute_overlays(cfg, tensors, local_r, local_r_v)
+            for name, data in overlays.items():
+                store_array(name, data, "f32")
+            metadata["overlays"] = {
+                "rank": local_r,
+                "rank_value": local_r_v,
+                "rows": len(overlays.get("overlays_H", [])),
+                "cols": len(overlays.get("overlays_U", [])),
+            }
+
+            linear_data, linear_meta = collapse_ffn(cfg, tensors, top_l)
+            store_array("linear_mphf", linear_data["linear_mphf"], "u8")
+            store_array("linear_keys", linear_data["linear_keys"], "u8")
+            store_array("linear_weights", linear_data["linear_weights"], "f32")
+            store_array("linear_bias", linear_data["linear_bias"], "f32")
+            store_array("cuckoo_delta", linear_data["cuckoo_delta"], "u8")
+            linear_meta = dict(linear_meta)
+            optional_linear = {
+                "num_experts": cfg.num_experts,
+                "experts_per_token": cfg.experts_per_token,
+                "intermediate_size": cfg.intermediate_size,
+                "swiglu_limit": cfg.swiglu_limit,
+            }
+            for key, value in optional_linear.items():
+                if value is not None:
+                    linear_meta[key] = value
+            metadata["linear"] = linear_meta
+
+            memory_data, memory_meta = memory_coefficients(cfg)
+            store_array("memory_coeff", memory_data["memory_coeff"], "f64")
+            store_array("delaybuf_init", memory_data["delaybuf_init"], "f32")
+            metadata["memory"] = memory_meta
+
+            bridge_data, bridge_meta = bridge_records(cfg, tensors, cfg.vocab_size)
+            store_array("bridge_hubs", bridge_data["bridge_hubs"], "u8")
+            store_array("bridge_qDin", bridge_data["bridge_qDin"], "i16")
+            store_array("bridge_qDout", bridge_data["bridge_qDout"], "i16")
+            store_array("peer_scores", bridge_data["peer_scores"], "i16")
+            metadata["bridge"] = bridge_meta
+
+            manifest_path = output / "sera_manifest.bin"
+            write_manifest(
+                manifest_path,
+                cfg,
+                artefact_payloads,
+                r=local_r,
+                r_v=local_r_v,
+                vocab_size=cfg.vocab_size or 16,
+            )
+
+            sera_cls, sera_config_cls = _load_sera_runtime()
+            try:
+                base_config = sera_config_cls()
+            except Exception:  # pragma: no cover - extremely defensive
+                base_config = None
+
+            if base_config is not None and dataclasses.is_dataclass(base_config):
+                pieces = tokenizer_meta.get("pieces", [])
+                tokenizer_vocab = {piece: token for piece, token in pieces}
+                max_piece_length = tokenizer_meta.get(
+                    "max_piece_length", base_config.tokenizer.max_piece_length
+                )
+                tokenizer_config = dataclasses.replace(
+                    base_config.tokenizer,
+                    vocabulary=tokenizer_vocab,
+                    max_piece_length=max_piece_length,
+                )
+                whitening_sig2 = metadata["attention"].get("whitening_sig2") or [1.0]
+                beta_floor = max(1e-3, min(float(value) for value in whitening_sig2))
+                value_dim = len(overlays.get("overlays_U", [])) or cfg.d_model
+                attention_config = dataclasses.replace(
+                    base_config.attention,
+                    dim=cfg.d_model,
+                    value_dim=value_dim,
+                    features=local_r,
+                    tau=getattr(cfg, "tau", base_config.attention.tau),
+                    beta_floor=beta_floor,
+                )
+                linear_capacity = max(
+                    len(linear_meta.get("keys", [])), base_config.linear.capacity
+                )
+                linear_config = dataclasses.replace(
+                    base_config.linear, capacity=linear_capacity
+                )
+                bridge_config = dataclasses.replace(
+                    base_config.bridge,
+                    hub_window=max(
+                        base_config.bridge.hub_window, bridge_meta.get("legs", 0) * 4
+                    ),
+                )
+                sera_config = dataclasses.replace(
+                    base_config,
+                    tokenizer=tokenizer_config,
+                    attention=attention_config,
+                    linear=linear_config,
+                    bridge=bridge_config,
+                )
+                sera_model = sera_cls(sera_config)
+                runtime_snapshot = sera_model.snapshot()
+            else:
+                config_instance = base_config if base_config is not None else object()
+                sera_model = sera_cls(config_instance)
+                runtime_snapshot = sera_model.snapshot()
+
+            snapshot_path = output / "sera_state.pkl"
+            snapshot = {
+                "model_config": _config_to_dict(cfg),
+                "artefacts": artefact_records,
+                "metadata": metadata,
+                "manifest_path": str(output / "sera_manifest.bin"),
+                "sera_snapshot": runtime_snapshot,
+            }
+            with snapshot_path.open("wb") as fh:
+                pickle.dump(snapshot, fh)
+            snapshot_infos.append(SnapshotInfo("pickle", snapshot_path))
+
+            json_snapshot = _json_value(snapshot)
+            json_path = output / "sera_state.json"
+            with json_path.open("w", encoding="utf-8") as fh:
+                json.dump(json_snapshot, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+            snapshot_infos.append(SnapshotInfo("json", json_path))
+
+            try:  # pragma: no cover - msgpack is optional
+                import msgpack  # type: ignore
+            except ModuleNotFoundError:  # pragma: no cover - exercised when msgpack missing
+                pass
+            else:
+                msgpack_path = output / "sera_state.msgpack"
+                with msgpack_path.open("wb") as fh:
+                    msgpack.pack(json_snapshot, fh, use_bin_type=True)
+                snapshot_infos.append(SnapshotInfo("msgpack", msgpack_path))
+
+            total_bytes = sum(info.bytes for info in array_infos)
+            summary = ConversionSummary(
+                source=source,
+                output=output,
+                arrays=tuple(array_infos),
+                manifest_path=manifest_path,
+                metadata_keys=tuple(sorted(metadata)),
+                snapshots=tuple(snapshot_infos),
+                total_bytes=total_bytes,
+                log_path=log_path,
+            )
+            formatted = format_summary(summary)
+            for line in formatted.splitlines():
+                log_verbose(line)
+            return summary
+
+        try:
+            return _convert_inner()
+        except (ValueError, RuntimeError, FileNotFoundError) as exc:
+            logger.exception("Conversion failed: %s", exc)
+            raise
+    finally:
+        if file_handler is not None:
+            logger.removeHandler(file_handler)
+            file_handler.close()
+        if previous_level:
+            logger.setLevel(previous_level)
+        else:
+            logger.setLevel(logging.NOTSET)
 
 
 def run_interactive_cli(
