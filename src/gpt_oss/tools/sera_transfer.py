@@ -44,10 +44,20 @@ _default_stub_safe_open.__gpt_oss_default_stub__ = True  # type: ignore[attr-def
 
 safe_open = _default_stub_safe_open  # type: ignore[assignment]
 
+_NUMPY_MISSING_MSG = (
+    "The numpy package is required for Sera conversion. Install it with 'pip install numpy'."
+)
+
 try:  # pragma: no cover - optional dependency
     import numpy as _np
-except Exception:  # pragma: no cover - defensive
-    _np = None
+except Exception as exc:  # pragma: no cover - defensive
+    raise ModuleNotFoundError(_NUMPY_MISSING_MSG) from exc
+else:  # pragma: no cover - executed when numpy is available
+    _missing_numpy_apis = [
+        name for name in ("stack", "ldexp", "split") if not hasattr(_np, name)
+    ]
+    if getattr(_np, "__gpt_oss_numpy_stub__", False) or _missing_numpy_apis:
+        raise ModuleNotFoundError(_NUMPY_MISSING_MSG)
 
 try:  # pragma: no cover - optional dependency
     import torch as _torch

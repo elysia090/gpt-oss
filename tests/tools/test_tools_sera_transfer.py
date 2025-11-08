@@ -22,8 +22,12 @@ if str(ROOT) not in sys.path:
 
 import gpt_oss._stubs.safetensors as safetensors_stub
 from gpt_oss._stubs.safetensors.numpy import save_file
-
-from gpt_oss.tools import sera_transfer
+try:
+    from gpt_oss.tools import sera_transfer
+except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
+    if "pip install numpy" in str(exc):
+        pytest.skip("Real numpy is required for Sera transfer tests", allow_module_level=True)
+    raise
 
 
 def _create_matrix(rows: int, cols: int, rng: random.Random) -> list[list[float]]:

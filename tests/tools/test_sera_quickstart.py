@@ -17,10 +17,17 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+import pytest
+
 import gpt_oss._stubs.safetensors as safetensors_stub
 from gpt_oss._stubs.safetensors.numpy import save_file
-import gpt_oss.tools.sera_quickstart as quickstart
-import pytest
+
+try:
+    import gpt_oss.tools.sera_quickstart as quickstart
+except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
+    if "pip install numpy" in str(exc):
+        pytest.skip("Real numpy is required for Sera transfer tests", allow_module_level=True)
+    raise
 
 quickstart.sera_transfer.safe_open = safetensors_stub.safe_open  # type: ignore[attr-defined]
 
