@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+__gpt_oss_numpy_stub__ = True
+
 import math
 import random as _py_random
 from dataclasses import dataclass
@@ -512,6 +514,7 @@ __all__ = [
     "random",
     "ndarray",
     "__version__",
+    "__gpt_oss_numpy_stub__",
 ]
 
 __version__ = "0.0-test"
