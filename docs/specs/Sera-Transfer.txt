@@ -805,3 +805,108 @@ Result:
 * Fully deterministic.
 * Directly consumable by Sera runtime using the manifest and array contracts above.
 
+
+
+1. Add fp_contract section to manifest
+   (Place under Manifest sections alongside tokenizer/prf/etc.)
+
+fp_contract:
+  fma_mode          // 0 = disabled, 1 = enabled
+  denormals_mode    // 0 = preserve, 1 = flush_to_zero
+  ext_precision     // 0 = none, 1 = double_double, 2 = long_double (if used)
+  reductions_digest // 64-bit or 128-bit hash over reduction orders, kernels, and LUTs
+
+
+Constraints:
+
+The fp_contract section MUST be present.
+
+fma_mode and denormals_mode MUST match the effective hardware/software configuration
+used during STK conversion. If ext_precision != 0 is used anywhere, that usage
+MUST be documented in reductions_digest and confined to a single well-defined
+reduction site as specified in the FP contract.
+
+Sera runtime MUST validate fp_contract against its own capabilities and reject
+or sandbox generations whose fp_contract it cannot honor.
+
+
+2. Define trust_gate absence semantics
+   (Place in the Manifest description and/or in a new "Optional module semantics" subsection.)
+
+Trust gate section (trust_gate) is OPTIONAL in STK outputs.
+
+If the trust_gate stanza is absent in sera_manifest.bin:
+
+  - The trust gate MUST be treated as disabled for this generation.
+  - All trust_decision values are implicitly "Unknown".
+  - No additional gating, caps, or penalties derived from the trust gate
+    may be applied to attention, linear, bridge, CFR, or search modules.
+  - Any fields in Diagnostics that relate to trust gate behavior MUST
+    either be zeroed or marked as inactive.
+
+This configuration is a valid Sera v2.3 model state.
+
+
+3. Clarify optional module OFF rules (CFR, search, overlays, etc.)
+   (Short unified rule; append near "Any missing optional array implies feature disabled".)
+
+Optional module semantics:
+
+For any module controlled by a dedicated manifest stanza and/or arrays:
+
+  - If its stanza is missing, or all of its capacity/limit fields are zero,
+    and no corresponding data arrays are present, the module is considered OFF.
+  - OFF means:
+      * No calls on that module's hot path.
+      * No dynamic allocation or background activity for that module.
+      * Outputs are replaced by fixed neutral elements (e.g. no overlays,
+        no CFR contributions, no search steps).
+  - This rule applies to: overlays, bridge O(0) fast path, search, CFR,
+    trust_gate, and any future optional modules.
+
+Sera runtimes MUST NOT assume undocumented behavior for missing sections.
+
+
+4. Clarify module identification (no extra headers)
+   (Place near Common array header / module header discussion.)
+
+Module identification:
+
+STK does not introduce an additional per-file ModuleHeader distinct from the
+Common array header. Module identity is defined by:
+
+  - The filename (arrays/*.bin), and
+  - The corresponding stanza and field names in sera_manifest.bin.
+
+Arrays and manifest entries MUST use the canonical Sera v2.3 names.
+Runtimes MUST treat these names as the authoritative mapping between
+binaries and logical modules.
+
+
+5. Clarify salts and separation for trust gate vs bridge
+   (Align with v2.3 security model; short addition to salts description.)
+
+Salt domains:
+
+The salts used for MPHF constructions and bridge/store keying MUST be
+logically disjoint from any salts or keys used by a trust gate profile.
+
+If a trust_gate stanza is present, its salts_digest MUST be computed over
+a distinct key domain from mphf_salt_digest and key_salt_digest.
+
+If trust_gate is absent, STK MUST NOT emit trust_gate salts in any other stanza.
+
+6. Deterministic OFF behavior for bridge O(0)
+   (Just to make the guard semantics line up tightly.)
+
+If bridge_hubs.bin or bridge_qDin.bin or bridge_qDout.bin is absent, or if
+the bridge stanza is missing, the external bridge MUST run in a fully OFF mode:
+
+  - No dictionary O(0) lookups.
+  - No two-hop scoring.
+  - No modification of y_base by external references.
+  - Diagnostics for O(0) hits and guard are set to zero or inactive.
+
+This is a valid Sera v2.3 configuration.
+
+
