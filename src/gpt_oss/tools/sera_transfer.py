@@ -61,6 +61,24 @@ if TYPE_CHECKING:  # pragma: no cover - typing helper
 else:  # pragma: no cover - runtime alias
     TensorLike = Any
 
+
+def _load_sera_common_module():
+    sera_common_path = Path(__file__).resolve().parents[1] / "inference" / "sera_common.py"
+    spec = importlib.util.spec_from_file_location("_sera_common", sera_common_path)
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        raise RuntimeError("Unable to locate Sera runtime helpers")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault(spec.name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+_sera_common = _load_sera_common_module()
+ARRAY_MAGIC = _sera_common.ARRAY_MAGIC
+JSON_BYTES_PREFIX = _sera_common.JSON_BYTES_PREFIX
+encode_snapshot_blob = _sera_common.encode_snapshot_blob
+ensure_bytes = _sera_common.ensure_bytes
+
 if getattr(_np, "__gpt_oss_numpy_stub__", False):
     _NP_ARRAY_TYPES: tuple[type, ...] = ()
 else:
@@ -225,33 +243,30 @@ __all__ = [
 ]
 
 
-MAGIC_SERA_ARRAY = 0x53455241
-JSON_BYTES_PREFIX = "__sera_bytes__:"
+MAGIC_SERA_ARRAY = ARRAY_MAGIC
 
 
 def _json_key(value: object) -> str:
-    if isinstance(value, bytes):
-        return JSON_BYTES_PREFIX + value.hex()
-    if isinstance(value, str):
-        return value
-    return str(value)
+    encoded = encode_snapshot_blob(value)
+    if isinstance(encoded, str):
+        return encoded
+    if isinstance(encoded, (bytes, bytearray, memoryview)):
+        return JSON_BYTES_PREFIX + ensure_bytes(encoded).hex()
+    return str(encoded)
 
 
 def _json_value(value: object):
-    if isinstance(value, dict):
+    encoded = encode_snapshot_blob(value)
+    if isinstance(encoded, dict):
         return {
             _json_key(key): _json_value(item)
-            for key, item in value.items()
+            for key, item in encoded.items()
         }
-    if isinstance(value, (list, tuple)):
-        return [_json_value(item) for item in value]
-    if isinstance(value, bytes):
-        return JSON_BYTES_PREFIX + value.hex()
-    if isinstance(value, Path):
-        return str(value)
-    if hasattr(value, "__dict__") and not isinstance(value, (str, bytes)):
-        return _json_value(vars(value))
-    return value
+    if isinstance(encoded, list):
+        return [_json_value(item) for item in encoded]
+    if hasattr(encoded, "__dict__") and not isinstance(encoded, (str, bytes, bytearray)):
+        return _json_value(vars(encoded))
+    return encoded
 
 
 def _flatten(values) -> List[float]:

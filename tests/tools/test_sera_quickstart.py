@@ -19,9 +19,11 @@ if str(SRC) not in sys.path:
 
 import pytest
 
-import numpy as np
-from safetensors import SafetensorError
-from safetensors.numpy import save_file
+np = pytest.importorskip("numpy")
+safetensors = pytest.importorskip("safetensors")
+SafetensorError = safetensors.SafetensorError
+safetensors_numpy = pytest.importorskip("safetensors.numpy")
+save_file = safetensors_numpy.save_file
 
 try:
     import gpt_oss.tools.sera_quickstart as quickstart

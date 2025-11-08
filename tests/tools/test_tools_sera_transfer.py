@@ -14,13 +14,15 @@ from array import array
 from pathlib import Path
 
 import pytest
-import numpy as np
+
+np = pytest.importorskip("numpy")
+
+safetensors_numpy = pytest.importorskip("safetensors.numpy")
+save_file = safetensors_numpy.save_file
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-from safetensors.numpy import save_file
 try:
     from gpt_oss.tools import sera_transfer
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard

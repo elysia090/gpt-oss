@@ -6,7 +6,7 @@ import sys
 import pytest
 
 
-import numpy as np
+np = pytest.importorskip("numpy")
 
 
 _SERA_PATH = pathlib.Path(__file__).resolve().parents[2] / "src" / "gpt_oss" / "inference" / "sera.py"
