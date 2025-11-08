@@ -157,6 +157,51 @@ def _config_to_dict(config):
 logger = logging.getLogger(__name__)
 
 
+_MODEL_CONFIG_LOG_ORDER: Tuple[str, ...] = (
+    "architectures",
+    "attention_bias",
+    "attention_dropout",
+    "eos_token_id",
+    "experts_per_token",
+    "head_dim",
+    "hidden_act",
+    "hidden_size",
+    "initial_context_length",
+    "initializer_range",
+    "intermediate_size",
+    "layer_types",
+    "max_position_embeddings",
+    "model_type",
+    "num_attention_heads",
+    "num_experts_per_tok",
+    "num_hidden_layers",
+    "num_key_value_heads",
+    "num_local_experts",
+    "output_router_logits",
+    "pad_token_id",
+    "quantization_config",
+    "rms_norm_eps",
+    "rope_scaling",
+    "rope_theta",
+    "router_aux_loss_coef",
+    "sliding_window",
+    "swiglu_limit",
+    "tie_word_embeddings",
+    "transformers_version",
+    "use_cache",
+    "vocab_size",
+)
+
+
+def _format_model_config_keys(config: Mapping[str, object]) -> str:
+    if not config:
+        return "<none>"
+    ordered = [key for key in _MODEL_CONFIG_LOG_ORDER if key in config]
+    remaining = [key for key in config if key not in _MODEL_CONFIG_LOG_ORDER]
+    keys = ordered + remaining
+    return ", ".join(keys) if keys else "<none>"
+
+
 def _safe_exists(path: Path) -> bool:
     """Return ``True`` if *path* exists, suppressing ``OSError`` failures."""
 
@@ -2427,8 +2472,8 @@ def convert(
         if verbose:
             logger.info("Reading model configuration from %s", config_path)
         config_data = json.loads(config_path.read_text())
-        if verbose and isinstance(config_data, dict):
-            config_keys = ", ".join(sorted(config_data)) or "<none>"
+        if verbose and isinstance(config_data, Mapping):
+            config_keys = _format_model_config_keys(config_data)
             logger.info("Model config keys: %s", config_keys)
         tensors = load_tensors(model_path)
         cfg = ModelConfig.from_dict(config_data, tensors=tensors)
