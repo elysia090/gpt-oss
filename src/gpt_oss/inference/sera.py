@@ -73,6 +73,7 @@ _TRANSFER_STATE_FILENAMES: Tuple[str, ...] = (
 )
 _TRANSFER_ARRAY_MAGIC = 0x53455241
 _TRANSFER_MANIFEST_MAGIC = 0x5345524D
+_TRANSFER_MANIFEST_PREFIX_STRUCT = struct.Struct("<I I")
 _TRANSFER_ARRAY_STRUCT = struct.Struct("<I H H 5Q Q Q Q I I")
 _TRANSFER_DTYPE_CODES: Dict[int, str] = {
     1: "f64",
@@ -3503,12 +3504,23 @@ class Sera:
             )
 
         with manifest_path.open("rb") as fh:
-            magic_raw = fh.read(4)
-        if len(magic_raw) != 4:
-            raise ValueError("Sera manifest file is truncated")
-        magic = struct.unpack("<I", magic_raw)[0]
-        if magic != _TRANSFER_MANIFEST_MAGIC:
-            raise ValueError("Invalid Sera manifest magic")
+            prefix_raw = fh.read(_TRANSFER_MANIFEST_PREFIX_STRUCT.size)
+            if len(prefix_raw) != _TRANSFER_MANIFEST_PREFIX_STRUCT.size:
+                raise ValueError("Sera manifest file is truncated")
+            magic, version = _TRANSFER_MANIFEST_PREFIX_STRUCT.unpack(prefix_raw)
+            if magic != _TRANSFER_MANIFEST_MAGIC:
+                raise ValueError("Invalid Sera manifest magic")
+            seed_digest = fh.read(32)
+            if len(seed_digest) != 32:
+                raise ValueError("Sera manifest file is truncated")
+            schema_digest = fh.read(32)
+            if len(schema_digest) != 32:
+                raise ValueError("Sera manifest file is truncated")
+        manifest_header = {
+            "version": version,
+            "seed_digest": seed_digest.hex(),
+            "schema_sha256": schema_digest.hex(),
+        }
 
         if state_file is not None:
             state_path = Path(state_file).expanduser()
@@ -3542,7 +3554,16 @@ class Sera:
 
         arrays_meta = state_blob.get("artefacts")
         if isinstance(arrays_meta, Mapping):
-            arrays_info = _validate_transfer_arrays(manifest_dir / "arrays", arrays_meta)
+            arrays_dir = (manifest_dir / "arrays").resolve()
+            if not arrays_dir.exists():
+                raise FileNotFoundError(
+                    f"Sera arrays directory is missing: {arrays_dir}"  # pragma: no cover - defensive
+                )
+            if not arrays_dir.is_dir():
+                raise NotADirectoryError(
+                    f"Sera arrays path is not a directory: {arrays_dir}"  # pragma: no cover - defensive
+                )
+            arrays_info = _validate_transfer_arrays(arrays_dir, arrays_meta)
         else:
             arrays_info = {}
 
@@ -3558,6 +3579,7 @@ class Sera:
         metadata: Dict[str, object] = {
             "manifest_path": manifest_path,
             "state_path": state_path,
+            "manifest_header": manifest_header,
             "arrays": {
                 name: {
                     "dtype": info["dtype"],
