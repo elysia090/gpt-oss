@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import random
@@ -20,10 +21,15 @@ def _load_sera_runtime():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    return module.Sera
+    return module
 
 
-Sera = _load_sera_runtime()
+_sera_runtime = _load_sera_runtime()
+Sera = _sera_runtime.Sera
+_validate_transfer_arrays = _sera_runtime._validate_transfer_arrays
+_TRANSFER_ARRAY_STRUCT = _sera_runtime._TRANSFER_ARRAY_STRUCT
+_TRANSFER_ARRAY_MAGIC = _sera_runtime._TRANSFER_ARRAY_MAGIC
+_crc32c = _sera_runtime._crc32c
 
 
 def _create_matrix(rows: int, cols: int, rng: random.Random) -> list[list[float]]:
@@ -148,3 +154,86 @@ def test_transfer_loader_fallback_without_runtime_snapshot(tmp_path: Path) -> No
 
     step_result = model.step()
     assert "y_out" in step_result
+
+
+def _make_transfer_array_header(byte_len: int, crc32c: int, sha_low64: int) -> bytes:
+    dims = (byte_len, 0, 0, 0, 0)
+    return _TRANSFER_ARRAY_STRUCT.pack(
+        _TRANSFER_ARRAY_MAGIC,
+        6,  # u8
+        1,
+        *dims,
+        byte_len,
+        crc32c,
+        sha_low64,
+        0,
+        0,
+    )
+
+
+def _generate_payload(size: int) -> bytes:
+    return bytes((idx % 251 for idx in range(size)))
+
+
+def test_validate_transfer_arrays_streams_large_payload(tmp_path: Path) -> None:
+    arrays_dir = tmp_path / "arrays"
+    arrays_dir.mkdir()
+    size = 2 * 1024 * 1024 + 17
+    payload = _generate_payload(size)
+    digest = hashlib.sha256(payload).digest()
+    header = _make_transfer_array_header(
+        size,
+        _crc32c(payload),
+        int.from_bytes(digest[-8:], "little"),
+    )
+    array_path = arrays_dir / "large.bin"
+    array_path.write_bytes(header + payload)
+    arrays = _validate_transfer_arrays(
+        arrays_dir,
+        {"large": {"sha256": digest.hex()}},
+    )
+    assert arrays["large"]["byte_len"] == size
+
+
+@pytest.mark.parametrize(
+    "modifier, message",
+    [
+        ("truncate", "Array payload length mismatch"),
+        ("crc", "CRC32C mismatch"),
+        ("sha_low", "sha256_low64 mismatch"),
+        ("sha_meta", "failed SHA-256 validation"),
+    ],
+)
+def test_validate_transfer_arrays_streaming_detects_corruption(
+    tmp_path: Path, modifier: str, message: str
+) -> None:
+    arrays_dir = tmp_path / "arrays"
+    arrays_dir.mkdir()
+    size = 2 * 1024 * 1024 + 17
+    payload = _generate_payload(size)
+    digest = hashlib.sha256(payload).digest()
+    crc_value = _crc32c(payload)
+    sha_low64 = int.from_bytes(digest[-8:], "little")
+    array_path = arrays_dir / f"large_{modifier}.bin"
+
+    if modifier == "truncate":
+        header = _make_transfer_array_header(size, crc_value, sha_low64)
+        array_path.write_bytes(header + payload[:-1])
+        record = {"sha256": digest.hex()}
+    elif modifier == "crc":
+        bad_crc = (crc_value + 1) & 0xFFFFFFFF
+        header = _make_transfer_array_header(size, bad_crc, sha_low64)
+        array_path.write_bytes(header + payload)
+        record = {"sha256": digest.hex()}
+    elif modifier == "sha_low":
+        bad_sha_low = (sha_low64 + 1) & 0xFFFFFFFFFFFFFFFF
+        header = _make_transfer_array_header(size, crc_value, bad_sha_low)
+        array_path.write_bytes(header + payload)
+        record = {"sha256": digest.hex()}
+    else:
+        header = _make_transfer_array_header(size, crc_value, sha_low64)
+        array_path.write_bytes(header + payload)
+        record = {"sha256": "0" * 64}
+
+    with pytest.raises(ValueError, match=message):
+        _validate_transfer_arrays(arrays_dir, {f"large_{modifier}": record})
