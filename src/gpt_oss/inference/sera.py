@@ -80,6 +80,7 @@ T = TypeVar("T")
 
 
 _TRANSFER_MANIFEST_PREFIX_STRUCT = struct.Struct("<I I")
+_TRANSFER_EXPECTED_SEED_DIGEST = hashlib.sha256(b"sera-transfer").digest()
 _CRC32C_TABLE: List[int] = []
 _CRC32C_INIT = 0xFFFFFFFF
 _ARRAY_VALIDATION_CHUNK_SIZE = 1024 * 1024
@@ -3702,6 +3703,8 @@ class Sera:
             seed_digest = fh.read(32)
             if len(seed_digest) != 32:
                 raise ValueError("Sera manifest file is truncated")
+            if seed_digest != _TRANSFER_EXPECTED_SEED_DIGEST:
+                raise ValueError("Unexpected Sera manifest seed digest")
             schema_digest = fh.read(32)
             if len(schema_digest) != 32:
                 raise ValueError("Sera manifest file is truncated")
