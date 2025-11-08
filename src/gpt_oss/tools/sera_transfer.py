@@ -848,56 +848,65 @@ def _decode_mxfp4_pair(blocks: TensorLike, scales: TensorLike):
     return _decode_recursive(blocks_list, scales_list)
 
 
-def _split_qkv_tensor(tensor: TensorLike, expected_proj: int):
-    if expected_proj <= 0:
-        raise ValueError("Expected projection dimension must be positive for QKV split")
+def _split_qkv_tensor(
+    tensor: TensorLike,
+    q_dim: int,
+    k_dim: int,
+    v_dim: int,
+):
+    if min(q_dim, k_dim, v_dim) <= 0:
+        raise ValueError("Q, K, and V projection dimensions must be positive for split")
 
     shape = _tensor_shape(tensor)
     if len(shape) < 2:
         raise ValueError("QKV tensor must be at least 2D to split into components")
 
     rows, cols = shape[0], shape[1]
-    axis = None
-    parts = None
-    if cols == expected_proj and rows % expected_proj == 0:
-        axis = 0
-        parts = rows // expected_proj
-    elif rows == expected_proj and cols % expected_proj == 0:
-        axis = 1
-        parts = cols // expected_proj
+    total = q_dim + k_dim + v_dim
+    axis: int | None = None
 
-    if axis is None or parts != 3:
+    if rows == total:
+        axis = 0
+    elif cols == total:
+        axis = 1
+
+    if axis is None:
         raise ValueError(
-            "Unable to split QKV tensor: expected dimensions compatible with 3-way split"
+            "Unable to split QKV tensor: expected dimensions compatible with split "
+            f"[{q_dim}, {k_dim}, {v_dim}] but received shape {shape}"
         )
 
     if _TORCH_TENSOR_TYPES and isinstance(tensor, _TORCH_TENSOR_TYPES):
-        chunks = tensor.split(expected_proj, dim=axis)
+        chunks = tensor.split((q_dim, k_dim, v_dim), dim=axis)
         if len(chunks) != 3:
             raise ValueError("QKV tensor did not split into 3 components as expected")
         return tuple(chunks)
 
     if _NP_ARRAY_TYPES and isinstance(tensor, _NP_ARRAY_TYPES):
-        chunks = _np.split(tensor, 3, axis=axis)
+        indices = (q_dim, q_dim + k_dim)
+        chunks = _np.split(tensor, indices, axis=axis)
+        if len(chunks) != 3:
+            raise ValueError("QKV tensor did not split into 3 components as expected")
         return tuple(chunks)
 
     matrix = _as_nested_list(tensor)
     if axis == 0:
-        step = len(matrix) // 3
+        q_rows = matrix[:q_dim]
+        k_rows = matrix[q_dim : q_dim + k_dim]
+        v_rows = matrix[q_dim + k_dim : total]
         return (
-            [row[:] for row in matrix[:step]],
-            [row[:] for row in matrix[step : 2 * step]],
-            [row[:] for row in matrix[2 * step : 3 * step]],
+            [row[:] for row in q_rows],
+            [row[:] for row in k_rows],
+            [row[:] for row in v_rows],
         )
 
     if not matrix or not matrix[0]:
         raise ValueError("Unable to split empty QKV tensor")
 
-    step = len(matrix[0]) // 3
     return (
-        [[row[idx] for idx in range(0, step)] for row in matrix],
-        [[row[idx] for idx in range(step, 2 * step)] for row in matrix],
-        [[row[idx] for idx in range(2 * step, 3 * step)] for row in matrix],
+        [row[0:q_dim] for row in matrix],
+        [row[q_dim : q_dim + k_dim] for row in matrix],
+        [row[q_dim + k_dim : total] for row in matrix],
     )
 
 
@@ -1071,6 +1080,7 @@ class ModelConfig:
                 d_model=d_model,
                 n_heads=n_heads,
                 head_dim=head_dim,
+                num_key_value_heads=kv_heads,
             )
             ModelConfig._materialize_mxfp4_layers(layers, tensors)
 
@@ -1410,13 +1420,16 @@ class ModelConfig:
         d_model: int,
         n_heads: int,
         head_dim: int,
+        num_key_value_heads: int | None,
     ) -> None:
         if not isinstance(tensors, MutableMapping):
             raise TypeError(
                 "Tensor mapping must be mutable to decode fused QKV weights"
             )
 
-        expected_proj = n_heads * head_dim if n_heads and head_dim else d_model
+        q_dim = n_heads * head_dim if n_heads and head_dim else d_model
+        kv_heads = num_key_value_heads if num_key_value_heads else n_heads
+        kv_dim = kv_heads * head_dim if kv_heads and head_dim else q_dim
         cache: Dict[str, Dict[str, TensorLike]] = {}
 
         for layer in layers:
@@ -1434,7 +1447,7 @@ class ModelConfig:
                             "Unable to decode fused QKV tensor; missing source "
                             f"'{base}' for role '{parsed_role}'"
                         )
-                    q, k, v = _split_qkv_tensor(tensor, expected_proj)
+                    q, k, v = _split_qkv_tensor(tensor, q_dim, kv_dim, kv_dim)
                     components = {"W_Q": q, "W_K": k, "W_V": v}
                     cache[base] = components
                 component = components.get(parsed_role)
