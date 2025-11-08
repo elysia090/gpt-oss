@@ -2541,11 +2541,13 @@ def convert(
                     )
                 )
 
+            log_notice("Generating tokenizer arrays")
             tokenizer_data, tokenizer_meta = tokenizer_arrays(cfg, tensors)
             for name, data in tokenizer_data.items():
                 store_array(name, data, "u8")
             metadata["tokenizer"] = tokenizer_meta
 
+            log_notice("Generating PRF arrays")
             prf = compute_prf(cfg, tensors, local_r)
             for name, data in prf.items():
                 store_array(name, data, "f32")
@@ -2568,6 +2570,7 @@ def convert(
                     attention_meta[key] = value
             metadata["attention"] = attention_meta
 
+            log_notice("Computing attention overlays")
             overlays = compute_overlays(cfg, tensors, local_r, local_r_v)
             for name, data in overlays.items():
                 store_array(name, data, "f32")
@@ -2578,6 +2581,7 @@ def convert(
                 "cols": len(overlays.get("overlays_U", [])),
             }
 
+            log_notice("Collapsing FFN weights")
             linear_data, linear_meta = collapse_ffn(cfg, tensors, top_l)
             store_array("linear_mphf", linear_data["linear_mphf"], "u8")
             store_array("linear_keys", linear_data["linear_keys"], "u8")
@@ -2596,11 +2600,13 @@ def convert(
                     linear_meta[key] = value
             metadata["linear"] = linear_meta
 
+            log_notice("Computing memory coefficients")
             memory_data, memory_meta = memory_coefficients(cfg)
             store_array("memory_coeff", memory_data["memory_coeff"], "f64")
             store_array("delaybuf_init", memory_data["delaybuf_init"], "f32")
             metadata["memory"] = memory_meta
 
+            log_notice("Constructing bridge records")
             bridge_data, bridge_meta = bridge_records(cfg, tensors, cfg.vocab_size)
             store_array("bridge_hubs", bridge_data["bridge_hubs"], "u8")
             store_array("bridge_qDin", bridge_data["bridge_qDin"], "i16")
