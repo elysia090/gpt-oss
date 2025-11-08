@@ -1100,6 +1100,20 @@ def test_cli_verbose_emits_search_hints(tmp_path: Path) -> None:
     assert "vocab_size" in log_output
 
 
+def test_format_model_config_keys_preserves_remaining_order() -> None:
+    config = {
+        "zeta": 0,
+        "architectures": "GptOssForCausalLM",
+        "epsilon": 1,
+        "model_type": "gpt_oss",
+        "alpha": 2,
+    }
+
+    formatted = sera_transfer._format_model_config_keys(config)
+
+    assert formatted == "architectures, model_type, zeta, epsilon, alpha"
+
+
 def test_cli_reports_missing_safetensors(tmp_path: Path, monkeypatch, capsys) -> None:
     module = importlib.reload(sera_transfer)
     monkeypatch.setattr(module, "_resolve_safe_open", lambda: safetensors_stub.safe_open)
