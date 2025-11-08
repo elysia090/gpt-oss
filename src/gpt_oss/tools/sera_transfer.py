@@ -27,26 +27,22 @@ _SAFETENSORS_MISSING_MSG = (
     "Install it with 'pip install safetensors'."
 )
 
-try:  # pragma: no cover - exercised indirectly when safetensors is installed
-    from safetensors import safe_open
-except ModuleNotFoundError as exc:  # pragma: no cover - deterministic error message
-    raise ModuleNotFoundError(_SAFETENSORS_MISSING_MSG) from exc
+if importlib.util.find_spec("safetensors") is None:  # pragma: no cover - deterministic import guard
+    raise ModuleNotFoundError(_SAFETENSORS_MISSING_MSG)
+from safetensors import safe_open
 
 _NUMPY_MISSING_MSG = (
     "The numpy package is required for Sera conversion. Install it with 'pip install numpy'."
 )
 
-try:  # pragma: no cover - optional dependency
-    import numpy as _np
-except Exception as exc:  # pragma: no cover - defensive
-    raise ModuleNotFoundError(_NUMPY_MISSING_MSG) from exc
-else:  # pragma: no cover - executed when numpy is available
-    if not getattr(_np, "__gpt_oss_numpy_stub__", False):
-        _missing_numpy_apis = [
-            name for name in ("stack", "ldexp", "split") if not hasattr(_np, name)
-        ]
-        if _missing_numpy_apis:
-            raise ModuleNotFoundError(_NUMPY_MISSING_MSG)
+if importlib.util.find_spec("numpy") is None:  # pragma: no cover - deterministic import guard
+    raise ModuleNotFoundError(_NUMPY_MISSING_MSG)
+import numpy as _np
+
+if not getattr(_np, "__gpt_oss_numpy_stub__", False):
+    _missing_numpy_apis = [name for name in ("stack", "ldexp", "split") if not hasattr(_np, name)]
+    if _missing_numpy_apis:
+        raise ModuleNotFoundError(_NUMPY_MISSING_MSG)
 
 try:  # pragma: no cover - optional dependency
     import torch as _torch

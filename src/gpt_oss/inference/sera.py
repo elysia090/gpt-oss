@@ -27,13 +27,11 @@ from typing import (
     Union,
 )
 
-try:  # pragma: no cover - exercised indirectly by the tests
-    import numpy as np
-except ModuleNotFoundError as exc:  # pragma: no cover - deterministic error message
+if importlib.util.find_spec("numpy") is None:  # pragma: no cover - deterministic import guard
     raise ModuleNotFoundError(
-        "The numpy package is required for the Sera runtime. "
-        "Install it with 'pip install numpy'."
-    ) from exc
+        "The numpy package is required for the Sera runtime. Install it with 'pip install numpy'."
+    )
+import numpy as np
 import hashlib
 import json
 import zlib
@@ -3984,12 +3982,9 @@ def _load_transfer_state(path: Path, *, allow_pickle: bool = False):
             blob = json.load(fh)
         return _decode_transfer_blob(blob)
     if suffix in {".msgpack", ".mpk"}:
-        try:  # pragma: no cover - optional dependency
-            import msgpack  # type: ignore
-        except ModuleNotFoundError as exc:  # pragma: no cover - defensive
-            raise RuntimeError(
-                "Support for msgpack snapshots requires the 'msgpack' package"
-            ) from exc
+        if importlib.util.find_spec("msgpack") is None:  # pragma: no cover - deterministic import guard
+            raise RuntimeError("Support for msgpack snapshots requires the 'msgpack' package")
+        import msgpack  # type: ignore
         with path.open("rb") as fh:
             blob = msgpack.unpack(fh, raw=False)
         return _decode_transfer_blob(blob)

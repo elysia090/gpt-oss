@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import textwrap
 from dataclasses import dataclass
@@ -9,85 +10,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
-try:  # pragma: no cover - executed at import time
-    from prompt_toolkit.application import Application
-    from prompt_toolkit.buffer import Buffer
-    from prompt_toolkit.document import Document
-    from prompt_toolkit.key_binding import KeyBindings
-    from prompt_toolkit.layout import HSplit, VSplit, Layout
-    from prompt_toolkit.layout.dimension import Dimension
-    from prompt_toolkit.widgets import Frame, TextArea
-except ModuleNotFoundError:  # pragma: no cover - fallback for environments without prompt_toolkit
-    class Application:  # type: ignore[override]
-        def __init__(self, layout, full_screen=False, key_bindings=None):
-            self.layout = layout
-            self.full_screen = full_screen
-            self.key_bindings = key_bindings
+_PROMPT_TOOLKIT_SPEC = importlib.util.find_spec("prompt_toolkit")
+if _PROMPT_TOOLKIT_SPEC is None:  # pragma: no cover - deterministic import guard
+    raise ModuleNotFoundError(
+        "prompt_toolkit is required to run the Sera TUI. Install it with 'pip install prompt-toolkit'."
+    )
 
-        def run(self) -> None:
-            raise RuntimeError(
-                "prompt_toolkit is required to run the Sera TUI. Install the optional dependency to enable it."
-            )
-
-        def invalidate(self) -> None:
-            pass
-
-    class Buffer:  # type: ignore[override]
-        def __init__(self, accept_handler=None):
-            self.accept_handler = accept_handler
-            self.text = ""
-            self.cursor_position = 0
-
-        def reset(self) -> None:
-            self.text = ""
-            self.cursor_position = 0
-
-    class Document:  # type: ignore[override]
-        def __init__(self, text: str = "", cursor_position: int = 0) -> None:
-            self.text = text
-            self.cursor_position = cursor_position
-
-    class TextArea:  # type: ignore[override]
-        def __init__(self, text="", buffer: Optional[Buffer] = None, **_: object) -> None:
-            self.buffer = buffer or Buffer()
-            self.text = text
-            self.buffer.text = text
-
-    class Frame:  # type: ignore[override]
-        def __init__(self, body, title: Optional[str] = None, height: Optional[object] = None):
-            self.body = body
-            self.title = title
-            self.height = height
-
-    class Dimension:  # type: ignore[override]
-        def __init__(self, min: Optional[int] = None, preferred: Optional[int] = None):
-            self.min = min
-            self.preferred = preferred
-
-    class HSplit(list):  # type: ignore[override]
-        def __init__(self, children):
-            super().__init__(children)
-
-    class VSplit(list):  # type: ignore[override]
-        def __init__(self, children, padding: int | None = None):
-            super().__init__(children)
-            self.padding = padding
-
-    class KeyBindings:  # type: ignore[override]
-        def __init__(self) -> None:
-            self._bindings: Dict[str, List[Callable[..., None]]] = {}
-
-        def add(self, key: str):  # type: ignore[override]
-            def decorator(func: Callable[..., None]) -> Callable[..., None]:
-                self._bindings.setdefault(key, []).append(func)
-                return func
-
-            return decorator
-
-    class Layout:  # type: ignore[override]
-        def __init__(self, container, focused_element=None):
-            self.container = container
-            self.focused_element = focused_element
+from prompt_toolkit.application import Application
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.document import Document
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import HSplit, Layout, VSplit
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.widgets import Frame, TextArea
 
 from .sera_chat import TranscriptLogger, TurnRecord
 

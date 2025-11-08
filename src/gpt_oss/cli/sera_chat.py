@@ -422,12 +422,9 @@ def _load_state(path: Path):
             blob = json.load(fh)
         return _decode_snapshot_types(blob)
     if suffix in {".msgpack", ".mpk"}:
-        try:  # pragma: no cover - optional dependency
-            import msgpack  # type: ignore
-        except ModuleNotFoundError as exc:  # pragma: no cover - defensive
-            raise RuntimeError(
-                "Support for msgpack snapshots requires the 'msgpack' package"
-            ) from exc
+        if importlib.util.find_spec("msgpack") is None:  # pragma: no cover - deterministic import guard
+            raise RuntimeError("Support for msgpack snapshots requires the 'msgpack' package")
+        import msgpack  # type: ignore
         with path.open("rb") as fh:
             blob = msgpack.unpack(fh, raw=False)
         return _decode_snapshot_types(blob)
