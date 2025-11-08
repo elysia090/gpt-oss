@@ -89,6 +89,8 @@ _TRANSFER_DTYPE_CODES: Dict[int, str] = {
     9: "bf16",
 }
 _CRC32C_TABLE: List[int] = []
+_CRC32C_INIT = 0xFFFFFFFF
+_ARRAY_VALIDATION_CHUNK_SIZE = 1024 * 1024
 
 
 def _coerce_int(value: object) -> Optional[int]:
@@ -4032,31 +4034,44 @@ def _validate_transfer_arrays(
         array_path = array_dir / f"{name}.bin"
         if not array_path.exists():
             raise FileNotFoundError(f"Required array {array_path} is missing")
+        file_size = array_path.stat().st_size
         with array_path.open("rb") as fh:
             header_raw = fh.read(_TRANSFER_ARRAY_STRUCT.size)
             if len(header_raw) != _TRANSFER_ARRAY_STRUCT.size:
                 raise ValueError(f"Array file {array_path} is truncated")
             values = _TRANSFER_ARRAY_STRUCT.unpack(header_raw)
-            payload = fh.read()
-        header = _parse_transfer_array_header(values)
-        if header["magic"] != _TRANSFER_ARRAY_MAGIC:
-            raise ValueError(f"Invalid array magic for {array_path}")
-        if len(payload) != header["byte_len"]:
+            header = _parse_transfer_array_header(values)
+            if header["magic"] != _TRANSFER_ARRAY_MAGIC:
+                raise ValueError(f"Invalid array magic for {array_path}")
+            expected_len = header["byte_len"]
+            crc_state = _CRC32C_INIT
+            sha256 = hashlib.sha256()
+            remaining = expected_len
+            while remaining > 0:
+                chunk = fh.read(min(_ARRAY_VALIDATION_CHUNK_SIZE, remaining))
+                if not chunk:
+                    break
+                crc_state = _crc32c_update(crc_state, chunk)
+                sha256.update(chunk)
+                remaining -= len(chunk)
+            bytes_consumed = expected_len - remaining
+            crc = (~crc_state) & 0xFFFFFFFF
+            digest_bytes = sha256.digest()
+        payload_len_on_disk = max(file_size - _TRANSFER_ARRAY_STRUCT.size, 0)
+        if bytes_consumed != expected_len or payload_len_on_disk != expected_len:
             raise ValueError(
-                f"Array payload length mismatch for {array_path}: expected {header['byte_len']}, got {len(payload)}"
+                f"Array payload length mismatch for {array_path}: expected {expected_len}, got {payload_len_on_disk}"
             )
-        crc = _crc32c(payload)
         if crc != header["crc32c"]:
             raise ValueError(f"CRC32C mismatch for {array_path}")
-        sha_low64 = int.from_bytes(hashlib.sha256(payload).digest()[-8:], "little")
+        sha_low64 = int.from_bytes(digest_bytes[-8:], "little")
         if sha_low64 != header["sha256_low64"]:
             raise ValueError(f"sha256_low64 mismatch for {array_path}")
         expected_sha = record.get("sha256")
         if expected_sha:
-            digest = hashlib.sha256(payload).hexdigest()
-            if digest != expected_sha:
+            if digest_bytes.hex() != expected_sha:
                 raise ValueError(
-                    f"Array {array_path} failed SHA-256 validation: expected {expected_sha}, got {digest}"
+                    f"Array {array_path} failed SHA-256 validation: expected {expected_sha}, got {digest_bytes.hex()}"
                 )
         arrays[name] = {
             "dtype": header["dtype"],
@@ -4081,9 +4096,13 @@ def _init_crc32c_table() -> None:
         _CRC32C_TABLE.append(crc & 0xFFFFFFFF)
 
 
-def _crc32c(data: bytes) -> int:
+def _crc32c_update(crc: int, data: bytes) -> int:
     _init_crc32c_table()
-    crc = 0xFFFFFFFF
     for byte in data:
         crc = _CRC32C_TABLE[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    return crc & 0xFFFFFFFF
+
+
+def _crc32c(data: bytes) -> int:
+    crc = _crc32c_update(_CRC32C_INIT, data)
     return (~crc) & 0xFFFFFFFF
