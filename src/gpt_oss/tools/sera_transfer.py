@@ -19,6 +19,7 @@ import sys
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import MutableMapping
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
 try:  # pragma: no cover - exercised indirectly in environments with safetensors
@@ -62,6 +63,27 @@ else:  # pragma: no cover - runtime alias
 
 _NP_ARRAY_TYPES = (_np.ndarray,) if _np is not None else ()
 _TORCH_TENSOR_TYPES = (_torch.Tensor,) if _torch is not None else ()
+
+_MXFP4_SUFFIXES = (".blocks", ".scales")
+
+_MXFP4_FP4_VALUES = (
+    +0.0,
+    +0.5,
+    +1.0,
+    +1.5,
+    +2.0,
+    +3.0,
+    +4.0,
+    +6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
 
 
 def _looks_like_repo_stub_safe_open(func) -> bool:
@@ -719,6 +741,87 @@ def _tensor_shape(tensor: object) -> Tuple[int, ...]:
     return ()
 
 
+def _mxfp4_components(name: str) -> Tuple[str, str, str] | None:
+    if not isinstance(name, str):
+        return None
+
+    for suffix in _MXFP4_SUFFIXES:
+        if name.endswith(suffix):
+            base = name[: -len(suffix)]
+            return base, f"{base}.blocks", f"{base}.scales"
+    return None
+
+
+def _as_nested_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return [_as_nested_list(item) for item in value]
+    if _NP_ARRAY_TYPES and isinstance(value, _NP_ARRAY_TYPES):
+        return value.tolist()
+    if _TORCH_TENSOR_TYPES and isinstance(value, _TORCH_TENSOR_TYPES):
+        return value.detach().cpu().tolist()
+    return value
+
+
+def _decode_mxfp4_pair(blocks: TensorLike, scales: TensorLike):
+    if _TORCH_TENSOR_TYPES and isinstance(blocks, _TORCH_TENSOR_TYPES):
+        blocks_tensor = blocks.to(dtype=_torch.uint8)
+        if _TORCH_TENSOR_TYPES and isinstance(scales, _TORCH_TENSOR_TYPES):
+            scales_tensor = scales.to(dtype=_torch.int32, device=blocks_tensor.device)
+        else:
+            scales_tensor = _torch.as_tensor(
+                scales, dtype=_torch.int32, device=blocks_tensor.device
+            )
+        scales_tensor = scales_tensor - 127
+        lut = _torch.tensor(
+            _MXFP4_FP4_VALUES, dtype=_torch.float32, device=blocks_tensor.device
+        )
+        prefix_shape = blocks_tensor.shape[:-1]
+        idx_lo = (blocks_tensor & 0x0F).to(dtype=_torch.long)
+        idx_hi = (blocks_tensor >> 4).to(dtype=_torch.long)
+        decoded = _torch.stack((lut[idx_lo], lut[idx_hi]), dim=-1)
+        decoded = _torch.ldexp(
+            decoded,
+            scales_tensor.reshape(*prefix_shape, 1, 1),
+        )
+        return decoded.reshape(*prefix_shape, blocks_tensor.shape[-1] * 2)
+
+    if _NP_ARRAY_TYPES and isinstance(blocks, _NP_ARRAY_TYPES):
+        blocks_array = _np.asarray(blocks, dtype=_np.uint8)
+        scales_array = _np.asarray(scales, dtype=_np.int32) - 127
+        lut = _np.asarray(_MXFP4_FP4_VALUES, dtype=_np.float32)
+        prefix_shape = blocks_array.shape[:-1]
+        idx_lo = blocks_array & 0x0F
+        idx_hi = blocks_array >> 4
+        decoded = _np.stack((lut[idx_lo], lut[idx_hi]), axis=-1)
+        decoded = _np.ldexp(decoded, scales_array.reshape(*prefix_shape, 1, 1))
+        return decoded.reshape(*prefix_shape, blocks_array.shape[-1] * 2)
+
+    blocks_list = _as_nested_list(blocks)
+    scales_list = _as_nested_list(scales)
+
+    def _decode_recursive(block_part, scale_part):
+        if isinstance(block_part, list) and block_part and isinstance(block_part[0], list):
+            return [
+                _decode_recursive(sub_block, sub_scale)
+                for sub_block, sub_scale in zip(block_part, scale_part)
+            ]
+        if not isinstance(block_part, list):
+            return []
+        scale_value = int(scale_part) - 127
+        row: List[float] = []
+        for byte in block_part:
+            byte_value = int(byte) & 0xFF
+            lo = _MXFP4_FP4_VALUES[byte_value & 0x0F]
+            hi = _MXFP4_FP4_VALUES[(byte_value >> 4) & 0x0F]
+            row.append(math.ldexp(lo, scale_value))
+            row.append(math.ldexp(hi, scale_value))
+        return row
+
+    return _decode_recursive(blocks_list, scales_list)
+
+
 @dataclass
 class ModelConfig:
     d_model: int
@@ -880,6 +983,9 @@ class ModelConfig:
                 head_dim=head_dim,
             )
 
+        if tensors is not None:
+            ModelConfig._materialize_mxfp4_layers(layers, tensors)
+
         if num_hidden_layers is None:
             num_hidden_layers = len(layers)
         elif num_hidden_layers != len(layers):
@@ -937,16 +1043,20 @@ class ModelConfig:
                 "key.weight",
                 "k_linear.weight",
                 "k.weight",
+                "attn.qkv.weight",
+                "attention.qkv.weight",
             ),
             "W_O": (
                 "attn.o.weight",
                 "attn.wo.weight",
                 "attn.o_proj.weight",
                 "attn.oproj.weight",
+                "attn.out.weight",
                 "attention.o.weight",
                 "attention.wo.weight",
                 "attention.o_proj.weight",
                 "attention.out_proj.weight",
+                "attention.out.weight",
                 "attention.oproj.weight",
                 "attention.outproj.weight",
                 "self_attn.o_proj.weight",
@@ -981,6 +1091,8 @@ class ModelConfig:
                 "gate.weight",
                 "w1.weight",
                 "wi.weight",
+                "mlp.mlp1_weight.blocks",
+                "mlp.mlp1_weight.scales",
             ),
             "FFN_W2": (
                 "ffn.w2.weight",
@@ -999,6 +1111,8 @@ class ModelConfig:
                 "proj.weight",
                 "w2.weight",
                 "wo.weight",
+                "mlp.mlp2_weight.blocks",
+                "mlp.mlp2_weight.scales",
             ),
             "FFN_B1": (
                 "ffn.w1.bias",
@@ -1018,6 +1132,7 @@ class ModelConfig:
                 "gate.bias",
                 "w1.bias",
                 "wi.bias",
+                "mlp.mlp1_bias",
             ),
             "FFN_B2": (
                 "ffn.w2.bias",
@@ -1032,6 +1147,7 @@ class ModelConfig:
                 "down_proj.bias",
                 "w2.bias",
                 "wo.bias",
+                "mlp.mlp2_bias",
             ),
         }
 
@@ -1116,6 +1232,36 @@ class ModelConfig:
                 )
             )
         return layers
+
+    @staticmethod
+    def _materialize_mxfp4_layers(
+        layers: Sequence[LayerConfig], tensors: Mapping[str, TensorLike]
+    ) -> None:
+        if not isinstance(tensors, MutableMapping):
+            raise TypeError(
+                "Tensor mapping must be mutable to decode MXFP4 weights"
+            )
+
+        cache: Dict[str, TensorLike] = {}
+        for layer in layers:
+            for attr in ("w1", "w2"):
+                name = getattr(layer, attr)
+                components = _mxfp4_components(name)
+                if components is None:
+                    continue
+                base, blocks_name, scales_name = components
+                if base not in cache:
+                    blocks = tensors.get(blocks_name)
+                    scales = tensors.get(scales_name)
+                    if blocks is None or scales is None:
+                        raise ValueError(
+                            "Unable to decode MXFP4 tensors for role "
+                            f"'{name}'; expected both '{blocks_name}' and "
+                            f"'{scales_name}'"
+                        )
+                    cache[base] = _decode_mxfp4_pair(blocks, scales)
+                    tensors[base] = cache[base]
+                setattr(layer, attr, base)
 
     @staticmethod
     def _tokens_allow_role(
