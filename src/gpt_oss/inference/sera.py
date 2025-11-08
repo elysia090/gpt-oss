@@ -73,6 +73,7 @@ _TRANSFER_STATE_FILENAMES: Tuple[str, ...] = (
 )
 _TRANSFER_ARRAY_MAGIC = 0x53455241
 _TRANSFER_MANIFEST_MAGIC = 0x5345524D
+_TRANSFER_MANIFEST_VERSION = 0x3
 _TRANSFER_MANIFEST_PREFIX_STRUCT = struct.Struct("<I I")
 _TRANSFER_ARRAY_STRUCT = struct.Struct("<I H H 5Q Q Q Q I I")
 _TRANSFER_DTYPE_CODES: Dict[int, str] = {
@@ -3510,6 +3511,10 @@ class Sera:
             magic, version = _TRANSFER_MANIFEST_PREFIX_STRUCT.unpack(prefix_raw)
             if magic != _TRANSFER_MANIFEST_MAGIC:
                 raise ValueError("Invalid Sera manifest magic")
+            if version != _TRANSFER_MANIFEST_VERSION:
+                raise ValueError(
+                    f"Unsupported Sera manifest version: {version}"
+                )
             seed_digest = fh.read(32)
             if len(seed_digest) != 32:
                 raise ValueError("Sera manifest file is truncated")
@@ -3553,7 +3558,9 @@ class Sera:
             raise TypeError("Transfer snapshot 'sera_snapshot' must be a mapping")
 
         arrays_meta = state_blob.get("artefacts")
-        if isinstance(arrays_meta, Mapping):
+        if arrays_meta is None:
+            arrays_info = {}
+        elif isinstance(arrays_meta, Mapping):
             arrays_dir = (manifest_dir / "arrays").resolve()
             if not arrays_dir.exists():
                 raise FileNotFoundError(
@@ -3565,7 +3572,7 @@ class Sera:
                 )
             arrays_info = _validate_transfer_arrays(arrays_dir, arrays_meta)
         else:
-            arrays_info = {}
+            raise TypeError("Transfer snapshot 'artefacts' must be a mapping if present")
 
         if isinstance(runtime_blob, Mapping) and "config" in runtime_blob:
             model = cls.restore(dict(runtime_blob))
