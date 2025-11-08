@@ -3,6 +3,9 @@ name = "gpt-oss"
 description = "A collection of reference inference implementations for gpt-oss by OpenAI"
 
 dependencies = [
+  "numpy",
+  "safetensors",
+  "torch",
   "openai-harmony",
   "tiktoken>=0.9.0",
   "huggingface-hub>=0.26.0",
