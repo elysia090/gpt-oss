@@ -67,10 +67,11 @@ T = TypeVar("T")
 
 _TRANSFER_JSON_BYTES_PREFIX = "__sera_bytes__:"
 _TRANSFER_STATE_FILENAMES: Tuple[str, ...] = (
-    "sera_state.pkl",
     "sera_state.json",
     "sera_state.msgpack",
+    "sera_state.pkl",
 )
+_PICKLE_SUFFIXES = {".pkl", ".pickle"}
 _TRANSFER_ARRAY_MAGIC = 0x53455241
 _TRANSFER_MANIFEST_MAGIC = 0x5345524D
 _TRANSFER_MANIFEST_VERSION = 0x3
@@ -3489,8 +3490,22 @@ class Sera:
         artefact_root: Union[str, Path],
         *,
         state_file: Optional[Union[str, Path]] = None,
+        allow_pickle: bool = False,
     ) -> Tuple["Sera", Dict[str, object]]:
-        """Restore a model from a Sera Transfer Kit bundle (spec §17)."""
+        """Restore a model from a Sera Transfer Kit bundle (spec §17).
+
+        Parameters
+        ----------
+        artefact_root:
+            Directory containing the ``sera_manifest.bin`` file and snapshot(s).
+        state_file:
+            Optional explicit path to the runtime snapshot.  When omitted the
+            loader probes for :data:`_TRANSFER_STATE_FILENAMES` in order.
+        allow_pickle:
+            If ``True`` the loader may restore ``.pkl``/``.pickle`` snapshots.
+            Pickle files can execute arbitrary code during loading so the
+            default ``False`` guards against accidental use.
+        """
 
         manifest_dir = Path(artefact_root).expanduser()
         if manifest_dir.is_file():
@@ -3527,24 +3542,40 @@ class Sera:
             "schema_sha256": schema_digest.hex(),
         }
 
+        refused_pickle: Optional[Path] = None
         if state_file is not None:
             state_path = Path(state_file).expanduser()
             if not state_path.is_absolute():
                 state_path = manifest_dir / state_path
             state_path = state_path.resolve()
+            if (
+                state_path.suffix.lower() in _PICKLE_SUFFIXES
+                and not allow_pickle
+                and state_path.exists()
+            ):
+                refused_pickle = state_path
         else:
             state_path = None
             for name in _TRANSFER_STATE_FILENAMES:
                 candidate = (manifest_dir / name).resolve()
-                if candidate.exists():
-                    state_path = candidate
-                    break
+                if not candidate.exists():
+                    continue
+                if candidate.suffix.lower() in _PICKLE_SUFFIXES and not allow_pickle:
+                    refused_pickle = candidate
+                    continue
+                state_path = candidate
+                break
         if state_path is None or not state_path.exists():
+            if refused_pickle is not None and not allow_pickle:
+                raise RuntimeError(
+                    "Refusing to load pickle snapshot without allow_pickle=True. "
+                    "Pickle deserialisation can execute arbitrary code."
+                )
             raise FileNotFoundError(
                 "No Sera runtime snapshot found alongside the manifest"
             )
 
-        state_blob = _load_transfer_state(state_path)
+        state_blob = _load_transfer_state(state_path, allow_pickle=allow_pickle)
         if not isinstance(state_blob, Mapping):
             raise TypeError("Transfer snapshot must be a mapping")
         state_blob = _strip_transfer_private_fields(state_blob)
@@ -3748,9 +3779,31 @@ def _strip_transfer_private_fields(blob):
     return blob
 
 
-def _load_transfer_state(path: Path):
+def _load_transfer_state(path: Path, *, allow_pickle: bool = False):
+    """Load a transfer snapshot from ``path`` with safe defaults.
+
+    Parameters
+    ----------
+    path:
+        Snapshot file to load.
+    allow_pickle:
+        Enable unpickling ``.pkl``/``.pickle`` snapshots.  Pickle deserialisation
+        can execute arbitrary code so the default ``False`` protects callers.
+
+    Raises
+    ------
+    RuntimeError
+        If the snapshot format is unsupported or when refusing to load a pickle
+        snapshot without explicit opt-in.
+    """
+
     suffix = path.suffix.lower()
-    if suffix in {".pkl", ".pickle"}:
+    if suffix in _PICKLE_SUFFIXES:
+        if not allow_pickle:
+            raise RuntimeError(
+                "Pickle snapshots are disabled by default. Pass allow_pickle=True "
+                "to acknowledge the code-execution risk."
+            )
         with path.open("rb") as fh:
             return pickle.load(fh)
     if suffix == ".json":

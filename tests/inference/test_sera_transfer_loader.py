@@ -4,6 +4,8 @@ import random
 import sys
 from pathlib import Path
 
+import pytest
+
 from gpt_oss._stubs.safetensors.numpy import save_file
 
 from gpt_oss.tools import sera_transfer
@@ -83,6 +85,41 @@ def test_transfer_loader_restores_model(tmp_path: Path) -> None:
     assert isinstance(model, Sera)
     assert metadata["manifest_path"] == summary.manifest_path
     assert metadata["state_path"].exists()
+    assert metadata["state_path"].suffix == ".json"
     arrays = metadata["arrays"]
     assert "tokenizer_fst" in arrays
     assert arrays["tokenizer_fst"]["byte_len"] >= 0
+
+
+def test_transfer_loader_rejects_pickle_without_opt_in(tmp_path: Path) -> None:
+    source = _create_checkpoint(tmp_path)
+    output = tmp_path / "output"
+    sera_transfer.convert(source, output, r=4, r_v=2, top_l=2)
+
+    # Remove safe formats so only the pickle snapshot remains.
+    json_path = output / "sera_state.json"
+    if json_path.exists():
+        json_path.unlink()
+    msgpack_path = output / "sera_state.msgpack"
+    if msgpack_path.exists():
+        msgpack_path.unlink()
+
+    with pytest.raises(RuntimeError, match="allow_pickle=True"):
+        Sera.transfer(output)
+
+
+def test_transfer_loader_allows_pickle_with_opt_in(tmp_path: Path) -> None:
+    source = _create_checkpoint(tmp_path)
+    output = tmp_path / "output"
+    sera_transfer.convert(source, output, r=4, r_v=2, top_l=2)
+
+    json_path = output / "sera_state.json"
+    if json_path.exists():
+        json_path.unlink()
+    msgpack_path = output / "sera_state.msgpack"
+    if msgpack_path.exists():
+        msgpack_path.unlink()
+
+    model, metadata = Sera.transfer(output, allow_pickle=True)
+    assert isinstance(model, Sera)
+    assert metadata["state_path"].suffix == ".pkl"
