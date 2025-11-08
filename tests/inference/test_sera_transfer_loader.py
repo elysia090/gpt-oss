@@ -123,3 +123,28 @@ def test_transfer_loader_allows_pickle_with_opt_in(tmp_path: Path) -> None:
     model, metadata = Sera.transfer(output, allow_pickle=True)
     assert isinstance(model, Sera)
     assert metadata["state_path"].suffix == ".pkl"
+
+
+def test_transfer_loader_fallback_without_runtime_snapshot(tmp_path: Path) -> None:
+    source = _create_checkpoint(tmp_path)
+    output = tmp_path / "output"
+    sera_transfer.convert(source, output, r=4, r_v=2, top_l=2)
+
+    json_path = output / "sera_state.json"
+    blob = json.loads(json_path.read_text())
+    blob.pop("sera_snapshot", None)
+    json_path.write_text(json.dumps(blob, indent=2, sort_keys=True) + "\n")
+
+    model, _ = Sera.transfer(output)
+    assert isinstance(model, Sera)
+
+    config_blob = blob["model_config"]
+    metadata_blob = blob["metadata"]
+    assert model.config.attention.dim == config_blob["d_model"]
+    assert model.config.attention.features == metadata_blob["attention"]["features"]
+    assert model.config.attention.value_dim == metadata_blob["overlays"]["cols"]
+    assert model.config.tokenizer.max_piece_length == metadata_blob["tokenizer"]["max_piece_length"]
+    assert model.config.linear.capacity >= len(metadata_blob["linear"]["keys"])
+
+    step_result = model.step()
+    assert "y_out" in step_result
