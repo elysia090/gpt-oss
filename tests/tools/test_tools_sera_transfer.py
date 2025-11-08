@@ -128,6 +128,18 @@ def _flatten_tensor(tensor) -> list[float]:
     return [float(tensor)]
 
 
+def _mxfp4_bytes(rows: int, bytes_per_row: int) -> list[list[int]]:
+    data: list[list[int]] = []
+    for r in range(rows):
+        row: list[int] = []
+        for c in range(bytes_per_row):
+            lo = (r + c) % 16
+            hi = (r + c + 1) % 16
+            row.append(lo | (hi << 4))
+        data.append(row)
+    return data
+
+
 def test_load_tensors_requires_safetensors(tmp_path, monkeypatch):
     module = importlib.reload(sera_transfer)
 
@@ -694,6 +706,66 @@ def test_model_config_infers_layers_from_openai_layout(tmp_path: Path) -> None:
     assert first.w2.endswith("mlp.down_proj.weight")
     assert first.b1.endswith("mlp.gate_proj.bias")
     assert first.b2.endswith("mlp.down_proj.bias")
+
+
+def test_model_config_handles_gpt_oss_mxfp4_layout() -> None:
+    config = {
+        "d_model": 4,
+        "n_heads": 2,
+        "head_dim": 2,
+        "vocab_size": 8,
+        "tau": 0.5,
+    }
+
+    attn_qkv = [[float(r * 4 + c) for c in range(4)] for r in range(4)]
+    attn_out = [[float((r + 1) * (c + 1)) for c in range(4)] for r in range(4)]
+    mlp1_blocks = _mxfp4_bytes(8, 2)
+    mlp2_blocks = _mxfp4_bytes(4, 4)
+    mlp1_scales = [127 + ((idx % 3) - 1) for idx in range(8)]
+    mlp2_scales = [127 + ((idx % 2) - 1) for idx in range(4)]
+    mlp1_bias = [float(idx) for idx in range(8)]
+    mlp2_bias = [float(idx) for idx in range(4)]
+
+    tensors: dict[str, list] = {
+        "block.0.attn.qkv.weight": attn_qkv,
+        "block.0.attn.out.weight": attn_out,
+        "block.0.mlp.mlp1_weight.blocks": mlp1_blocks,
+        "block.0.mlp.mlp1_weight.scales": mlp1_scales,
+        "block.0.mlp.mlp2_weight.blocks": mlp2_blocks,
+        "block.0.mlp.mlp2_weight.scales": mlp2_scales,
+        "block.0.mlp.mlp1_bias": mlp1_bias,
+        "block.0.mlp.mlp2_bias": mlp2_bias,
+    }
+
+    cfg = sera_transfer.ModelConfig.from_dict(config, tensors=tensors)
+
+    assert len(cfg.layers) == 1
+    layer = cfg.layers[0]
+    assert layer.w_k.endswith("attn.qkv.weight")
+    assert layer.w_o.endswith("attn.out.weight")
+    assert layer.w1.endswith("mlp.mlp1_weight")
+    assert layer.w2.endswith("mlp.mlp2_weight")
+    assert not layer.w1.endswith("blocks")
+    assert not layer.w2.endswith("blocks")
+
+    decoded_shape_w1 = _tensor_shape(tensors[layer.w1])
+    decoded_shape_w2 = _tensor_shape(tensors[layer.w2])
+    assert decoded_shape_w1 == [8, 4]
+    assert decoded_shape_w2 == [4, 8]
+
+    prf = sera_transfer.compute_prf(cfg, tensors, r=2)
+    assert "prf_W" in prf and prf["prf_W"]
+
+    overlays = sera_transfer.compute_overlays(cfg, tensors, r=1, r_v=1)
+    assert "overlays_H" in overlays
+
+    linear_data, linear_meta = sera_transfer.collapse_ffn(cfg, tensors, top_l=2)
+    assert linear_data["linear_bias"]
+    assert linear_meta["bias"]
+
+    bridge_data, bridge_meta = sera_transfer.bridge_records(cfg, tensors, config["vocab_size"])
+    assert bridge_data["bridge_hubs"]
+    assert len(bridge_meta["layer_seeds"]) == len(cfg.layers)
 
 
 @pytest.mark.parametrize(
