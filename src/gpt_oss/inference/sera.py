@@ -1,22 +1,3 @@
-"""Implementation of the Sera model described in the integrated specification.
-
-The goal of this module is not to simulate a high-performance production system
-but to provide a faithful, fully documented, and testable reference
-implementation that follows every structural requirement from the
-specification contained in ``docs/specs/sera-model-centric-integrated-
-specification.txt``.  The classes defined here organise the system into the
-same conceptual components as the spec and provide constant-time execution
-paths whose budgets are enforced by explicit assertions.  Where the spec
-describes probabilistic or approximate behaviour (for instance random feature
-attention) we implement a deterministic variant that keeps the same API while
-remaining numerically stable for unit tests.
-
-The code is intentionally verbose – every public method is documented with the
-section of the specification that it implements and the invariants that are
-checked.  This makes the module useful both as an executable artefact and as a
-living piece of documentation for contributors.
-"""
-
 from __future__ import annotations
 
 import dataclasses
