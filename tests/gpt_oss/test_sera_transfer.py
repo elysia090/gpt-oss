@@ -270,7 +270,26 @@ def test_convert_returns_summary(tmp_path: Path, monkeypatch):
     assert summary.total_bytes >= 0
     assert summary.manifest_path == output / "sera_manifest.bin"
     assert any(info.kind == "json" for info in summary.snapshots)
+    assert summary.log_path == output / "conversion.log"
+    assert summary.log_path.exists()
 
     formatted = sera_transfer.format_summary(summary)
     assert "Sera Transfer Conversion Summary" in formatted
     assert str(output) in formatted
+    assert "Log file:" in formatted
+
+
+def test_convert_writes_error_log(tmp_path: Path):
+    """Conversion failures should still leave a log describing the issue."""
+
+    source = tmp_path / "source"
+    source.mkdir()
+    output = tmp_path / "output"
+
+    with pytest.raises(FileNotFoundError):
+        sera_transfer.convert(source, output, verbose=False)
+
+    log_path = output / "conversion.log"
+    assert log_path.exists()
+    log_text = log_path.read_text(encoding="utf-8")
+    assert "Unable to locate 'config.json'" in log_text
