@@ -1,240 +1,807 @@
-Sera Transfer Kit (STK) — Precise GPU-free Migration Spec
-Goal: deterministically project open-weight Transformer checkpoints (e.g., MoE or dense) into Sera’s constant-time runtime using only CPU. No training, no GPU, no unbounded loops. Outputs are binary arrays + a manifest that Sera can publish by a single pointer swap.
-	1.	Scope and guarantees
-1.1 All steps are O(N) over model size with fixed loop bounds per inner kernel; runtime Sera hot path remains O(1)/event.
-1.2 Determinism: fixed PRNG (splitmix64), fixed reduction orders, pinned threads, fixed BLAS mode, fixed byte layouts, fixed tie-breakers.
-1.3 Memory: stream tensors by layer via mmap; peak RAM bounded by max(layer_bytes) + small scratch (<=512 MiB).
-1.4 Failure policy: any bound breach => disable optional features (e.g., O(0) route) and emit invariant record; conversion must still complete.
-	2.	Inputs, outputs, and binary formats
-2.1 Inputs (read-only)
-input/model.safetensors | pytorch_model.bin (mmap)
-input/config.json (d_model, n_heads, head_dim, vocab_size, rope/alibi flags, moe metadata if any)
-input/tokenizer.model | {merges.txt, vocab.json} (optional for FST build)
-2.2 Outputs (write-once)
-output/sera_manifest.bin
-output/arrays/*.bin as below
-2.3 Common array header (fixed 64 bytes, little-endian)
-u32 magic = 0x53455241  // “SERA”
-u16 dtype  // 1=f64,2=f32,3=i32,4=i16,5=i8,6=u8,7=q8_8,8=q4_12,9=bf16
-u16 rank
-u64 dims[5]  // unused entries = 1
-u64 byte_len
-u64 crc32c
-u64 sha256_low64
-u32 flags  // bit0=row_major, bit1=aligned_64B, bit2=ftz_on
-u32 reserved
-Bytes immediately follow, 64-byte aligned. All arrays row-major if flag set.
-2.4 File list (all with Common header)
-tokenizer_fst.bin, T_1.bin..T_Ltok.bin
-prf_W.bin [r x d_model, f32 or f64]
-R_init.bin [r x d_v, f32], s_init.bin [r, f32]
-whitening_mu.bin [r,f32], whitening_sig2.bin [r,f32]
-overlays_H.bin [r x r_v, f32], overlays_U.bin [d_v x r_v, f32], overlays_DeltaW.bin [r_v x r_v, f32]
-linear_mphf.bin, linear_keys.bin [C,u64], linear_weights.bin [C,f32], cuckoo_delta.bin
-memory_coeff.bin [{mode:ARMA, p<=2,q<=1, coeffs f64}], delaybuf_init.bin
-bridge_hubs.bin [contexts x H_bits, u64], bridge_qDin.bin, bridge_qDout.bin, peer_scores.bin [Q8.8]
-2.5 Manifest (fixed fields, no “version” field; schema digest is stored)
-magic=0x5345524D  // “SERM”
-endian=LE, abi_flags(FMA/FTZ), seed_digest, schema_sha256
-tokenizer{L_tok,S_norm,L_norm,P_gen,sp_cert_digest,unicode_policy}
-prf{r,tau,whitening_eps,clip_c}
-denominator{beta_floor,lambda_star_digest}
-linear{C,d,b,S,L_cuckoo,Q,tau_low,tau_high}
-memory{mode in {SOS,ARMA},p,q,L,T_phi,K,pole_radius_min}
-overlays{P,k_max,r_v}
-ccr_cert{gamma_CCR_target, m_target, norm_def}
-bridge{K,W,Proj_shape,Proj_digest,beta_min,beta_max,guard{margin_policy,eps_row_policy},store_limits{load_max,stash_max,kick_max}}
-search{A_max,A_cap,H_sel,H_roll,c_puct,epsilon,vloss}
-capacity{lambda_hat,T_rb_ms,slack,margin}
-salts{mphf_salt_digest,key_salt_digest}
-hashes{prev_hash,curr_hash}
-All scalar fields are bounded; any missing optional array implies feature disabled.
-	3.	Tensor name mapping (deterministic)
-3.1 Name patterns are configured via regex list in config.json; each pattern maps to a role tag in {EMB,Q,K,V,O,FFN_W1,FFN_W2,FFN_B1,FFN_B2,LN_G,LN_B,ROUTER_GATE,ROPE_ALPHA}.
-3.2 Resolution rule: first matching regex wins; ties resolved by lexical order of pattern string; absence => role omitted.
-3.3 MoE: if ROUTER_GATE exists, experts E are enumerated in sorted order by derived magnitude (see 7).
-	4.	Tokenizer build (CPU-only)
-4.1 If source is BPE byte-level: extract bytepieces of length 1..L_tok; else use EXT wrapper (no FST build, still emit proposal set).
-4.2 Sardinas–Patterson (build-time)
-Construct sets S_k until empty or epsilon appears; store sp_cert_digest (sha256 of minimal witness). If epsilon found => reject vocab.
-4.3 Rolling hashes RH_n
-64-bit Karp-Rabin mod 2^64 with base B=257; precompute P[i]=B^i mod 2^64 for i<=L_tok; update is branchless.
-4.4 Minimal perfect hash per n (two-level CHD style)
-Partition keys into buckets by h1(key)=mix64(key) mod M, M=ceil(1.23*K). For each bucket b:
-find seed s_b (increment from 0) s.t. secondary positions h2_i=(mix64(key,s_b)+i) mod M are all free (i in {0,1}); deterministic search cap 2^16.
-Serialize seeds array and base table; lookup is 2 probes. Collisions are guarded by bytewise Dec equality.
-4.5 Encoder per byte: at most L_tok table probes; accept only if Dec[id] matches; no backtracking; residual flush at EOF.
-4.6 Generator proposals C_t: build frequency table from merges/vocab if available; else fill by splitmix64 over id space; store P_gen ids in manifest.
-	5.	PRF projection and whitening (no data required)
-5.1 PRNG
-splitmix64(x): x += 0x9E3779B97F4A7C15; z=(x^(x>>30))*0xBF58476D1CE4E5B9; z=(z^(z>>27))*0x94D049BB133111EB; return z^(z>>31)
-Gaussian pair via Box-Muller using two 64-bit uniforms mapped to (0,1) with u= (x>>11)*2^-53, v=(y>>11)*2^-53; use cos/sin deterministic libcall; clamp u in [2^-52,1-2^-52].
-5.2 Diagonal pre-whitener from W_K
-For each head h with matrix W_K[h] in R^{head_dim x d_model_block}:
-d_h[j] = mean_i (W_K[h]_{i,j}^2)
-D = blockdiag(d_h) across heads; set d_j := max(d_j, eps_wk) with eps_wk=1e-8.
-5.3 PRF basis
-Draw r standard Gaussians w_i in R^{d_model}; scale by D^{1/2}: w_i := sqrt(d).w_i; store prf_W[r x d_model].
-tau from config; define phi_i(x)=r^(-1/2)exp( w_i^T x / sqrt(tau) - ||x||^2/(2tau) ).
-5.4 Whitening stats init
-whitening_mu[:] = 0; whitening_sig2[j] = 1 for all j (or fold D to r by random projection once: v = prf_W * ones / ||.||; set sig2 = 1 + 0.1|v|).
-5.5 Floors
-Choose beta_floor = max(1e-3, 5e-4 * expected_den); record denominator schedule digest; den always >= beta_floor at runtime.
-	6.	Value overlays from W_O (rank-r_v)
-6.1 Fixed H and U
-H in R^{r x r_v}: take first r_v columns of the deterministic Hadamard-like basis generated by splitmix64, orthonormalized by Householder QR with fixed sign convention (R diag positive).
-U in R^{d_v x r_v}: thin orthonormal basis from W_O via deterministic randomized range finder:
-draw Omega in R^{d_v x r_v} via splitmix64; Y=W_O^T * Omega; Q=householder_qr(Y); U=Q[:,0:r_v]
-6.2 Core DeltaW
-Solve least-squares in r_v-space for ΔW such that U*(H*ΔW)^T approximates W_O:
-Let A = H, B = U, target T = W_O
-Compute Z = argmin_Z ||T - B Z^T A^T||_F
-Closed form with orthonormal A,B: Z = B^T T A
-Store overlays_H=H, overlays_U=U, overlays_DeltaW=Z; runtime deltaC(q) = U * ( (phi_w(q)^T H) * Z ).
-	7.	FFN collapse to injective sparse dictionary
-7.1 Per layer gather W1 (h x d), b1 (h), W2 (d x h), b2 (d). Activation GELU is approximated by ReLU in collapse (fast upper bound).
-7.2 Influence score
-S = |W2| * |W1|  // dims (d x d); compute by blocked GEMM with abs on the fly; use i8 packing allowed
-7.3 Top-L selection per input feature j
-Take indices I_j of top L entries in column j of S by magnitude; compute signed effect
-e_j = sum_{h in I_j} sign(W2[:,h]) .* max(0, W1[h,j])
-Accumulate e_j into base weight vector W_base[:,j]; keep residual into delta set R_j (indices not selected)
-7.4 Injective addressing
-Stable feature ids are u64 keys: key = layer_id<<32 | j
-Build MPHF h() over all live keys by two-level method in 4.4 with bounded seed search; serialize h seeds.
-Allocate base arrays: weights[C], indices implicit via h(key). Serialize linear_keys for audit only.
-7.5 Delta dictionary (bounded cuckoo)
-Params (d choices, b slots, stash S, relocation cap L_cuckoo=8, ring Q cap = C/32)
-Insert residual pairs (key, val) in deterministic order; kicks <= L_cuckoo; overflow to stash, then ring; emergency slot count at most 1 per shard.
-Serialize cuckoo_delta with compact bucket arrays. Lookup probes <= d*b + S + 1.
-7.6 Bias
-Global b := sum of layer biases projected by collapse; stored in a small side record.
-	8.	Positional encoding to finite rational memory
-8.1 If RoPE with base θ_i per head (from config or inferred)
-Use AR(2) with complex-conjugate poles at radius ρ and angle θ̄=mean_i θ_i:
-Choose damping ρ=0.995; difference eq: y_t = 2ρcosθ̄ * y_{t-1} - ρ^2 * y_{t-2} + u_t
-Coeffs stored as {a1=2ρcosθ̄, a2=−ρ^2, b0=1}. Poles < 1 guaranteed.
-8.2 If ALiBi or learned abs
-Fit SOS (L<=6) by vector-fit on synthetic impulse response of attention score to 1-token shift with fixed seed; accept first set with pole radii < 1; else scale all a_i by 0.95 until stable.
-8.3 Delay buffer
-T_phi and K from manifest; delaybuf_init zeros; accumulators use Kahan compensation in f64; single reduction site back to f32 if requested.
-	9.	Bridge hubs, routes, and peer scoring (cold start)
-9.1 Hubs
-H_bits = 64W where W in {2,3}. If ROUTER_GATE present:
-expert norm m_e = ||W_gate[:,e]||_2; pick top H experts; map to hub ids [0..H-1].
-Else: hubs = splitmix64-derived pseudo-experts.
-9.2 Token/context to hubs
-For token id t and context id c: two independent hashes with salts -> two set bits per leg in W words; store in bridge_hubs bitset.
-9.3 qDin/qDout quantization
-Quantize leg scores rowwise to Q8.8: q = clip(round(xs), -32768, 32767) with s chosen so that p99 of |x| maps to 0.832767; store s_in, s_out per row. eps_row = 0.5(1/s_in + 1/s_out).
-9.4 Guard preload for promoted pairs (optional)
-For top-K pairs per token (by hashed score), precompute margin m and competitor bounds C_h and leg update bounds U,V from capacity targets; store compact tuples for O(0) path.
-9.5 Peer IQ/HON
-Initialize to 0.5 (Q8.8=128) with seed-jitter ±2; serialize peer_scores.bin.
-	10.	Deterministic scheduling, threads, and numerics
-10.1 Threads pinned to [0..T-1]; BLAS set to T; OMP/MKL threads fixed; affinity documented in manifest; no dynamic allocation inside inner loops.
-10.2 Floating point contract: IEEE-754 double for reductions; f32 storage unless explicitly f64; FMA and FTZ flags set and recorded; libm calls routed through a pinned implementation.
-10.3 Reduction orders fixed: lexicographic layer then tensor, row-major within tensor; QR and SVD routines use Householder with sign convention R diag > 0.
-10.4 PRNG streams: each stage has unique counter tuple (module_id, layer_id, local_counter); no data-dependent reseeding.
-	11.	Hot conversion algorithms (pseudocode, fixed loops)
+Sera Transfer Kit (STK) — Deterministic GPU-free Projection Specification (Tightened)
+Plain ASCII, English only. No dummy behavior. Implementation-grade.
 
-function build_prf_W(d_model, r, D_diag):
-x = seed0
-for i in 0..r-1:
-u = toUnit(splitmix64(x)); v = toUnit(splitmix64(x+=C))
-g0,g1 = box_muller(u,v)
-for j in 0..d_model-1:  // fixed stride
-prf_W[i,j] = g0 * sqrt(max(D_diag[j],1e-8))
-x += C
-save(prf_W)
+0. Purpose
 
-function overlays_from_WO(W_O, r, r_v, d_v):
-H = hadamard_like(r,r_v,seedH); H = householder_qr_orth(H)
-Omega = gaussian(d_v,r_v,seedU)
-Y = gemm(transpose(W_O), Omega)
-U = householder_qr_orth(Y)[:,0:r_v]
-Z = transpose(U) * W_O * H   // exact with orthonormal U,H
-save(H,U,Z)
+STK converts an open-weight Transformer checkpoint into a Sera-compatible constant-time runtime package using only CPUs.
 
-function collapse_ffn(W1,W2):
-// compute S = |W2| * |W1|
-S = blocked_abs_gemm(|W2|, |W1|)
-for j in 0..d-1:
-I = topL_indices(S[:,j], L)  // fixed partial selection
-e = 0
-for h in I:
-e += sign_col(W2,h) * relu_row(W1,h,j)
-add_to_base_dict(j,e)
-spill_residuals_to_cuckoo(j,S[:,j] \ I)
+* No GPUs, no training, no fine-tuning.
+* O(N_params) preprocessing; Sera runtime remains O(1) per event.
+* Exactly reproducible: same inputs -> bitwise-identical outputs.
+* All semantics are encoded in:
 
-function mphf_build(keys):
-M = ceil(1.23*|keys|)
-buckets = group_by(h1(key)=mix64(key) mod M)
-for b in 0..M-1:
-s=0
-while s<65536:
-pos0 = mix64(seed=s,key=b) mod M
-pos1 = mix64(seed=s+1,key=b) mod M
-if both_free(pos0,pos1): assign; break
-s+=1
-record_seed(b,s)
-serialize seeds; lookup uses two positions and Dec equality guard
+  * a manifest (sera_manifest.bin)
+  * a fixed set of binary arrays (arrays/*.bin)
+* Sera activates a model by a single pointer swap to a validated generation.
 
-function hubs_and_routes(token_ids, H_bits, W):
-for each id:
-for leg in 0..W-1:
-bit = mix64(id,leg) >> (64-6)  // 0..63
-set bit in word[leg]
-	12.	Determinism checks and invariants
-12.1 Tokenizer: SP certificate hash matches; probe bound <= L_tok; Greedy==Decode on random bytes (seeded).
-12.2 PRF: prf_W SHA256 recorded; whitening_sig2 >= eps; beta_floor > 0.
-12.3 Overlays: H,U orthonormal to 1e-6; Z finite; deltaC path returns finite for random q.
-12.4 Linear: MPHF seeds found; probes <= d*b+S+1; no emergency overflow except allowed 1 per shard; base+delta reconstructs e_j within 0.5% MAPE on synthetic inputs.
-12.5 Memory: pole radii < 1; DF-II-T states bounded in double; single reduction site back to f32.
-12.6 Bridge: hub_and_p99 <= K; quant scales sane; guard tuples consistent (m>0 implies C_h < m).
-12.7 Manifest: schema digest equals computed; all array sizes consistent; crc32c and sha256_low64 pass.
-	13.	Complexity and resource envelopes (20B-class dense or MoE small)
-13.1 Tokenizer FST build: O(|V|L_tok), ~1–2 s, <1 GiB peak.
-13.2 PRF build r=512: O(rd_model), a few 100 ms; arrays ~rd_model4 bytes.
-13.3 Overlays r_v<=16: two GEMMs of size d_v x r_v and d_v x d_model projected; ~seconds CPU.
-13.4 FFN collapse: blocked GEMM per layer; total ~minutes CPU; memory streamed.
-13.5 MPHF+cuckoo: O(C) with small constants; seconds.
-13.6 Memory fit: sub-second.
-13.7 Bridge init: seconds.
-	14.	Fast path choices (quality vs speed, all deterministic)
-14.1 r in {256,512,1024}; r=512 is a good default.
-14.2 r_v in {8,12,16}; 12 often sufficient.
-14.3 FFN top-L in {8,12}; higher L yields better base coverage, fewer deltas.
-14.4 ρ in {0.99,0.995} for AR(2) damping if RoPE missing.
-14.5 K in {4,6}; W in {2,3}.
-	15.	CLI and stage graph
-15.1 CLI
-stk convert –in input –out output –r 512 –rv 12 –Ltok 8 –topL 12 –threads 16
-stk check   –out output
-stk replay  –out output –prompt “Hello.”
-15.2 Stages (fixed DAG)
-parse_tensors -> tokenizer_build_or_wrap -> prf_build -> overlays_build -> ffn_collapse -> mphf_cuckoo -> memory_fit -> bridge_init -> manifest_emit -> check
-Each stage emits its own crc32c and sha256_low64; manifest stores both.
-	16.	Acceptance thresholds (cold start, no data)
-16.1 PRF vs softmax surrogate on synthetic q,K,V: relative L2 error <= 1e-2 averaged over 1k trials.
-16.2 Linear collapse MAPE <= 0.5% on random sparse inputs with density <= 0.01.
-16.3 Memory AR(2) impulse alignment: cosine similarity >= 0.97 vs RoPE surrogate at 32-step window.
-16.4 Bridge guard precheck pass-rate >= 0.9 on synthetic margins.
-16.5 Deterministic replay: two full runs produce identical sha256_low64 for all arrays and identical Diagnostics snapshots.
-	17.	Hook-up to Sera ABI (no glue code divergence)
-17.1 Arrays and manifest names exactly match Sera section keys.
-17.2 Publication: Sera loads arrays, validates checksums, writes single generation pointer; readers pin and proceed.
-17.3 If any optional array missing, the corresponding module auto-disables and emits beta=0 on that path.
-	18.	Troubleshooting rules (constant-time fixes)
-18.1 MPHF seed search exhausted: increase M by 5% and rerun only MPH stage; all other arrays unchanged.
-18.2 Overlays orthonormality fail: rerun QR with stabilized Householder (fixed tolerance 1e-12).
-18.3 Poles >= 1: multiply all AR coeffs by 0.95 repeatedly (max 3 times), then accept.
-18.4 Guard margins negative: mark those pairs non-promoted; O(1) two-hop still available.
-18.5 CRC mismatch: recompute header; never rewrite payloads after first write.
-	19.	Minimal reproducible recipe (20B-class, laptop CPU)
-export OMP_NUM_THREADS=16; export MKL_NUM_THREADS=16
-stk convert –in input –out output –r 512 –rv 12 –Ltok 8 –topL 12 –threads 16
-stk check –out output
-stk replay –out output –prompt “A short test.”
-Expected artifacts: ~1–3 GiB total arrays depending on d_model and r; total wall time minutes, bounded by FFN collapse GEMMs; zero GPU usage.
+All nondeterminism sources (threading, BLAS behavior, random sampling) are eliminated or fixed.
+
+1. Deterministic environment model
+
+1.1 Determinism
+
+Implementation MUST enforce:
+
+* Fixed PRNG: splitmix64 (section 6).
+* No time-based or OS-random seeds.
+* Stable reduction orders:
+
+  * layer index ascending
+  * tensor role fixed order
+  * row-major within each tensor
+* Linear algebra:
+
+  * Householder QR only.
+  * R diagonal forced positive.
+  * No vendor-randomized pivoting.
+* No use of "fast but non-deterministic" BLAS modes.
+
+1.2 Threading
+
+* Thread count T fixed by CLI.
+* Threads pinned to cores [0..T-1].
+* No work stealing, no dynamic creation inside core kernels.
+* Collective operations use fixed tree or serial reductions.
+
+1.3 Memory discipline
+
+* Model weights mapped read-only via mmap or equivalent.
+
+* Streaming by layer:
+
+  * At most one (or a bounded small number of) full-layer tensors in RAM.
+
+* Peak memory:
+
+  peak_bytes <= max_layer_bytes + 512 MiB
+
+* No unbounded containers, no amortized growth in inner loops.
+
+* All array files are write-once:
+
+  * payload written
+  * header filled
+  * checksums computed
+  * then file is immutable.
+
+2. Inputs
+
+2.1 Required
+
+* Weights:
+
+  * `input/model.safetensors` or equivalent
+  * or `input/pytorch_model.bin`
+* Config:
+
+  * `input/config.json`
+
+    * Includes or allows inference of:
+
+      * num_hidden_layers
+      * hidden_size (d_model_candidate)
+      * num_attention_heads, num_key_value_heads, head_dim (if any)
+      * vocab_size
+      * MoE metadata if any (num_experts, experts_per_token)
+      * RoPE/ALiBi/other positional parameters, if any
+
+2.2 Optional
+
+* Tokenizer:
+
+  * `input/tokenizer.model`
+  * or `merges.txt` + `vocab.json`
+* If unsupported:
+
+  * STK emits a tokenizer wrapper entry (no FST), still deterministic.
+
+2.3 Authoritative shapes
+
+If config.json and actual tensor shapes disagree:
+
+* Actual tensor shapes are authoritative.
+* Manifest records both:
+
+  * `config_declared_*`
+  * `effective_*`
+* All downstream constructions use effective shapes only.
+
+3. Outputs
+
+3.1 Files
+
+* `output/sera_manifest.bin`
+* `output/arrays/*.bin`
+
+No other files are read by Sera runtime.
+
+3.2 Common array header (64 bytes, LE)
+
+All `*.bin` arrays share this exact header:
+
+* u32 magic        = 0x53455241              // "SERA"
+* u16 dtype        // 1=f64,2=f32,3=i32,4=i16,5=i8,6=u8,7=q8_8,8=q4_12,9=bf16
+* u16 rank
+* u64 dims[5]      // product(dims) * sizeof(dtype) == byte_len; unused slots = 1
+* u64 byte_len     // payload bytes, excluding header
+* u64 crc32c       // CRC32C of payload
+* u64 sha256_low64 // low 64 bits of SHA-256(payload)
+* u32 flags
+
+  * bit0: row_major (if set, row-major C-order)
+  * bit1: aligned_64B (payload start is 64-byte aligned)
+  * bit2: ftz_on (runtime may assume flush-to-zero)
+* u32 reserved     // must be 0
+
+Payload:
+
+* Starts immediately after header.
+* 64-byte aligned.
+* Never modified after header finalization.
+
+3.3 Core arrays (by role)
+
+Tokenizer:
+
+* tokenizer_fst.bin         // optional; omitted for unsupported tokenizer types
+* T_1.bin .. T_Ltok.bin     // per-length lookup tables (if FST/table tokenizer used)
+
+PRF and whitening:
+
+* prf_W.bin                 // [r, d_model_eff], f32 or f64
+* R_init.bin                // [r, d_v], f32
+* s_init.bin                // [r], f32
+* whitening_mu.bin          // [r], f32
+* whitening_sig2.bin        // [r], f32
+
+Overlays:
+
+* overlays_H.bin            // [r, r_v], f32
+* overlays_U.bin            // [d_v, r_v], f32
+* overlays_DeltaW.bin       // [r_v, r_v], f32
+
+Linear:
+
+* linear_mphf.bin           // MPHF metadata
+* linear_keys.bin           // [C], u64 (audit only)
+* linear_weights.bin        // [C], f32
+* cuckoo_delta.bin          // encoded (key, val) residuals
+
+Memory:
+
+* memory_coeff.bin          // AR/ARMA/SOS coeffs, f64
+* delaybuf_init.bin         // initial DF-II state
+
+Bridge:
+
+* bridge_hubs.bin           // [N_hub_contexts, H_words], u64
+* bridge_qDin.bin           // quantized inbound projections
+* bridge_qDout.bin          // quantized outbound projections
+* peer_scores.bin           // [N_peers], q8_8
+
+Omission:
+
+* If any optional array is missing:
+
+  * The corresponding feature is OFF.
+  * Runtime behavior must be well-defined neutral (e.g. no overlays, no O(0) guards).
+
+4. Manifest (sera_manifest.bin)
+
+4.1 Header
+
+Binary struct (LE):
+
+* u32 magic          = 0x5345524D            // "SERM"
+* u8  endian         = 1                     // 1 = little-endian
+* u8  abi_flags      // bit0=FMA, bit1=FTZ, others reserved
+* u16 reserved0      // zero
+* u64 seed_digest_lo // low 64 bits of SHA-256 over seed schedule description
+* u64 seed_digest_hi
+* u64 schema_sha256_lo
+* u64 schema_sha256_hi
+
+`schema_sha256_*` is the hash of this manifest schema and field ordering.
+
+4.2 Sections (compact encoding allowed; here logical view)
+
+Each subsection has fixed field order; all numeric fields bounded.
+
+Tokenizer:
+
+* u16 L_tok
+* u16 S_norm
+* u16 L_norm
+* u16 reserved
+* u32 P_gen_count
+* u64 sp_cert_digest_lo, sp_cert_digest_hi
+* u8  unicode_policy   // enum
+
+PRF:
+
+* u32 r
+* f32 tau
+* f32 whitening_eps
+* f32 clip_c
+
+Denominator:
+
+* f32 beta_floor
+* u64 lambda_star_digest_lo, lambda_star_digest_hi
+
+Linear:
+
+* u64 C                 // MPHF capacity
+* u32 d                 // input features logical
+* u32 b                 // bucket size
+* u32 S                 // stash size
+* u32 L_cuckoo
+* u32 Q                 // ring capacity
+* f32 tau_low
+* f32 tau_high
+
+Memory:
+
+* u8  mode              // 0=NONE,1=SOS,2=ARMA
+* u8  p
+* u8  q
+* u8  L
+* u32 T_phi
+* u32 K
+* f32 pole_radius_min
+
+Overlays:
+
+* u32 P
+* u32 k_max
+* u32 r_v
+
+CCR cert (if used):
+
+* f32 gamma_CCR_target
+* f32 m_target
+* u8  norm_def
+* u8  reserved[3]
+
+Bridge:
+
+* u8  K
+* u8  W
+* u16 reserved
+* u32 proj_rows
+* u32 proj_cols
+* u64 proj_digest_lo, proj_digest_hi
+* f32 beta_min
+* f32 beta_max
+* f32 guard_margin_policy
+* f32 guard_eps_row_policy
+* f32 load_max
+* f32 stash_max
+* f32 kick_max
+
+Search (if tree/heuristic used):
+
+* f32 A_max
+* f32 A_cap
+* f32 H_sel
+* f32 H_roll
+* f32 c_puct
+* f32 epsilon
+* f32 vloss
+
+Capacity:
+
+* f32 lambda_hat
+* f32 T_rb_ms
+* f32 slack
+* f32 margin
+
+Salts:
+
+* u64 mphf_salt_digest_lo, mphf_salt_digest_hi
+* u64 key_salt_digest_lo, key_salt_digest_hi
+
+Hashes:
+
+* u64 prev_hash_lo, prev_hash_hi
+* u64 curr_hash_lo, curr_hash_hi
+
+Missing sections or zero values are interpreted as "feature disabled / default" explicitly by Sera ABI.
+
+5. Tensor role mapping
+
+5.1 Roles
+
+Each parameter is mapped to:
+
+* EMB, Q, K, V, O
+* FFN_W1, FFN_W2, FFN_B1, FFN_B2
+* LN_G, LN_B
+* ROUTER_GATE
+* ROPE_META (RoPE/positional parameters)
+
+5.2 Mapping algorithm
+
+Inputs:
+
+* Ordered list of (pattern, role) from config.
+
+Algorithm:
+
+* For each tensor name:
+
+  * Traverse list in index order.
+  * First pattern that matches fully (regex full or anchored) sets its role.
+  * If multiple patterns at same index would match, use lexicographically smallest pattern string (explicit tie-break).
+* Unmatched tensors are ignored by STK.
+* MoE:
+
+  * Expert tensors discovered via patterns including expert index groups.
+  * Experts sorted by:
+
+    1. layer index
+    2. expert index
+    3. tensor name lexical
+
+No implicit guessing is allowed beyond these rules.
+
+6. PRNG and basic numeric primitives
+
+6.1 splitmix64
+
+State x is u64.
+
+* x += 0x9E3779B97F4A7C15
+* z  = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9
+* z  = (z ^ (z >> 27)) * 0x94D049BB133111EB
+* z  = z ^ (z >> 31)
+* return z
+
+6.2 Uniform double
+
+From u64 v:
+
+* u = (v >> 11) * 2^-53
+* Clamp u into [2^-52, 1 - 2^-52].
+
+6.3 Gaussian
+
+Use Box-Muller:
+
+* Given u1,u2 in (0,1), deterministic libm:
+
+  r     = sqrt(-2 * log(u1))
+  theta = 2 * pi * u2
+  z0    = r * cos(theta)
+  z1    = r * sin(theta)
+
+No approximations; same libm across runs and builds.
+
+6.4 Module seeds
+
+Global:
+
+* base_seed: 256-bit user-visible or derived from file hashes.
+* Each module uses:
+
+  seed = H(module_id || layer_id || index || base_seed)
+
+via splitmix64 chaining, encoded and documented in manifest (seed_digest).
+
+7. Tokenizer construction
+
+7.1 Supported mode: BPE-like
+
+If merges/vocab represent a byte-level or deterministic BPE:
+
+* Extract tokens as byte sequences.
+* Restrict to piece length <= L_tok.
+* Reject any epsilon-derivable code using Sardinas-Patterson.
+
+7.2 Sardinas-Patterson
+
+* Run exact algorithm on token set.
+* If epsilon is found -> tokenizer is ambiguous:
+
+  * STK may:
+
+    * abort conversion, or
+    * mark tokenizer unsupported (no FST), require fallback mode.
+* Store `sp_cert_digest = sha256(minimal_witness_set)`.
+
+7.3 Rolling hash
+
+For each token (byte string b[0..k-1]):
+
+* h = 0
+* for i in 0..k-1:
+  h = h * 257 + b[i]          // mod 2^64 via natural overflow
+
+Store h; used as key in MPHF.
+
+7.4 MPHF per length
+
+For all tokens of length n:
+
+* Let K = count.
+* Set M = ceil(1.23 * K).
+* Partition by:
+
+  bucket_id = mix64(h) mod M
+
+For each bucket:
+
+* For seed s in [0..65535]:
+
+  * Try assign each key in bucket to one or two candidate positions without collision.
+  * If success: record s; break.
+* If any bucket fails:
+
+  * Trigger 18.1 (increase M; rebuild only tokenizer MPHF).
+
+Lookup:
+
+* Uses recorded seed and 1-2 indexed slots plus exact token comparison.
+* Bound: <= 2 probes per length.
+
+7.5 Encoding
+
+* Greedy longest-match, forward-only.
+* Max L_tok attempts per offset.
+* No backtracking beyond this.
+* Residual bytes at end become fallback tokens.
+* Deterministic for any byte string.
+
+8. PRF basis and whitening (attention surrogate)
+
+8.1 Diagonal from K
+
+Effective d_model determined from Q/K shapes.
+
+For each column j:
+
+* Aggregate over heads and rows:
+
+  D_diag[j] = max( mean( W_K^2 over all relevant entries ), eps_wk )
+
+eps_wk = 1e-8.
+
+8.2 prf_W
+
+Given r:
+
+For each i in [0..r):
+
+* For each j in [0..d_model):
+
+  * g_ij from Gaussian sampler.
+  * w_ij = g_ij * sqrt(D_diag[j])
+
+* Normalize:
+
+  prf_W[i,j] = w_ij / sqrt(r)
+
+Store as f32 or f64.
+
+8.3 Whitening stats
+
+* whitening_mu[k]   = 0
+* whitening_sig2[k] = 1 (or deterministic low-variance adjustment derived from prf_W and D_diag)
+
+8.4 Denominator floor
+
+Compute expected_den on synthetic queries (fixed-seed), then:
+
+* beta_floor = max(1e-3, 5e-4 * expected_den)
+
+Store in manifest.
+
+9. Overlays from W_O
+
+9.1 H
+
+* Construct r x r_v matrix from splitmix64.
+* Run Householder QR deterministically.
+* Take first r_v columns as overlays_H.
+* Ensure orthonormal to tolerance 1e-6.
+
+9.2 U
+
+Given W_O in R^{d_v x d_model}:
+
+* Build Omega in R^{d_v x r_v} via splitmix64 Gaussian.
+* Y = W_O^T * Omega
+* U_full = Q from deterministic QR(Y)
+* U = first r_v columns, stored as overlays_U.
+
+9.3 DeltaW
+
+* Z = U^T * W_O * H    // r_v x r_v
+
+Store overlays_DeltaW = Z.
+
+Runtime overlay path is fully determined by (H,U,Z).
+
+10. FFN collapse to sparse linear
+
+10.1 Inputs
+
+Per layer l:
+
+* W1[l] in R^{h x d_in}
+* W2[l] in R^{d_out x h}
+* b1[l] in R^{h}, b2[l] in R^{d_out}
+
+10.2 Influence matrix
+
+* S = |W2| * |W1|   // size d_out x d_in
+* Use blocked GEMM, absolute values fused.
+
+10.3 Top-L selection
+
+For each input index j:
+
+* I_j = indices of top-L entries in column j of S by magnitude.
+
+* For each output i:
+
+  e_ij = sum_{h in I_j} sign( W2[i,h] * W1[h,j] ) * max(0, |W2[i,h]| * |W1[h,j]|)
+
+* Add e_ij into base weight for logical feature (l, j).
+
+Residual contributions (h not in I_j) are candidates for delta dict.
+
+10.4 Keying
+
+Stable 64-bit key:
+
+* key = ((u64)l << 32) | (u64)j
+
+10.5 MPHF for linear
+
+* Input: all keys used by base weights.
+* Build MPHF as in tokenizer step, with its own salt and M.
+* linear_mphf.bin:
+
+  * stores M, bucket seeds, and metadata.
+* linear_weights.bin:
+
+  * index = h(key)
+  * value = f32 base weight
+* linear_keys.bin:
+
+  * at index h(key): original key (for offline verification).
+
+10.6 Cuckoo delta
+
+* Residual (key, val) pairs inserted into bounded cuckoo:
+
+  * fixed number of hash funcs d
+  * fixed bucket size b
+  * stash size S
+  * max relocations L_cuckoo = 8
+  * optional overflow ring Q = C/32
+
+* Insertion order deterministic by (layer, j, i, h).
+
+* Overflow conditions:
+
+  * If constraints violated, record in manifest and stop inserting further residuals.
+  * Runtime remains correct but with reduced approximation quality.
+
+11. Positional encoding -> rational memory
+
+11.1 RoPE
+
+If RoPE detected:
+
+* Derive per-head angle parameters.
+* Compute average angle theta_bar.
+
+Set:
+
+* rho in {0.99, 0.995}
+* a1 = 2 * rho * cos(theta_bar)
+* a2 = -rho^2
+
+Difference equation:
+
+* y_t = a1 * y_{t-1} + a2 * y_{t-2} + u_t
+
+Store {a1, a2, 1.0} in memory_coeff.bin.
+
+11.2 ALiBi / learned abs
+
+* Generate synthetic score response to shift.
+* Fit limited-order ARMA/SOS with fixed seed:
+
+  * p <= 2, q <= 1, L <= 6.
+* If any pole radius >= 1:
+
+  * multiply all feedback coeffs by 0.95, up to 3 times.
+* If still unstable:
+
+  * downgrade to simpler stable filter and record.
+
+11.3 Delay buffer
+
+* Choose T_phi, K as bounded constants.
+* delaybuf_init is all zeros.
+* Runtime uses DF-II in f64, cast to f32 single-site.
+
+12. Bridge hubs and guards
+
+12.1 Hubs
+
+If ROUTER_GATE present:
+
+* For each expert e:
+
+  * m_e = L2 norm of gate weights.
+* Sort experts by m_e descending; pick top-H as hubs.
+
+If absent:
+
+* Generate H pseudo-hubs via splitmix64; store mapping.
+
+12.2 Bitsets
+
+* H_bits = 64 * W; W in {2,3}.
+* For each (token_id, context_id):
+
+  For leg in [0..W-1]:
+
+  * idx = mix64(token_id xor (context_id << 1) xor leg) >> (64 - log2(H_bits))
+  * Set corresponding bit.
+
+12.3 Quantization
+
+Q8.8 format:
+
+* Stored as int16:
+
+  * real_value = q / 256.0
+* For vector x:
+
+  * choose row scale s so that:
+
+    * p99(|x|) maps to <= 0.832767 * 32767 / 256
+  * q_i = clamp( round(x_i * 256 / s), -32768, 32767 )
+
+Store per-row s; eps_row_policy uses these scales.
+
+12.4 Guards
+
+* For top-K promoted pairs by fixed hash-based score:
+
+  * Precompute margin m and competitor bounds.
+* If any computed guard implies inconsistency (m <= 0, NaN):
+
+  * Do not use promotion for that pair.
+
+13. Numerics, threads, reductions
+
+* All reductions in deterministic order.
+* Sums in f64 where feasible.
+* FMA and FTZ configuration stored in abi_flags.
+* No approximate random libraries.
+* All acceptance tests (section 16) must pass bit-exactly.
+
+14. Stage DAG
+
+Fixed, acyclic:
+
+1. parse_tensors
+2. tokenizer_build_or_wrap
+3. prf_build
+4. overlays_build
+5. ffn_collapse
+6. mphf_cuckoo
+7. memory_fit
+8. bridge_init
+9. manifest_emit
+10. check
+
+Each stage:
+
+* Writes its files once.
+* Computes crc32c and sha256_low64.
+* May only depend on prior stage outputs.
+
+15. Acceptance tests (must pass)
+
+Against fixed synthetic seeds:
+
+* PRF vs softmax-like baseline:
+
+  * Relative L2 error <= 1e-2 on 1k random (q,K,V).
+* Linear collapse:
+
+  * MAPE <= 0.5% on random sparse inputs (density <= 0.01).
+* Memory:
+
+  * Cosine similarity >= 0.97 vs reference positional behavior at window 32.
+* Bridge:
+
+  * Guard precheck pass-rate >= 0.9.
+* Determinism:
+
+  * Two complete runs produce identical:
+
+    * all array payloads
+    * all headers
+    * sera_manifest.bin
+    * diagnostic logs (excluding timestamps if any; recommend none).
+
+16. Failure handling (strict)
+
+If any check fails:
+
+* Do NOT introduce nondeterminism, retraining, or heuristic loops.
+* Apply only the following:
+
+16.1 MPHF build failure
+
+* Increase M by 5% (rounded up).
+* Rebuild MPHF for that subsystem only.
+* If still failing:
+
+  * mark MPHF-based feature as disabled; fall back to direct table (if small) or abort conversion with explicit code.
+
+16.2 Overlays orthogonality failure
+
+* Rerun QR once with tighter threshold.
+* If still failing:
+
+  * omit overlays_* arrays; record "no_overlays".
+
+16.3 Unstable poles
+
+* Scale feedback coefficients by 0.95 up to 3 times.
+* If still unstable:
+
+  * select simpler stable filter or disable memory feature.
+
+16.4 Guard inconsistency
+
+* Disable promotions for affected entries.
+
+16.5 CRC or hash mismatch
+
+* Never change payload bytes.
+* If header wrong:
+
+  * recompute header (once) from existing payload.
+* If payload wrong:
+
+  * mark file invalid; disable dependent feature.
+
+Conversion either:
+
+* yields a consistent minimal Sera package, or
+* fails with explicit error; no undefined partial state.
+
+17. Minimal practical profile (20B-class)
+
+For a 20B-class model (dense or MoE small):
+
+* Choose:
+
+  * r   = 512
+  * r_v = 12
+  * L_tok = 8
+  * topL  = 12
+  * L_cuckoo = 8
+  * K = 6, W = 2
+* Run:
+
+  * `stk convert --in input --out out --r 512 --rv 12 --Ltok 8 --topL 12 --threads 16`
+  * `stk check --out out`
+
+Result:
+
+* Total arrays: ~1–3 GiB depending on shapes.
+* CPU-only.
+* Fully deterministic.
+* Directly consumable by Sera runtime using the manifest and array contracts above.
 
