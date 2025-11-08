@@ -11,6 +11,7 @@ import struct
 import shutil
 import subprocess
 import sys
+from array import array
 from pathlib import Path
 
 import pytest
@@ -726,6 +727,67 @@ def test_model_config_infers_head_dim_from_qkv_tensor() -> None:
     assert tensors[layer.w_k] == qkv_weight[8:12]
     assert tensors[layer.w_v] == qkv_weight[12:]
 
+
+def test_model_config_infers_kv_heads_from_gpt_oss_20b_shape() -> None:
+    class FakeMatrix:
+        def __init__(self, rows: int, cols: int) -> None:
+            self.shape = (rows, cols)
+            self._rows = rows
+            self._row_template = array("f", [0.0] * cols)
+
+        def __len__(self) -> int:
+            return self._rows
+
+        def __iter__(self):
+            for _ in range(self._rows):
+                yield self._row_template[:]
+
+        def __getitem__(self, item):
+            if isinstance(item, slice):
+                start, stop, step = item.indices(self._rows)
+                return [self._row_template[:] for _ in range(start, stop, step)]
+            index = item if item >= 0 else self._rows + item
+            if index < 0 or index >= self._rows:
+                raise IndexError(index)
+            return self._row_template[:]
+
+    config = {
+        "hidden_size": 2880,
+        "num_attention_heads": 64,
+        "head_dim": 64,
+    }
+
+    qkv_weight = FakeMatrix(5120, 2880)
+    tensors = {
+        "model.layers.0.attention.qkv.weight": qkv_weight,
+        "model.layers.0.attention.o_proj.weight": FakeMatrix(4096, 1),
+        "model.layers.0.mlp.gate_proj.weight": _create_matrix(4, 4, random.Random(4)),
+        "model.layers.0.mlp.down_proj.weight": _create_matrix(4, 4, random.Random(5)),
+        "model.layers.0.mlp.gate_proj.bias": _create_vector(4, random.Random(6)),
+        "model.layers.0.mlp.down_proj.bias": _create_vector(4, random.Random(7)),
+    }
+
+    cfg = sera_transfer.ModelConfig.from_dict(config, tensors=tensors)
+
+    assert cfg.num_key_value_heads == 8
+    assert cfg.head_dim == 64
+
+    layer = cfg.layers[0]
+    assert layer.w_q.startswith("model.layers.0.attention.qkv.weight")
+    assert layer.w_k.startswith("model.layers.0.attention.qkv.weight")
+    assert layer.w_v.startswith("model.layers.0.attention.qkv.weight")
+
+    q_rows = tensors[layer.w_q]
+    k_rows = tensors[layer.w_k]
+    v_rows = tensors[layer.w_v]
+
+    assert len(q_rows) == 4096
+    assert len(k_rows) == 512
+    assert len(v_rows) == 512
+
+    assert len(q_rows[0]) == 2880
+    assert len(k_rows[0]) == 2880
+    assert len(v_rows[0]) == 2880
 
 def test_model_config_records_optional_fields() -> None:
     config = {
