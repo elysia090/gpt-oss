@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import json
 import random
@@ -255,6 +256,44 @@ def test_quickstart_missing_checkpoint(tmp_path: Path, capsys) -> None:
     assert exit_code == 1
     stderr = capsys.readouterr().err
     assert "sera_quickstart:" in stderr
+
+
+def test_quickstart_reports_missing_safetensors(tmp_path: Path, monkeypatch, capsys) -> None:
+    module = importlib.reload(quickstart)
+    monkeypatch.setattr(
+        module.sera_transfer,
+        "_resolve_safe_open",
+        lambda: safetensors_stub.safe_open,
+    )
+
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    config = {
+        "d_model": 4,
+        "n_heads": 2,
+        "head_dim": 2,
+        "vocab_size": 8,
+        "tau": 0.5,
+    }
+    (checkpoint_dir / "config.json").write_text(json.dumps(config))
+    (checkpoint_dir / "model.safetensors").write_bytes(b"BINARY")
+
+    output_dir = tmp_path / "sera"
+
+    exit_code = module.main(
+        [
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert exit_code == 1
+    stderr = capsys.readouterr().err
+    assert "sera_quickstart:" in stderr
+    assert "pip install safetensors" in stderr
+    assert not output_dir.exists()
 
 
 def test_stub_safe_open_binary_blob(tmp_path: Path) -> None:

@@ -1010,6 +1010,39 @@ def test_cli_verbose_emits_search_hints(tmp_path: Path) -> None:
     assert "vocab_size" in log_output
 
 
+def test_cli_reports_missing_safetensors(tmp_path: Path, monkeypatch, capsys) -> None:
+    module = importlib.reload(sera_transfer)
+    monkeypatch.setattr(module, "_resolve_safe_open", lambda: safetensors_stub.safe_open)
+
+    source = tmp_path / "binary_source"
+    source.mkdir()
+    config = {
+        "d_model": 4,
+        "n_heads": 2,
+        "head_dim": 2,
+        "vocab_size": 8,
+        "tau": 0.5,
+    }
+    (source / "config.json").write_text(json.dumps(config))
+    (source / "model.safetensors").write_bytes(b"BINARY")
+
+    output = tmp_path / "output"
+
+    with pytest.raises(SystemExit) as excinfo:
+        module.main([
+            "--source",
+            str(source),
+            "--output",
+            str(output),
+        ])
+
+    assert excinfo.value.code == 1
+    stderr = capsys.readouterr().err
+    assert "sera_transfer:" in stderr
+    assert "pip install safetensors" in stderr
+    assert not output.exists()
+
+
 def test_convert_handles_path_resolution_failures(tmp_path: Path, monkeypatch) -> None:
     source = _create_openai_checkpoint(tmp_path / "resolve_error" / "checkpoint")
     output = tmp_path / "resolve_error" / "output"

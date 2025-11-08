@@ -121,7 +121,10 @@ def _convert_checkpoint(
         "Converting checkpoint at"
         f" {source_dir} -> {output_dir} (r={r}, r_v={r_v}, top_l={top_l})"
     )
-    sera_transfer.convert(source_dir, output_dir, r=r, r_v=r_v, top_l=top_l)
+    try:
+        sera_transfer.convert(source_dir, output_dir, r=r, r_v=r_v, top_l=top_l)
+    except ModuleNotFoundError as exc:
+        raise QuickstartError(sera_transfer._SAFETENSORS_MISSING_MSG) from exc
     return output_dir
 
 
