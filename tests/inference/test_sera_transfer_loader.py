@@ -5,10 +5,11 @@ import random
 import sys
 from pathlib import Path
 
-import numpy as np
 import pytest
 
-from safetensors.numpy import save_file
+np = pytest.importorskip("numpy")
+safetensors_numpy = pytest.importorskip("safetensors.numpy")
+save_file = safetensors_numpy.save_file
 
 try:
     from gpt_oss.tools import sera_transfer

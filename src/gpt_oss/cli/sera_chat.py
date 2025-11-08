@@ -21,7 +21,6 @@ import importlib.util
 import json
 import os
 import pickle
-import struct
 import sys
 import time
 import hashlib
@@ -44,30 +43,26 @@ from typing import (
 if TYPE_CHECKING:  # pragma: no cover - import only used for type checkers
     from gpt_oss.inference.sera import Sera
 
-DEFAULT_STATE_FILENAMES: Sequence[str] = (
-    "sera_state.pkl",
-    "sera_state.json",
-    "sera_state.msgpack",
-)
+
+def _load_sera_common_module():
+    sera_common_path = Path(__file__).resolve().parents[1] / "inference" / "sera_common.py"
+    spec = importlib.util.spec_from_file_location("_sera_common", sera_common_path)
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        raise RuntimeError("Unable to locate Sera runtime helpers")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault(spec.name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+_sera_common = _load_sera_common_module()
+DEFAULT_STATE_FILENAMES = _sera_common.DEFAULT_STATE_FILENAMES
+JSON_BYTES_PREFIX = _sera_common.JSON_BYTES_PREFIX
+SeraArrayError = _sera_common.SeraArrayError
+decode_snapshot_blob = _sera_common.decode_snapshot_blob
+load_array_file = _sera_common.load_array_file
 
 OPTIONAL_TOOLS: Sequence[str] = ("browser", "python")
-
-
-JSON_BYTES_PREFIX = "__sera_bytes__:"
-
-
-_ARRAY_HEADER_STRUCT = struct.Struct("<I H H 5Q Q Q Q I I")
-_DTYPE_CODES: Dict[int, str] = {
-    1: "f64",
-    2: "f32",
-    3: "i32",
-    4: "i16",
-    5: "i8",
-    6: "u8",
-    7: "q8_8",
-    8: "q4_12",
-    9: "bf16",
-}
 
 
 def _format_float(value: Optional[object]) -> str:
@@ -358,18 +353,7 @@ def _strip_private_fields(blob):
 
 
 def _decode_snapshot_types(blob):
-    if isinstance(blob, str) and blob.startswith(JSON_BYTES_PREFIX):
-        return bytes.fromhex(blob[len(JSON_BYTES_PREFIX) :])
-    if isinstance(blob, list):
-        return [_decode_snapshot_types(value) for value in blob]
-    if isinstance(blob, dict):
-        result = {}
-        for key, value in blob.items():
-            if isinstance(key, str):
-                key = _decode_snapshot_types(key)
-            result[key] = _decode_snapshot_types(value)
-        return result
-    return blob
+    return decode_snapshot_blob(blob)
 
 
 def _decode_text(value) -> str:
@@ -450,46 +434,6 @@ def _load_state(path: Path):
     raise RuntimeError(f"Unsupported snapshot format: {path}")
 
 
-def _parse_array_header(values: Sequence[int]) -> Dict[str, object]:
-    magic = int(values[0])
-    if magic != 0x53455241:
-        raise ValueError("Invalid Sera array header magic")
-    dtype_code = int(values[1])
-    rank = int(values[2])
-    dims = tuple(int(dim) for dim in values[3:8])
-    shape = tuple(dim for dim in dims[:rank]) if rank > 0 else tuple()
-    header = {
-        "magic": magic,
-        "dtype_code": dtype_code,
-        "dtype": _DTYPE_CODES.get(dtype_code, f"code{dtype_code}"),
-        "rank": rank,
-        "dims": dims,
-        "shape": shape,
-        "byte_len": int(values[8]),
-        "crc32c": int(values[9]),
-        "sha256_low64": int(values[10]),
-        "flags": int(values[11]),
-        "reserved": int(values[12]),
-    }
-    return header
-
-
-def _load_array_file(path: Path) -> tuple[Dict[str, object], bytes]:
-    with path.open("rb") as fh:
-        header_raw = fh.read(_ARRAY_HEADER_STRUCT.size)
-        if len(header_raw) != _ARRAY_HEADER_STRUCT.size:
-            raise ValueError(f"Array file {path} is truncated")
-        values = _ARRAY_HEADER_STRUCT.unpack(header_raw)
-        payload = fh.read()
-    header = _parse_array_header(values)
-    if len(payload) != header["byte_len"]:
-        raise ValueError(
-            f"Array payload length mismatch for {path}: "
-            f"expected {header['byte_len']}, got {len(payload)}"
-        )
-    return header, payload
-
-
 def _load_manifest_arrays(
     manifest_dir: Path, artefacts: Optional[Mapping[str, Mapping[str, object]]]
 ) -> Dict[str, Dict[str, object]]:
@@ -501,7 +445,10 @@ def _load_manifest_arrays(
         array_path = arrays_dir / f"{name}.bin"
         if not array_path.exists():
             raise FileNotFoundError(f"Required array {array_path} is missing")
-        header, payload = _load_array_file(array_path)
+        try:
+            header, payload = load_array_file(array_path)
+        except SeraArrayError as exc:
+            raise ValueError(str(exc)) from exc
         expected_sha = record.get("sha256") if isinstance(record, Mapping) else None
         if expected_sha:
             digest = hashlib.sha256(payload).hexdigest()
@@ -511,9 +458,9 @@ def _load_manifest_arrays(
                     f"expected {expected_sha}, got {digest}"
                 )
         loaded[name] = {
-            "dtype": header["dtype"],
-            "shape": header["shape"],
-            "byte_len": header["byte_len"],
+            "dtype": header.dtype,
+            "shape": header.shape,
+            "byte_len": header.byte_len,
         }
     return loaded
 

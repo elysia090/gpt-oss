@@ -7,6 +7,8 @@ import unicodedata
 import copy
 import threading
 import pickle
+import importlib.util
+import sys
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +38,36 @@ import hashlib
 import json
 import zlib
 
+try:
+    from .sera_common import (
+        ARRAY_HEADER_STRUCT as _TRANSFER_ARRAY_STRUCT,
+        ARRAY_MAGIC as _TRANSFER_ARRAY_MAGIC,
+        DEFAULT_STATE_FILENAMES as _TRANSFER_STATE_FILENAMES,
+        DTYPE_CODES as _TRANSFER_DTYPE_CODES,
+        JSON_BYTES_PREFIX as _TRANSFER_JSON_BYTES_PREFIX,
+        MANIFEST_MAGIC as _TRANSFER_MANIFEST_MAGIC,
+        MANIFEST_VERSION as _TRANSFER_MANIFEST_VERSION,
+        PICKLE_SUFFIXES as _PICKLE_SUFFIXES,
+    )
+except ImportError:  # pragma: no cover - fallback for direct loading
+    _sera_common_path = Path(__file__).resolve().parent / "sera_common.py"
+    _sera_common_spec = importlib.util.spec_from_file_location(
+        "_sera_common", _sera_common_path
+    )
+    if _sera_common_spec is None or _sera_common_spec.loader is None:
+        raise
+    _sera_common_module = importlib.util.module_from_spec(_sera_common_spec)
+    sys.modules.setdefault(_sera_common_spec.name, _sera_common_module)
+    _sera_common_spec.loader.exec_module(_sera_common_module)
+    _TRANSFER_ARRAY_STRUCT = _sera_common_module.ARRAY_HEADER_STRUCT
+    _TRANSFER_ARRAY_MAGIC = _sera_common_module.ARRAY_MAGIC
+    _TRANSFER_STATE_FILENAMES = _sera_common_module.DEFAULT_STATE_FILENAMES
+    _TRANSFER_DTYPE_CODES = _sera_common_module.DTYPE_CODES
+    _TRANSFER_JSON_BYTES_PREFIX = _sera_common_module.JSON_BYTES_PREFIX
+    _TRANSFER_MANIFEST_MAGIC = _sera_common_module.MANIFEST_MAGIC
+    _TRANSFER_MANIFEST_VERSION = _sera_common_module.MANIFEST_VERSION
+    _PICKLE_SUFFIXES = _sera_common_module.PICKLE_SUFFIXES
+
 
 # ---------------------------------------------------------------------------
 # Helper utilities
@@ -49,29 +81,7 @@ class BudgetError(RuntimeError):
 T = TypeVar("T")
 
 
-_TRANSFER_JSON_BYTES_PREFIX = "__sera_bytes__:"
-_TRANSFER_STATE_FILENAMES: Tuple[str, ...] = (
-    "sera_state.json",
-    "sera_state.msgpack",
-    "sera_state.pkl",
-)
-_PICKLE_SUFFIXES = {".pkl", ".pickle"}
-_TRANSFER_ARRAY_MAGIC = 0x53455241
-_TRANSFER_MANIFEST_MAGIC = 0x5345524D
-_TRANSFER_MANIFEST_VERSION = 0x3
 _TRANSFER_MANIFEST_PREFIX_STRUCT = struct.Struct("<I I")
-_TRANSFER_ARRAY_STRUCT = struct.Struct("<I H H 5Q Q Q Q I I")
-_TRANSFER_DTYPE_CODES: Dict[int, str] = {
-    1: "f64",
-    2: "f32",
-    3: "i32",
-    4: "i16",
-    5: "i8",
-    6: "u8",
-    7: "q8_8",
-    8: "q4_12",
-    9: "bf16",
-}
 _CRC32C_TABLE: List[int] = []
 _CRC32C_INIT = 0xFFFFFFFF
 _ARRAY_VALIDATION_CHUNK_SIZE = 1024 * 1024
