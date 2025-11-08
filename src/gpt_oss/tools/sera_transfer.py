@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import pickle
 import re
 import struct
@@ -2424,6 +2425,7 @@ def convert(
     source = _normalise_path(source)
     output = _normalise_path(output)
 
+    created_output_dir = not output.exists()
     output.mkdir(parents=True, exist_ok=True)
 
     if verbose and not logging.getLogger().handlers:
@@ -2432,6 +2434,8 @@ def convert(
     log_path = output / "conversion.log"
     file_handler: logging.Handler | None = None
     previous_level = logger.level
+
+    cleanup_on_failure = False
 
     try:
         file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
@@ -2715,6 +2719,9 @@ def convert(
 
         try:
             return _convert_inner()
+        except ModuleNotFoundError:
+            cleanup_on_failure = created_output_dir
+            raise
         except (ValueError, RuntimeError, FileNotFoundError) as exc:
             logger.exception("Conversion failed: %s", exc)
             raise
@@ -2726,6 +2733,12 @@ def convert(
             logger.setLevel(previous_level)
         else:
             logger.setLevel(logging.NOTSET)
+
+        if cleanup_on_failure:
+            try:
+                shutil.rmtree(output)
+            except OSError:
+                logger.debug("Failed to remove output directory after error: %s", output)
 
 
 def run_interactive_cli(
@@ -2985,7 +2998,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     except ModuleNotFoundError as exc:
         message = str(exc) or _SAFETENSORS_MISSING_MSG
-        print(f"sera_transfer: {message}", file=sys.stderr)
+        hint = ""
+        if args.output is not None:
+            hint = f" No artefacts were written to {args.output}."
+        print(f"sera_transfer: {message}{hint}", file=sys.stderr)
         raise SystemExit(1) from exc
 
     try:

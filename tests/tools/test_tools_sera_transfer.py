@@ -1144,6 +1144,7 @@ def test_cli_reports_missing_safetensors(tmp_path: Path, monkeypatch, capsys) ->
     stderr = capsys.readouterr().err
     assert "sera_transfer:" in stderr
     assert "pip install safetensors" in stderr
+    assert "No artefacts were written" in stderr
     assert not output.exists()
 
 
