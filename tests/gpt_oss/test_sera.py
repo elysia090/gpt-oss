@@ -29,6 +29,9 @@ BalancerResult = _SERA_MODULE.BalancerResult
 TrustGateConfig = _SERA_MODULE.TrustGateConfig
 BridgeConfig = _SERA_MODULE.BridgeConfig
 BridgeState = _SERA_MODULE.BridgeState
+TreeSearchConfig = _SERA_MODULE.TreeSearchConfig
+TreeSearchObservation = _SERA_MODULE.TreeSearchObservation
+TreeSearchState = _SERA_MODULE.TreeSearchState
 
 
 def test_tokenizer_enforces_event_budgets() -> None:
@@ -179,6 +182,19 @@ def test_bridge_manifest_includes_config_metadata() -> None:
     assert bridge_blob["route_proof_schema_digest"] == config.bridge.route_proof_schema_digest
 
 
+def test_manifest_includes_search_constants() -> None:
+    search_config = TreeSearchConfig(enabled=True, epsilon=0.125, value_loss=0.5)
+    config = SeraConfig(tree_search=search_config)
+    model = Sera(config)
+
+    sections = model.manifest_record().sections
+    assert "search" in sections
+    search_blob = sections["search"]
+    assert search_blob["constants"]["epsilon"] == pytest.approx(search_config.epsilon)
+    assert search_blob["constants"]["value_loss"] == pytest.approx(search_config.value_loss)
+    assert search_blob["actions"]
+
+
 def test_sparse_linear_tau_freeze() -> None:
     config = SeraConfig(
         linear=SparseLinearConfig(
@@ -300,6 +316,41 @@ def test_trust_gate_adjusts_beta_caps() -> None:
     assert diag.trust_decision == -1
     assert diag.trust_beta_cap == pytest.approx(0.0)
     assert diag.trust_beta_min == pytest.approx(0.0)
+
+
+def test_tree_search_observation_updates_stats() -> None:
+    config = TreeSearchConfig(
+        enabled=True,
+        max_actions=3,
+        action_cap=3,
+        epsilon=0.0,
+        value_loss=0.75,
+        action_priors=(0.5, 0.3, 0.2),
+        action_rewards=(0.1, 0.0, -0.1),
+    )
+    state = TreeSearchState(config)
+    observation = TreeSearchObservation(
+        delta_accuracy=0.3,
+        dictionary_hit=True,
+        guard_ok=True,
+        route_cost=0.4,
+        witness_quality=0.6,
+        trust_signal=1.0,
+    )
+
+    state.observe_event(observation)
+    state.maybe_select()
+    stats = state.stats()
+
+    assert stats["simulations"] == 1
+    assert 0 <= stats["path_len"] <= config.selection_depth
+    assert 0 < stats["rollout_len"] <= config.rollout_depth
+    assert state._root.visits > 0
+
+    manifest = state.manifest()
+    assert manifest["constants"]["A_cap"] == config.action_cap
+    assert manifest["constants"]["epsilon"] == pytest.approx(config.epsilon)
+    assert manifest["reward_weights"] == list(config.reward_weights)
 
 
 def test_bridge_promote_respects_guard_policies() -> None:
