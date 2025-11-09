@@ -156,11 +156,11 @@ def _format_dashboard(
     trust_gamma = diagnostics.get("trust_gamma", 0.0)
     trust_beta_min = diagnostics.get("trust_beta_min", 0.0)
     trust_beta_cap = diagnostics.get("trust_beta_cap", 0.0)
-    cfr_mode = diagnostics.get("cfr_mode", "OFF")
-    cfr_beta = diagnostics.get("cfr_beta", 0.0)
-    cfr_guard = diagnostics.get("cfr_guard", False)
-    cfr_health = diagnostics.get("cfr_health_ok", True)
-    cfr_y_cfr = diagnostics.get("cfr_y_cfr", 0.0)
+    corrector_mode = diagnostics.get("corrector_mode", "OFF")
+    corrector_beta = diagnostics.get("corrector_beta", 0.0)
+    corrector_guard = diagnostics.get("corrector_guard", False)
+    corrector_health = diagnostics.get("corrector_health_ok", True)
+    corrector_y = diagnostics.get("corrector_y_corrector", 0.0)
 
     details = [summary]
     details.append(
@@ -176,10 +176,11 @@ def _format_dashboard(
         + f" {_format_float(trust_beta_cap)}]"
     )
     details.append(
-        "  cfr: mode="
-        + str(cfr_mode)
-        + f" beta={_format_float(cfr_beta)} guard={cfr_guard} health={cfr_health}"
-        + f" y_cfr={_format_float(cfr_y_cfr)}"
+        "  corrector: mode="
+        + str(corrector_mode)
+        + f" beta={_format_float(corrector_beta)} guard={corrector_guard}"
+        + f" health={corrector_health}"
+        + f" y={_format_float(corrector_y)}"
     )
     return "\n".join(details)
 

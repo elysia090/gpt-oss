@@ -1377,8 +1377,10 @@ class TrustGateState:
         return matrix
 
     def _default_vector(self, diagnostics: "SeraDiagnostics") -> np.ndarray:
-        mode = (diagnostics.cfr_mode or "").upper()
-        if mode not in {"OFF", "CFR-REPLAY", "CFR-MIX"}:
+        mode = (diagnostics.corrector_mode or "").upper()
+        if mode.startswith("CFR-"):
+            mode = mode.replace("CFR", "CORRECTOR", 1)
+        if mode not in {"OFF", "CORRECTOR-REPLAY", "CORRECTOR-MIX"}:
             mode = "OFF"
         features = [
             _safe_tanh(diagnostics.attention_den_min, scale=10.0),
@@ -1396,12 +1398,12 @@ class TrustGateState:
             _safe_tanh(diagnostics.tokenizer_probe_max, scale=32.0),
             _safe_tanh(diagnostics.tok_emitted % 1024, scale=1024.0),
             _safe_tanh(diagnostics.tok_bytes_in % 1024, scale=1024.0),
-            _safe_tanh(diagnostics.cfr_beta, scale=1.0),
-            _safe_tanh(diagnostics.cfr_y_cfr, scale=1.0),
-            float(bool(diagnostics.cfr_guard)),
-            float(bool(diagnostics.cfr_health_ok)),
-            float(mode == "CFR-MIX"),
-            float(mode == "CFR-REPLAY"),
+            _safe_tanh(diagnostics.corrector_beta, scale=1.0),
+            _safe_tanh(diagnostics.corrector_y_corrector, scale=1.0),
+            float(bool(diagnostics.corrector_guard)),
+            float(bool(diagnostics.corrector_health_ok)),
+            float(mode == "CORRECTOR-MIX"),
+            float(mode == "CORRECTOR-REPLAY"),
             float(mode == "OFF"),
             _safe_tanh(diagnostics.tree_simulations, scale=16.0),
             1.0,
@@ -1507,19 +1509,19 @@ class TrustGateState:
 
 
 # ---------------------------------------------------------------------------
-# CCR overlap corrector (spec section 7)
+# Balancer overlap corrector (spec section 7)
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class CCRConfig:
+class BalancerConfig:
     gamma: float = 0.25
     truncation_order: int = 2
 
 
 @dataclass(frozen=True)
-class CCRSmallBlocks:
-    """Small precomputed blocks for the CCR contraction (spec §7)."""
+class BalancerSmallBlocks:
+    """Small precomputed blocks for the balancer contraction (spec §7)."""
 
     dim: int
     B_blocks: Tuple[np.ndarray, ...]
@@ -1530,8 +1532,8 @@ class CCRSmallBlocks:
 
 
 @dataclass(frozen=True)
-class CCRResult:
-    """Result of a CCR correction step including residual construction."""
+class BalancerResult:
+    """Result of a balancer correction step including residual construction."""
 
     residual: np.ndarray
     correction: np.ndarray
@@ -1541,36 +1543,36 @@ class CCRResult:
 
 
 @dataclass
-class CCRState:
-    config: CCRConfig
-    _certificate: "CCRProof" = field(init=False)
-    _blocks: CCRSmallBlocks = field(init=False)
+class BalancerState:
+    config: BalancerConfig
+    _certificate: "BalancerProof" = field(init=False)
+    _blocks: BalancerSmallBlocks = field(init=False)
 
     def __post_init__(self) -> None:
         if not (0 <= self.config.gamma < 1):
             raise ValueError("gamma must be in [0,1)")
         tail = self._tail_bound(self.config.gamma, self.config.truncation_order)
-        self._certificate = CCRProof(
+        self._certificate = BalancerProof(
             gamma=self.config.gamma,
             truncation_order=self.config.truncation_order,
             tail_bound=tail,
         )
         self._blocks = self._precompute_small_blocks(self.config.truncation_order)
 
-    def correct(self, locals_: np.ndarray) -> CCRResult:
+    def correct(self, locals_: np.ndarray) -> BalancerResult:
         locals_vec = np.asarray(locals_, dtype=float)
         if locals_vec.ndim != 1:
             raise ValueError("Locals must be a vector")
         if locals_vec.shape[0] != self._blocks.dim:
             raise ValueError("Unexpected locals dimensionality")
         if self.config.gamma >= 1:
-            raise BudgetError("CCR contraction gamma must be < 1")
+            raise BudgetError("Balancer contraction gamma must be < 1")
         target = float(self._blocks.pi @ locals_vec)
         residual = locals_vec - target
         correction = -self._blocks.h_series @ residual
         corrected = locals_vec + correction
         y_val = float(self._blocks.pi @ corrected)
-        return CCRResult(
+        return BalancerResult(
             residual=residual,
             correction=correction,
             corrected_locals=corrected,
@@ -1578,7 +1580,7 @@ class CCRState:
             y=y_val,
         )
 
-    def _precompute_small_blocks(self, order: int) -> CCRSmallBlocks:
+    def _precompute_small_blocks(self, order: int) -> BalancerSmallBlocks:
         if order != 2:
             raise NotImplementedError("Only truncation order m=2 is supported")
         dim = 2
@@ -1601,7 +1603,7 @@ class CCRState:
             series += block
         h_series = h @ series
         pi = np.ones(dim, dtype=float) * (1.0 / dim)
-        return CCRSmallBlocks(
+        return BalancerSmallBlocks(
             dim=dim,
             B_blocks=tuple(B_blocks),
             W_blocks=tuple(W_blocks),
@@ -1615,16 +1617,16 @@ class CCRState:
         return gamma ** (order + 1) / (1 - gamma) if gamma < 1 else float("inf")
 
     @property
-    def certificate(self) -> "CCRProof":
+    def certificate(self) -> "BalancerProof":
         return self._certificate
 
     @property
-    def blocks(self) -> CCRSmallBlocks:
+    def blocks(self) -> BalancerSmallBlocks:
         return self._blocks
 
 
 @dataclass(frozen=True)
-class CCRProof:
+class BalancerProof:
     gamma: float
     truncation_order: int
     tail_bound: float
@@ -2407,10 +2409,10 @@ class BridgeState:
 
 
 @dataclass(frozen=True)
-class CFRConfig:
-    mode: str = "OFF"
+class CorrectorConfig:
+    mode: str = "CORRECTOR-MIX"
     gate_gain: float = 1.0
-    beta_cfr_max: float = 0.2
+    beta_corrector_max: float = 0.2
     projector: Sequence[Sequence[float]] = ((1.0, 0.0, 0.0, 0.0),)
     mem_excitation: Sequence[Tuple[int, float]] = ((0, 0.0),)
     drift_epsilon: float = 1e-3
@@ -2423,19 +2425,21 @@ class CFRConfig:
 
     def __post_init__(self) -> None:
         mode = self.mode.upper().replace("_", "-")
-        if mode not in {"OFF", "CFR-REPLAY", "CFR-MIX"}:
+        if mode.startswith("CFR-"):
+            mode = mode.replace("CFR", "CORRECTOR", 1)
+        if mode not in {"OFF", "CORRECTOR-REPLAY", "CORRECTOR-MIX"}:
             if mode == "REPLAY":
-                mode = "CFR-REPLAY"
+                mode = "CORRECTOR-REPLAY"
             elif mode == "MIX":
-                mode = "CFR-MIX"
+                mode = "CORRECTOR-MIX"
             else:
-                raise ValueError("mode must be OFF, CFR-REPLAY, or CFR-MIX")
+                raise ValueError("mode must be OFF, CORRECTOR-REPLAY, or CORRECTOR-MIX")
         object.__setattr__(self, "mode", mode)
 
         if not 0.0 <= self.gate_gain <= 1.0:
             raise ValueError("gate_gain must lie in [0, 1]")
-        if not 0.0 <= self.beta_cfr_max <= 1.0:
-            raise ValueError("beta_cfr_max must lie in [0, 1]")
+        if not 0.0 <= self.beta_corrector_max <= 1.0:
+            raise ValueError("beta_corrector_max must lie in [0, 1]")
         if self.drift_epsilon < 0.0:
             raise ValueError("drift_epsilon must be non-negative")
         if self.schedule_period <= 0:
@@ -2475,10 +2479,10 @@ class CFRConfig:
 
 
 @dataclass(frozen=True)
-class CFRComputation:
+class CorrectorComputation:
     mode: str
     cf_vector: np.ndarray
-    y_cfr: float
+    y_corrector: float
     beta: float
     y_mix: float
     guard: bool
@@ -2487,8 +2491,8 @@ class CFRComputation:
 
 
 @dataclass
-class CFRState:
-    config: CFRConfig
+class CorrectorState:
+    config: CorrectorConfig
     _projector: np.ndarray = field(init=False, repr=False)
     _mode: str = field(init=False, repr=False)
     _enabled: bool = field(init=False, repr=False)
@@ -2503,7 +2507,7 @@ class CFRState:
     _generation: int = field(init=False, default=0)
     _event_counter: int = 0
     _last_beta: float = 0.0
-    _last_y_cfr: float = 0.0
+    _last_y_corrector: float = 0.0
     _last_s_wit: float = 0.0
 
     def __post_init__(self) -> None:
@@ -2529,7 +2533,7 @@ class CFRState:
 
     @property
     def allows_linear_update(self) -> bool:
-        return self._mode != "CFR-REPLAY"
+        return self._mode != "CORRECTOR-REPLAY"
 
     def _reseed(self, generation: int) -> None:
         gen = int(generation)
@@ -2603,40 +2607,40 @@ class CFRState:
         guard_ok: bool,
         trust_beta_min: float,
         trust_beta_cap: float,
-    ) -> CFRComputation:
+    ) -> CorrectorComputation:
         vector = self._counterfactual_vector(phi_q, y_lin, mem_value, bridge_value, y_fus)
         projected = self._projector @ vector
         if projected.ndim == 0:
-            y_cfr = float(projected)
+            y_corrector = float(projected)
         else:
-            y_cfr = float(np.mean(projected))
+            y_corrector = float(np.mean(projected))
 
         s_wit = 1.0 if guard_ok else 0.0
         beta_min = _clamp(float(trust_beta_min), 0.0, float(trust_beta_cap))
         beta_cap = _clamp(float(trust_beta_cap), 0.0, 1.0)
-        beta_cap = min(beta_cap, self.config.beta_cfr_max)
+        beta_cap = min(beta_cap, self.config.beta_corrector_max)
         beta_span = max(0.0, beta_cap - beta_min)
 
         health_ok = guard_ok
         beta = 0.0
         y_mix = float(y_fus)
-        if self._mode == "CFR-MIX" and self._enabled and health_ok:
+        if self._mode == "CORRECTOR-MIX" and self._enabled and health_ok:
             beta_target = beta_min + beta_span * s_wit
             beta = _clamp(self._gate_gain * beta_target, 0.0, beta_cap)
             if beta > 0.0:
-                y_mix = (1.0 - beta) * float(y_fus) + beta * y_cfr
-        elif self._mode == "CFR-REPLAY":
+                y_mix = (1.0 - beta) * float(y_fus) + beta * y_corrector
+        elif self._mode == "CORRECTOR-REPLAY":
             beta = 0.0
 
         self._last_beta = beta
-        self._last_y_cfr = y_cfr
+        self._last_y_corrector = y_corrector
         self._last_s_wit = s_wit
         self._event_counter = (self._event_counter + 1) & _HASH_MASK
 
-        return CFRComputation(
+        return CorrectorComputation(
             mode=self._mode,
             cf_vector=vector,
-            y_cfr=y_cfr,
+            y_corrector=y_corrector,
             beta=beta,
             y_mix=y_mix,
             guard=guard_ok,
@@ -2651,7 +2655,7 @@ class CFRState:
                 digest.update(struct.pack("<d", float(value)))
         return {
             "mode": self._mode,
-            "beta_cfr_max": float(self.config.beta_cfr_max),
+            "beta_corrector_max": float(self.config.beta_corrector_max),
             "gate_gain": float(self._gate_gain),
             "projector_shape": list(self._projector.shape),
             "projector_digest": digest.hexdigest(),
@@ -2664,20 +2668,20 @@ class CFRState:
         return {
             "event_counter": int(self._event_counter),
             "last_beta": float(self._last_beta),
-            "last_y_cfr": float(self._last_y_cfr),
+            "last_y_corrector": float(self._last_y_corrector),
             "last_s_wit": float(self._last_s_wit),
             "generation": int(self._generation),
         }
 
     @classmethod
-    def restore(cls, config: CFRConfig, blob: Optional[Dict[str, object]]) -> "CFRState":
+    def restore(cls, config: CorrectorConfig, blob: Optional[Dict[str, object]]) -> "CorrectorState":
         state = cls(config)
         if blob:
             generation = int(blob.get("generation", 0))
             state._reseed(generation)
             state._event_counter = int(blob.get("event_counter", 0)) & _HASH_MASK
             state._last_beta = float(blob.get("last_beta", 0.0))
-            state._last_y_cfr = float(blob.get("last_y_cfr", 0.0))
+            state._last_y_corrector = float(blob.get("last_y_corrector", 0.0))
             state._last_s_wit = float(blob.get("last_s_wit", 0.0))
         return state
 
@@ -3045,16 +3049,16 @@ def _default_trust_config() -> TrustGateConfig:
     return TrustGateConfig()
 
 
-def _default_ccr_config() -> CCRConfig:
-    return CCRConfig()
+def _default_balancer_config() -> BalancerConfig:
+    return BalancerConfig()
 
 
 def _default_bridge_config() -> BridgeConfig:
     return BridgeConfig()
 
 
-def _default_cfr_config() -> CFRConfig:
-    return CFRConfig()
+def _default_corrector_config() -> CorrectorConfig:
+    return CorrectorConfig()
 
 
 def _default_tree_search_config() -> TreeSearchConfig:
@@ -3073,9 +3077,9 @@ class SeraConfig:
     memory: FiniteMemoryConfig = field(default_factory=_default_memory_config)
     fusion: FusionConfig = field(default_factory=_default_fusion_config)
     trust: TrustGateConfig = field(default_factory=_default_trust_config)
-    ccr: CCRConfig = field(default_factory=_default_ccr_config)
+    balancer: BalancerConfig = field(default_factory=_default_balancer_config)
     bridge: BridgeConfig = field(default_factory=_default_bridge_config)
-    cfr: CFRConfig = field(default_factory=_default_cfr_config)
+    corrector: CorrectorConfig = field(default_factory=_default_corrector_config)
     tree_search: TreeSearchConfig = field(default_factory=_default_tree_search_config)
     lambda_floor: float = 0.05
     feature_budget: int = 32
@@ -3118,8 +3122,8 @@ class SeraConfig:
         )
         object.__setattr__(
             self,
-            "ccr",
-            _coerce_dataclass_config(self.ccr, CCRConfig, _default_ccr_config),
+            "balancer",
+            _coerce_dataclass_config(self.balancer, BalancerConfig, _default_balancer_config),
         )
         object.__setattr__(
             self,
@@ -3128,8 +3132,8 @@ class SeraConfig:
         )
         object.__setattr__(
             self,
-            "cfr",
-            _coerce_dataclass_config(self.cfr, CFRConfig, _default_cfr_config),
+            "corrector",
+            _coerce_dataclass_config(self.corrector, CorrectorConfig, _default_corrector_config),
         )
         object.__setattr__(
             self,
@@ -3342,11 +3346,11 @@ class SeraDiagnostics:
     trust_audit: bytes = field(default=b"", repr=False)
     trust_beta_min: float = 0.0
     trust_beta_cap: float = 0.0
-    cfr_mode: str = "OFF"
-    cfr_beta: float = 0.0
-    cfr_guard: bool = False
-    cfr_health_ok: bool = True
-    cfr_y_cfr: float = 0.0
+    corrector_mode: str = "OFF"
+    corrector_beta: float = 0.0
+    corrector_guard: bool = False
+    corrector_health_ok: bool = True
+    corrector_y_corrector: float = 0.0
 
     def __post_init__(self) -> None:
         if self.p99_window < 1:
@@ -3372,9 +3376,9 @@ class Sera:
     memory: FiniteMemoryState = field(init=False)
     fusion: FusionState = field(init=False)
     trust_gate: TrustGateState = field(init=False)
-    ccr: CCRState = field(init=False)
+    balancer: BalancerState = field(init=False)
     bridge: BridgeState = field(init=False)
-    cfr: CFRState = field(init=False)
+    corrector: CorrectorState = field(init=False)
     tree_search: TreeSearchState = field(init=False)
     diagnostics: SeraDiagnostics = field(default_factory=SeraDiagnostics)
     generation: int = field(init=False, default=0)
@@ -3387,12 +3391,12 @@ class Sera:
         object.__setattr__(self, "memory", FiniteMemoryState(self.config.memory))
         object.__setattr__(self, "fusion", FusionState(self.config.fusion))
         object.__setattr__(self, "trust_gate", TrustGateState(self.config.trust))
-        object.__setattr__(self, "ccr", CCRState(self.config.ccr))
+        object.__setattr__(self, "balancer", BalancerState(self.config.balancer))
         object.__setattr__(self, "bridge", BridgeState(self.config.bridge))
-        object.__setattr__(self, "cfr", CFRState(self.config.cfr))
+        object.__setattr__(self, "corrector", CorrectorState(self.config.corrector))
         object.__setattr__(self, "tree_search", TreeSearchState(self.config.tree_search))
         self.bridge.advance_generation(self.generation)
-        self.cfr.advance_generation(self.generation)
+        self.corrector.advance_generation(self.generation)
         object.__setattr__(self, "_generation_pointer", GenerationPointer())
         self._generation_pointer.publish(self.manifest_record())
 
@@ -3475,7 +3479,7 @@ class Sera:
                     raise BudgetError("Feature budget exceeded")
                 features.append(feature)
             y_lin = self.linear.predict(features)
-            if target is not None and self.cfr.allows_linear_update:
+            if target is not None and self.corrector.allows_linear_update:
                 self.linear.update(features, target)
 
             mem_value = self.memory.accumulate((idx, val) for idx, val in features)
@@ -3506,7 +3510,7 @@ class Sera:
             if bridge_ctx is not None:
                 bridge_val, guard, proof = self.bridge.read(bridge_ctx, bridge_token)
 
-            cfr_result = self.cfr.run(
+            corrector_result = self.corrector.run(
                 y_fus=fused,
                 y_lin=y_lin,
                 mem_value=mem_value,
@@ -3516,15 +3520,15 @@ class Sera:
                 trust_beta_min=trust.beta_min,
                 trust_beta_cap=trust.beta_cap,
             )
-            fused = float(cfr_result.y_mix)
-            diag.cfr_mode = cfr_result.mode
-            diag.cfr_beta = float(cfr_result.beta)
-            diag.cfr_guard = bool(cfr_result.guard)
-            diag.cfr_health_ok = bool(cfr_result.health_ok or bridge_ctx is None)
-            diag.cfr_y_cfr = float(cfr_result.y_cfr)
+            fused = float(corrector_result.y_mix)
+            diag.corrector_mode = corrector_result.mode
+            diag.corrector_beta = float(corrector_result.beta)
+            diag.corrector_guard = bool(corrector_result.guard)
+            diag.corrector_health_ok = bool(corrector_result.health_ok or bridge_ctx is None)
+            diag.corrector_y_corrector = float(corrector_result.y_corrector)
 
             locals_vec = np.array([fused, gated], dtype=float)
-            ccr_result = self.ccr.correct(locals_vec)
+            balancer_result = self.balancer.correct(locals_vec)
 
             if bridge_ctx is not None:
                 if guard:
@@ -3541,7 +3545,7 @@ class Sera:
                 gated,
                 bridge_val,
                 guard,
-                witness_quality=cfr_result.s_witness,
+                witness_quality=corrector_result.s_witness,
                 beta_min_override=trust.beta_min,
                 beta_cap_override=trust.beta_cap,
             )
@@ -3582,11 +3586,11 @@ class Sera:
                 "memory": mem_value,
                 "y_fus": fused,
                 "y_gate": gated,
-                "y_out": ccr_result.y,
-                "ccr_residual": ccr_result.residual,
-                "ccr_correction": ccr_result.correction,
+                "y_out": balancer_result.y,
+                "balancer_residual": balancer_result.residual,
+                "balancer_correction": balancer_result.correction,
                 "y_bridge": bridged,
-                "y_cfr": cfr_result.y_cfr,
+                "y_corrector": corrector_result.y_corrector,
                 "trust_decision": trust.verdict(),
                 "trust": trust_record,
             }
@@ -3630,7 +3634,7 @@ class Sera:
         return {
             "config": dataclasses.asdict(self.config),
             "linear_state": self.linear.snapshot(),
-            "cfr_state": self.cfr.snapshot(),
+            "corrector_state": self.corrector.snapshot(),
             "diagnostics": self.diagnostics_record(),
             "generation": self.generation,
             "manifest": self.manifest_record().as_dict(),
@@ -3658,10 +3662,10 @@ class Sera:
         model.generation = int(blob.get("generation", 0))
         model.linear.advance_generation(model.generation)
         model.bridge.advance_generation(model.generation)
-        cfr_blob = blob.get("cfr_state")
-        if cfr_blob is not None:
-            model.cfr = CFRState.restore(model.config.cfr, cfr_blob)
-        model.cfr.advance_generation(model.generation)
+        corrector_blob = blob.get("corrector_state")
+        if corrector_blob is not None:
+            model.corrector = CorrectorState.restore(model.config.corrector, corrector_blob)
+        model.corrector.advance_generation(model.generation)
         model._generation_pointer.publish(model.manifest_record())
         return model
 
@@ -3830,15 +3834,15 @@ class Sera:
         self.generation += 1
         self.linear.advance_generation(self.generation)
         self.bridge.advance_generation(self.generation)
-        self.cfr.advance_generation(self.generation)
+        self.corrector.advance_generation(self.generation)
         self._generation_pointer.publish(self.manifest_record())
 
     def _manifest_sections(self) -> Dict[str, object]:
         return {
             "linear": self.linear.manifest(),
             "bridge": self.bridge.manifest(),
-            "cfr": self.cfr.manifest(),
-            "ccr_proof": self.ccr.certificate.as_dict(),
+            "corrector": self.corrector.manifest(),
+            "balancer_proof": self.balancer.certificate.as_dict(),
             "diagnostics": self.diagnostics_record(),
         }
 
@@ -3895,7 +3899,7 @@ __all__ = [
     "ManifestRecord",
     "Sera",
     "SeraConfig",
-    "CFRConfig",
+    "CorrectorConfig",
     "TrustGateConfig",
 ]
 

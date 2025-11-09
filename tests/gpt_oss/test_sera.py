@@ -23,9 +23,9 @@ SeraConfig = _SERA_MODULE.SeraConfig
 TokenizerConfig = _SERA_MODULE.TokenizerConfig
 TokenizerState = _SERA_MODULE.TokenizerState
 SparseLinearConfig = _SERA_MODULE.SparseLinearConfig
-CCRConfig = _SERA_MODULE.CCRConfig
-CCRState = _SERA_MODULE.CCRState
-CCRResult = _SERA_MODULE.CCRResult
+BalancerConfig = _SERA_MODULE.BalancerConfig
+BalancerState = _SERA_MODULE.BalancerState
+BalancerResult = _SERA_MODULE.BalancerResult
 TrustGateConfig = _SERA_MODULE.TrustGateConfig
 BridgeConfig = _SERA_MODULE.BridgeConfig
 BridgeState = _SERA_MODULE.BridgeState
@@ -203,8 +203,8 @@ def test_sparse_linear_tau_freeze() -> None:
     assert capacity["frozen"] is True
 
 
-def test_ccr_small_block_precomputation() -> None:
-    state = CCRState(CCRConfig())
+def test_balancer_small_block_precomputation() -> None:
+    state = BalancerState(BalancerConfig())
     blocks = state.blocks
 
     assert blocks.dim == 2
@@ -216,13 +216,13 @@ def test_ccr_small_block_precomputation() -> None:
     assert float(sum(blocks.pi.tolist())) == pytest.approx(1.0)
 
 
-def test_ccr_correct_constructs_residual_and_output() -> None:
-    state = CCRState(CCRConfig())
+def test_balancer_correct_constructs_residual_and_output() -> None:
+    state = BalancerState(BalancerConfig())
     locals_vec = np.array([3.0, 1.0], dtype=float)
 
     result = state.correct(locals_vec)
 
-    assert isinstance(result, CCRResult)
+    assert isinstance(result, BalancerResult)
     assert result.residual.shape == (2,)
     assert float(sum(result.residual.tolist())) == pytest.approx(0.0)
     assert result.correction.shape == (2,)
@@ -230,13 +230,13 @@ def test_ccr_correct_constructs_residual_and_output() -> None:
     assert result.y == pytest.approx(float(np.mean(result.corrected_locals)))
 
 
-def test_step_exposes_ccr_outputs() -> None:
+def test_step_exposes_balancer_outputs() -> None:
     model = Sera(SeraConfig())
 
     outputs = model.step()
 
-    residual = outputs["ccr_residual"]
-    correction = outputs["ccr_correction"]
+    residual = outputs["balancer_residual"]
+    correction = outputs["balancer_correction"]
 
     assert isinstance(residual, np.ndarray)
     assert residual.shape == (2,)
