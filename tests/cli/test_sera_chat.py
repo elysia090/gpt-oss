@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import importlib
+import importlib.machinery
 import importlib.util
-import pickle
 import json
+import pickle
 import struct
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -227,3 +230,39 @@ def test_transcript_logger_records_turn(tmp_path: Path) -> None:
     turn_entries = [entry for entry in lines if entry["type"] == "turn"]
     assert turn_entries and turn_entries[0]["prompt"] == "hello"
     assert turn_entries[0]["tools"] == ["browser"]
+
+
+def test_ensure_real_numpy_available_requires_numpy(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_find_spec = importlib.util.find_spec
+
+    def fake_find_spec(name: str, *args, **kwargs):  # noqa: ANN001, ANN002, D401 - test helper
+        if name == "numpy":
+            return None
+        return original_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        sera_chat._ensure_real_numpy_available()
+
+    assert "pip install numpy" in str(excinfo.value)
+
+
+def test_ensure_real_numpy_available_rejects_stub(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = ModuleType("numpy")
+    stub.__gpt_oss_numpy_stub__ = True  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "numpy", stub)
+
+    original_find_spec = importlib.util.find_spec
+
+    def fake_find_spec(name: str, *args, **kwargs):  # noqa: ANN001, ANN002, D401 - test helper
+        if name == "numpy":
+            return importlib.machinery.ModuleSpec("numpy", loader=None)
+        return original_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        sera_chat._ensure_real_numpy_available()
+
+    assert "pip install numpy" in str(excinfo.value)
