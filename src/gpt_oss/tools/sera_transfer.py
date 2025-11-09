@@ -1,19 +1,21 @@
-"""Public wrapper re-exporting the Sera transfer implementation."""
+"""Public wrapper that re-exports the Sera transfer implementation."""
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import sys
 from pathlib import Path
+from typing import Any
 
 try:
-    from . import _sera_transfer_impl as _impl
-except ImportError:  # pragma: no cover - fallback for direct loading
+    _impl = importlib.import_module("gpt_oss.tools._sera_transfer_impl")
+except ModuleNotFoundError:  # pragma: no cover - fallback for direct execution
     _impl_path = Path(__file__).resolve().with_name("_sera_transfer_impl.py")
     _impl_spec = importlib.util.spec_from_file_location(
         "gpt_oss.tools._sera_transfer_impl", _impl_path
     )
-    if _impl_spec is None or _impl_spec.loader is None:
+    if _impl_spec is None or _impl_spec.loader is None:  # pragma: no cover - defensive
         raise
     _impl_module = importlib.util.module_from_spec(_impl_spec)
     sys.modules.setdefault(_impl_spec.name, _impl_module)
@@ -29,7 +31,13 @@ for _name in dir(_impl):
         __all__.append(_name)
 
 
-if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    import sys
+def __getattr__(name: str) -> Any:  # pragma: no cover - simple delegation
+    return getattr(_impl, name)
 
+
+def __dir__() -> list[str]:  # pragma: no cover - simple delegation
+    return sorted(set(__all__ + [key for key in globals() if not key.startswith("_")]))
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
     sys.exit(_impl.main())
