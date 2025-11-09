@@ -1018,6 +1018,35 @@ def test_convert_continues_when_snapshot_generation_fails(tmp_path: Path, monkey
     assert snapshot_blob["metadata"]["runtime_snapshot_error"]["message"] == "snap failure"
 
 
+def test_convert_continues_when_runtime_loader_missing(tmp_path: Path, monkeypatch) -> None:
+    module = importlib.reload(sera_transfer)
+
+    def missing_loader():
+        raise ModuleNotFoundError("runtime unavailable")
+
+    monkeypatch.setattr(module, "_load_sera_runtime", missing_loader)
+
+    source = _create_checkpoint(tmp_path / "runtime_missing")
+    output = tmp_path / "output"
+
+    summary = module.convert(source, output, r=4, r_v=2, top_l=2)
+
+    assert summary.output == output
+
+    snapshot_path = output / "sera_state.pkl"
+    assert snapshot_path.exists()
+
+    snapshot_blob = pickle.loads(snapshot_path.read_bytes())
+    runtime_snapshot = snapshot_blob["sera_snapshot"]
+    assert runtime_snapshot["status"] == "error"
+    assert runtime_snapshot["error"]["type"] == "ModuleNotFoundError"
+    assert runtime_snapshot["error"]["message"] == "runtime unavailable"
+
+    metadata_error = snapshot_blob["metadata"]["runtime_snapshot_error"]
+    assert metadata_error["type"] == "ModuleNotFoundError"
+    assert metadata_error["message"] == "runtime unavailable"
+
+
 def test_deterministic_conversion(tmp_path: Path) -> None:
     source = _create_checkpoint(tmp_path / "deterministic")
     out_a = tmp_path / "out_a"
