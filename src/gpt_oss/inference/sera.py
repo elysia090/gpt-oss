@@ -2120,6 +2120,18 @@ class BridgeEntry:
 
 
 @dataclass(frozen=True)
+class BridgeReadInfo:
+    ctx: int
+    token: Optional[int]
+    best_hub: Optional[int]
+    best_cost: float
+    runner_up: float
+    guard_ok: bool
+    dictionary_hit: bool
+    projected: Tuple[float, ...]
+
+
+@dataclass(frozen=True)
 class BridgeProof:
     """64-byte proof record emitted by :meth:`BridgeState.read` (spec §10.3)."""
 
@@ -2159,6 +2171,7 @@ class BridgeState:
     _qdout: Dict[Tuple[int, int], float] = field(default_factory=dict)
     _generation: int = 0
     _projection: np.ndarray = field(init=False, repr=False)
+    _last_read: Optional["BridgeReadInfo"] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         matrix_data = [list(row) for row in self.config.projection]
@@ -2194,6 +2207,8 @@ class BridgeState:
             raise ValueError("Guard margin is below configured policy")
         if guard.eps_row < self.config.eps_row_policy:
             raise ValueError("Guard eps_row is below configured policy")
+        if not guard.check():
+            raise ValueError("Guard record does not satisfy published inequality")
         value_vec = self._coerce_value(value)
         self._store[(ctx, token)] = BridgeEntry(value_vec, guard, self._generation)
         self._hub_bits.setdefault(ctx, [0] * self.config.hub_window)
@@ -2286,6 +2301,11 @@ class BridgeState:
         best_hub, best_cost, runner_up_cost = self._best_route(ctx, token)
         guard_record = entry.guard if entry is not None else None
 
+        route_vector = self._route_projection_vector(
+            ctx, token, best_hub, best_cost, runner_up_cost
+        )
+        projection_input = self._coerce_value(route_vector)
+
         inferred_margin = float("nan")
         if best_hub is not None and math.isfinite(best_cost):
             if math.isfinite(runner_up_cost):
@@ -2315,8 +2335,7 @@ class BridgeState:
         if entry is not None and guard_ok:
             value = entry.value.copy()
         else:
-            fallback = best_cost if math.isfinite(best_cost) else 0.0
-            value = np.full(self.config.value_dim, float(fallback), dtype=float)
+            value = self._projection @ projection_input
 
         proof = BridgeProof(
             hub=best_hub or 0,
@@ -2329,6 +2348,17 @@ class BridgeState:
             ctx=ctx,
             token=token,
         ).pack()
+
+        self._last_read = BridgeReadInfo(
+            ctx=ctx,
+            token=token,
+            best_hub=best_hub,
+            best_cost=float(best_cost),
+            runner_up=float(runner_up_cost),
+            guard_ok=guard_ok,
+            dictionary_hit=entry is not None,
+            projected=tuple(float(v) for v in projection_input.tolist()),
+        )
 
         return value, guard_ok, proof
 
@@ -2389,6 +2419,35 @@ class BridgeState:
     def _empty_value(self) -> np.ndarray:
         return np.zeros(self.config.value_dim, dtype=float)
 
+    def _sanitize_route_scalar(self, value: float) -> float:
+        if not math.isfinite(value):
+            return 0.0
+        return float(value)
+
+    def _route_projection_vector(
+        self,
+        ctx: int,
+        token: Optional[int],
+        best_hub: Optional[int],
+        best_cost: float,
+        runner_up_cost: float,
+    ) -> Sequence[float]:
+        components: List[float] = []
+        components.append(self._sanitize_route_scalar(best_cost))
+        if token is None or best_hub is None:
+            components.extend([0.0, 0.0])
+        else:
+            dout = self._qdout.get((ctx, best_hub), float("inf"))
+            din = self._qdin.get((best_hub, token), float("inf"))
+            components.append(self._sanitize_route_scalar(dout))
+            components.append(self._sanitize_route_scalar(din))
+        if math.isfinite(best_cost) and math.isfinite(runner_up_cost):
+            gap = max(0.0, runner_up_cost - best_cost)
+        else:
+            gap = 0.0
+        components.append(self._sanitize_route_scalar(gap))
+        return components
+
     def advance_generation(self, generation: int) -> None:
         self._generation = generation
 
@@ -2399,6 +2458,10 @@ class BridgeState:
         if entry is None:
             return None
         return entry.guard
+
+    @property
+    def last_read_info(self) -> Optional["BridgeReadInfo"]:
+        return self._last_read
 
     def manifest(self) -> Dict[str, object]:
         config_blob = {
@@ -2743,12 +2806,39 @@ class TreeSearchConfig:
     enabled: bool = False
     cpuct: float = 1.0
     max_actions: int = 4
+    action_cap: int = 4
     action_priors: Tuple[float, ...] = (0.4, 0.3, 0.2, 0.1)
     action_rewards: Tuple[float, ...] = (0.2, 0.1, 0.05, -0.05)
     selection_depth: int = 4
     rollout_depth: int = 4
     backup_depth: int = 4
     discount: float = 0.9
+    epsilon: float = 0.0
+    value_loss: float = 1.0
+    reward_weights: Tuple[float, float, float, float] = (0.4, 0.2, 0.2, 0.2)
+    trust_weight: float = 0.2
+
+
+_TREE_SEARCH_ACTIONS: Tuple[str, ...] = (
+    "Hold",
+    "Route",
+    "Rebind",
+    "PromoteHint",
+    "OverlayHint",
+    "DenFloorBump",
+    "MemExcite",
+    "TokenProposal",
+)
+
+
+@dataclass(frozen=True)
+class TreeSearchObservation:
+    delta_accuracy: float = 0.0
+    dictionary_hit: bool = False
+    guard_ok: bool = False
+    route_cost: float = float("inf")
+    witness_quality: float = 0.0
+    trust_signal: float = 0.0
 
 
 @dataclass
@@ -2772,17 +2862,39 @@ class TreeSearchState:
     _priors: Tuple[float, ...] = field(init=False)
     _rewards: Tuple[float, ...] = field(init=False)
     _max_actions: int = field(init=False)
+    _action_cap: int = field(init=False)
     _selection_depth: int = field(init=False)
     _rollout_depth: int = field(init=False)
     _backup_depth: int = field(init=False)
     _discount: float = field(init=False)
+    _epsilon: float = field(init=False)
+    _value_loss: float = field(init=False)
+    _reward_weights: Tuple[float, float, float, float] = field(init=False)
+    _trust_weight: float = field(init=False)
+    _actions: Tuple[str, ...] = field(init=False)
+    _last_path_length: int = field(init=False, default=0)
+    _last_rollout_length: int = field(init=False, default=0)
+    _last_expanded: bool = field(init=False, default=False)
+    _observation: TreeSearchObservation = field(
+        init=False, default_factory=TreeSearchObservation
+    )
+    _rng_state: int = field(init=False, default=0)
 
     def __post_init__(self) -> None:
-        self._max_actions = max(1, min(self.config.max_actions, 4))
+        self._max_actions = max(1, min(self.config.max_actions, len(_TREE_SEARCH_ACTIONS)))
+        self._action_cap = max(1, min(self.config.action_cap, self._max_actions, 4))
         self._selection_depth = max(1, min(self.config.selection_depth, 4))
         self._rollout_depth = max(1, min(self.config.rollout_depth, 4))
         self._backup_depth = max(1, min(self.config.backup_depth, 4))
         self._discount = max(0.0, min(self.config.discount, 1.0))
+        self._epsilon = max(0.0, min(self.config.epsilon, 0.5))
+        self._value_loss = max(0.0, min(self.config.value_loss, 1.0))
+        weights = list(self.config.reward_weights[:4])
+        while len(weights) < 4:
+            weights.append(0.0)
+        self._reward_weights = tuple(float(w) for w in weights[:4])
+        self._trust_weight = _clamp(float(self.config.trust_weight), -1.0, 1.0)
+
         priors = list(self.config.action_priors[: self._max_actions])
         if not priors:
             priors = [1.0]
@@ -2800,20 +2912,33 @@ class TreeSearchState:
         while len(rewards) < self._max_actions:
             rewards.append(rewards[-1])
         self._rewards = tuple(
-            max(-1.0, min(1.0, r)) for r in rewards[: self._max_actions]
+            _clamp(float(r), -1.0, 1.0) for r in rewards[: self._max_actions]
         )
+
+        self._actions = _TREE_SEARCH_ACTIONS[: self._max_actions]
+        self._rng_state = _mix64(self._max_actions)
 
         self._root = TreeNode(action_index=None)
 
     def maybe_select(self) -> None:
         if not self.config.enabled:
+            self._last_path_length = 0
+            self._last_rollout_length = 0
+            self._last_expanded = False
             return
         self._simulate()
         self._simulations = min(self._simulations + 1, 2**31 - 1)
 
+    def observe_event(self, observation: TreeSearchObservation) -> None:
+        self._observation = observation
+
     # ------------------------------------------------------------------
     # Internal helpers implementing best-of-two selection and bounded MCTS
     # ------------------------------------------------------------------
+
+    def _rand_float(self) -> float:
+        self._rng_state = _mix64(self._rng_state + 1)
+        return (self._rng_state & _HASH_MASK) / float(1 << 64)
 
     def _allowed_children(self, node: TreeNode) -> int:
         allowed = 1
@@ -2821,7 +2946,7 @@ class TreeSearchState:
             allowed += 1
         if node.visits >= 4:
             allowed += 1
-        return min(allowed, self._max_actions)
+        return min(allowed, self._action_cap)
 
     def _score(self, parent: TreeNode, child: TreeNode, index: int) -> float:
         prior = self._priors[index]
@@ -2839,10 +2964,13 @@ class TreeSearchState:
             return idx_b
         return idx_a
 
-    def _select(self) -> Tuple[List[Tuple[TreeNode, int, TreeNode]], TreeNode]:
+    def _select(
+        self,
+    ) -> Tuple[List[Tuple[TreeNode, int, TreeNode]], TreeNode, bool]:
         node = self._root
         path: List[Tuple[TreeNode, int, TreeNode]] = []
         depth = 0
+        expanded = False
         while depth < self._selection_depth:
             allowed = self._allowed_children(node)
             if len(node.children) < allowed:
@@ -2850,7 +2978,8 @@ class TreeSearchState:
                 child = TreeNode(action_index=index)
                 node.children.append(child)
                 path.append((node, index, child))
-                return path, child
+                expanded = True
+                return path, child, expanded
             if not node.children:
                 break
             allowed_indices = min(len(node.children), allowed)
@@ -2861,19 +2990,26 @@ class TreeSearchState:
             path.append((node, best_index, child))
             node = child
             depth += 1
-        return path, node
+        return path, node, expanded
 
     def _rollout(self, leaf: TreeNode) -> float:
         base_index = leaf.action_index or 0
         reward = 0.0
         discount = 1.0
+        steps = 0
+        action_count = max(1, len(self._actions))
         for step in range(self._rollout_depth):
-            idx = (base_index + step) % len(self._rewards)
-            reward += discount * self._rewards[idx]
+            idx = (base_index + step) % action_count
+            if self._epsilon > 0.0 and self._rand_float() < self._epsilon:
+                idx = int(self._rand_float() * action_count) % action_count
+            reward += discount * self._action_reward(idx)
             discount *= self._discount
-        return max(-1.0, min(1.0, reward))
+            steps += 1
+        self._last_rollout_length = steps
+        return _clamp(reward, -1.0, 1.0)
 
     def _backup(self, path: List[Tuple[TreeNode, int, TreeNode]], reward: float) -> None:
+        reward = _clamp(reward, -self._value_loss, self._value_loss)
         if not path:
             self._root.visits = min(self._root.visits + 1, 2**31 - 1)
             self._root.value_sum = max(
@@ -2884,7 +3020,10 @@ class TreeSearchState:
         steps = path[-min(len(path), self._backup_depth):]
         for parent, index, child in reversed(steps):
             child.visits = min(child.visits + 1, 2**31 - 1)
-            child.value_sum = max(-float(child.visits), min(float(child.visits), child.value_sum + reward))
+            child.value_sum = max(
+                -float(child.visits),
+                min(float(child.visits), child.value_sum + reward),
+            )
             parent.visits = min(parent.visits + 1, 2**31 - 1)
             parent.value_sum = max(
                 -float(parent.visits),
@@ -2892,9 +3031,63 @@ class TreeSearchState:
             )
 
     def _simulate(self) -> None:
-        path, leaf = self._select()
+        path, leaf, expanded = self._select()
+        self._last_path_length = len(path)
+        self._last_expanded = expanded
         reward = self._rollout(leaf)
         self._backup(path, reward)
+
+    def _action_reward(self, index: int) -> float:
+        if not (0 <= index < len(self._actions)):
+            return 0.0
+        obs = self._observation
+        delta = _clamp(float(obs.delta_accuracy), -1.0, 1.0)
+        hit = 1.0 if obs.dictionary_hit else 0.0
+        guard = 1.0 if obs.guard_ok else -1.0
+        witness = _clamp(float(obs.witness_quality), 0.0, 1.0)
+        trust = _clamp(float(obs.trust_signal), -1.0, 1.0)
+        cost_term = 0.0
+        if math.isfinite(obs.route_cost) and obs.route_cost >= 0.0:
+            cost_term = math.exp(-min(float(obs.route_cost), 32.0))
+        cost_penalty = 1.0 - cost_term
+        linear = (
+            self._reward_weights[0] * delta
+            + self._reward_weights[1] * hit
+            + self._reward_weights[2] * guard
+            - self._reward_weights[3] * cost_penalty
+        )
+        gated = (0.5 + 0.5 * witness) * linear
+        reward = gated + self._trust_weight * trust + self._rewards[index]
+        return _clamp(reward, -1.0, 1.0)
+
+    def stats(self) -> Dict[str, int]:
+        return {
+            "simulations": self._simulations,
+            "expanded": 1 if self._last_expanded else 0,
+            "path_len": self._last_path_length,
+            "rollout_len": self._last_rollout_length,
+        }
+
+    def manifest(self) -> Dict[str, object]:
+        return {
+            "enabled": bool(self.config.enabled),
+            "actions": list(self._actions),
+            "constants": {
+                "A_max": self._max_actions,
+                "A_cap": self._action_cap,
+                "H_sel": self._selection_depth,
+                "H_roll": self._rollout_depth,
+                "H_backup": self._backup_depth,
+                "c_puct": float(self.config.cpuct),
+                "discount": float(self._discount),
+                "epsilon": float(self._epsilon),
+                "value_loss": float(self._value_loss),
+            },
+            "priors": [float(p) for p in self._priors],
+            "base_rewards": [float(r) for r in self._rewards],
+            "reward_weights": [float(w) for w in self._reward_weights],
+            "trust_weight": float(self._trust_weight),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -3368,6 +3561,9 @@ class SeraDiagnostics:
     bridge_hits: int = 0
     bridge_misses: int = 0
     tree_simulations: int = 0
+    tree_expansions: int = 0
+    tree_path_len: int = 0
+    tree_rollout_len: int = 0
     bridge_last_proof: bytes = field(default=b"", repr=False)
     p99_window: int = 128
     store_load_samples: Tuple[float, ...] = field(default_factory=tuple, repr=False)
@@ -3594,8 +3790,33 @@ class Sera:
                 beta_cap_override=trust.beta_cap,
             )
 
+            if bridge_ctx is not None:
+                last_read = self.bridge.last_read_info
+            else:
+                last_read = None
+            route_cost = (
+                float(last_read.best_cost)
+                if last_read is not None and math.isfinite(last_read.best_cost)
+                else float("inf")
+            )
+            dictionary_hit = bool(last_read.dictionary_hit) if last_read is not None else False
+            delta_accuracy = float(bridged) - float(gated)
+            trust_signal = float(trust.decision)
+            observation = TreeSearchObservation(
+                delta_accuracy=delta_accuracy,
+                dictionary_hit=dictionary_hit,
+                guard_ok=bool(guard),
+                route_cost=route_cost,
+                witness_quality=float(corrector_result.s_witness),
+                trust_signal=trust_signal,
+            )
+            self.tree_search.observe_event(observation)
             self.tree_search.maybe_select()
-            self.diagnostics.tree_simulations = self.tree_search._simulations
+            stats = self.tree_search.stats()
+            diag.tree_simulations = stats["simulations"]
+            diag.tree_expansions = stats["expanded"]
+            diag.tree_path_len = stats["path_len"]
+            diag.tree_rollout_len = stats["rollout_len"]
             self.diagnostics.lambda_star = self.config.lambda_floor
 
             store = self.linear._weights
@@ -3886,6 +4107,7 @@ class Sera:
             "linear": self.linear.manifest(),
             "bridge": self.bridge.manifest(),
             "corrector": self.corrector.manifest(),
+            "search": self.tree_search.manifest(),
             "balancer_proof": self.balancer.certificate.as_dict(),
             "diagnostics": self.diagnostics_record(),
         }

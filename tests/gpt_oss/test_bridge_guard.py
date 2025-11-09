@@ -85,3 +85,63 @@ def test_bridge_read_requires_margin_consistency() -> None:
     bridge_value, guard_ok, _ = bridge.read(ctx, token)
     assert not guard_ok
     np.testing.assert_allclose(bridge_value, np.array([1.0], dtype=float))
+
+
+def test_bridge_last_read_info_tracks_route_projection() -> None:
+    config = BridgeConfig(hub_window=1, candidate_bound=4, projection=((1.0,),))
+    bridge = BridgeState(config)
+
+    ctx = 11
+    token = 23
+
+    bridge.set_hub(ctx, 0)
+    bridge.set_hub(token, 0)
+    for hub in (0, 1):
+        bridge.set_hub(ctx, hub)
+        bridge.set_hub(token, hub)
+
+    bridge.set_qdout(ctx, 0, 0.2)
+    bridge.set_qdin(0, token, 0.3)
+    bridge.set_qdout(ctx, 1, 1.1)
+    bridge.set_qdin(1, token, 1.4)
+
+    bridge.promote(
+        ctx,
+        token,
+        np.array([4.0], dtype=float),
+        guard_margin=1.6,
+        guard_eps_row=0.05,
+        leg_bound_in=0.1,
+        leg_bound_out=0.1,
+        competitor_bounds=(0.2,),
+    )
+
+    value, guard_ok, _ = bridge.read(ctx, token)
+    assert guard_ok
+    np.testing.assert_allclose(value, np.array([4.0], dtype=float))
+    info = bridge.last_read_info
+    assert info is not None
+    assert info.best_hub == 0
+    assert info.guard_ok is True
+    assert info.dictionary_hit is True
+    assert info.projected == (0.5,)
+
+    bridge.promote(
+        ctx,
+        token,
+        np.array([4.0], dtype=float),
+        guard_margin=4.0,
+        guard_eps_row=0.05,
+        leg_bound_in=0.1,
+        leg_bound_out=0.1,
+        competitor_bounds=(0.2,),
+    )
+
+    fallback, guard_ok, _ = bridge.read(ctx, token)
+    assert not guard_ok
+    np.testing.assert_allclose(fallback, np.array([0.5], dtype=float))
+    info = bridge.last_read_info
+    assert info is not None
+    assert info.guard_ok is False
+    assert info.dictionary_hit is True
+    assert info.projected == (0.5,)
