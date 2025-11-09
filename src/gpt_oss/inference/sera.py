@@ -1347,6 +1347,18 @@ class TrustGateDecision:
         }
 
 
+@dataclass(frozen=True)
+class _TrustWitness:
+    """Compact representation of a per-salt trust witness."""
+
+    salt: int
+    ext_digest: Tuple[int, int, int]
+    choice: Tuple[int, int, int]
+    element_hashes: Tuple[int, ...]
+    edge_pairs: Tuple[Tuple[int, int, int], ...]
+    digest: int
+
+
 class TrustGateState:
     """Deterministic verifier implementing the trust gate (spec §6.4)."""
 
@@ -1355,6 +1367,34 @@ class TrustGateState:
     def __init__(self, config: TrustGateConfig) -> None:
         self.config = config
         self._projections = self._build_projections(config)
+        self._salt_keys = tuple(
+            _mix64(salt + 1, 0xC8E90B9F27F4A7D3) or 1 for salt in range(config.salts)
+        )
+        self._salt_choice_keys = tuple(
+            _mix64(salt + 1, 0xA4093822299F31D0) or 1
+            for salt in range(config.salts)
+        )
+        self._salt_choice_keys_2 = tuple(
+            _mix64(salt + 1, 0x13198A2E03707344) or 1
+            for salt in range(config.salts)
+        )
+        element_indices: List[Tuple[int, ...]] = []
+        element_rotations: List[Tuple[int, ...]] = []
+        for salt in range(config.salts):
+            base_seed = _mix64(salt + 1, 0x243F6A8885A308D3)
+            indices: List[int] = []
+            rotations: List[int] = []
+            for slot in range(3):
+                mixed = _mix64(base_seed, slot + 1)
+                index = int(mixed % config.dimension) if config.dimension > 0 else 0
+                rotation = 7 + int(mixed % 17)
+                indices.append(index)
+                rotations.append(rotation)
+            element_indices.append(tuple(indices))
+            element_rotations.append(tuple(rotations))
+        self._element_indices = tuple(element_indices)
+        self._element_rotations = tuple(element_rotations)
+        self._p_prime = (1 << 61) - 1
         norm_list: List[float] = []
         for row in self._projections:
             norm_sq = 0.0
@@ -1449,20 +1489,50 @@ class TrustGateState:
         neg = False
         pos_count = 0
         digest = 0
-        seen_hashes: Set[int] = set()
         consistent = True
+        collisions = 0
+        witness_map: Dict[Tuple[int, int, int], Tuple[int, int, int]] = {}
+        seen_choices: Set[int] = set()
+        edge_orientations: Dict[Tuple[int, int], int] = {}
         for salt, value in enumerate(projections):
             value = _clamp(float(value), -1.0, 1.0)
             if value <= self.config.neg_threshold:
                 neg = True
                 digest ^= _mix64(salt + 1, 0)
-            elif value >= self.config.pos_threshold:
-                pos_count += 1
-                witness_hash = _mix64(salt + 1, int(round((value + 1.0) * 1_000_000)))
-                if witness_hash in seen_hashes:
-                    consistent = False
-                seen_hashes.add(witness_hash)
-                digest ^= witness_hash
+                continue
+            if value < self.config.pos_threshold:
+                continue
+            witness = self._build_witness(salt, trust_vec)
+            pos_count += 1
+            existing = witness_map.get(witness.ext_digest)
+            if existing is None:
+                witness_map[witness.ext_digest] = witness.choice
+            elif existing != witness.choice:
+                consistent = False
+            digest ^= witness.digest
+            choice_key = witness.choice[2]
+            if choice_key in seen_choices:
+                collisions += 1
+            seen_choices.add(choice_key)
+            if len(set(witness.element_hashes)) != len(witness.element_hashes):
+                neg = True
+            for left_hash, right_hash, edge_hash in witness.edge_pairs:
+                digest ^= edge_hash
+                if left_hash == right_hash:
+                    neg = True
+                    continue
+                orientation_key = (
+                    min(left_hash, right_hash),
+                    max(left_hash, right_hash),
+                )
+                orientation = 1 if left_hash <= right_hash else -1
+                prev = edge_orientations.get(orientation_key)
+                if prev is None:
+                    edge_orientations[orientation_key] = orientation
+                elif prev != orientation:
+                    neg = True
+            if neg:
+                consistent = False
         decision = 0
         beta_min = self.config.beta_min
         beta_cap = 0.0
@@ -1476,26 +1546,18 @@ class TrustGateState:
                 llr = self.config.logit_pi0 + pos_count * self.config.log_bf_pos
                 if llr >= gamma:
                     decision = 1
-                else:
-                    decision = 0
-            else:
-                decision = 0
             if decision > 0:
                 beta_min = self.config.beta_boost
                 beta_cap = self.config.beta_max
             elif decision == 0:
                 beta_min = self.config.beta_min
                 beta_cap = self.config.alpha_unknown * self.config.beta_max
-            else:
-                beta_min = self.config.beta_min
-                beta_cap = 0.0
-            if decision < 0:
-                beta_cap = 0.0
         if decision < 0:
             beta_min = 0.0
+            beta_cap = 0.0
         elif beta_cap > 0.0:
             beta_min = min(beta_min, beta_cap)
-        audit = self._audit(decision, pos_count, llr, gamma, digest, len(seen_hashes))
+        audit = self._audit(decision, pos_count, llr, gamma, digest, collisions)
         return TrustGateDecision(
             decision=decision,
             m=pos_count,
@@ -1506,6 +1568,81 @@ class TrustGateState:
             beta_min=beta_min,
             beta_cap=beta_cap,
         )
+
+    def _build_witness(self, salt: int, trust_vec: np.ndarray) -> _TrustWitness:
+        element_hashes = self._element_hashes(salt, trust_vec)
+        ext_digest = self._ext_digest(element_hashes)
+        choice = self._choice_digest(salt, element_hashes)
+        edge_pairs = self._edge_pairs(salt, element_hashes)
+        digest = ext_digest[0] ^ ext_digest[1] ^ choice[0] ^ choice[1] ^ choice[2]
+        for _, _, edge_hash in edge_pairs:
+            digest ^= edge_hash
+        return _TrustWitness(
+            salt=salt,
+            ext_digest=ext_digest,
+            choice=choice,
+            element_hashes=element_hashes,
+            edge_pairs=edge_pairs,
+            digest=digest & _HASH_MASK,
+        )
+
+    def _element_hashes(self, salt: int, trust_vec: np.ndarray) -> Tuple[int, ...]:
+        indices = self._element_indices[salt]
+        hashes: List[int] = []
+        for slot, index in enumerate(indices):
+            value = trust_vec[index]
+            quant = self._quantize(value, slot)
+            hashes.append(self._hash_element(salt, index, quant))
+        return tuple(hashes)
+
+    def _quantize(self, value: float, slot: int) -> int:
+        clipped = _clamp(float(value), -1.0, 1.0)
+        scaled = int(round((clipped + 1.0) * 32767.0))
+        return ((scaled & 0xFFFF) << 4) | (slot & 0xF)
+
+    def _hash_element(self, salt: int, index: int, quant: int) -> int:
+        payload = ((index + 1) << 32) ^ quant
+        return _mix64(payload, self._salt_keys[salt])
+
+    def _ext_digest(self, hashes: Sequence[int]) -> Tuple[int, int, int]:
+        xor = 0
+        total = 0
+        for value in hashes:
+            xor ^= value
+            total = (total + (value & _HASH_MASK)) % self._p_prime
+        return xor & _HASH_MASK, total, len(hashes)
+
+    def _choice_digest(
+        self, salt: int, hashes: Sequence[int]
+    ) -> Tuple[int, int, int]:
+        best: Optional[Tuple[int, int, int]] = None
+        key1 = self._salt_choice_keys[salt]
+        key2 = self._salt_choice_keys_2[salt]
+        for value in hashes:
+            h1 = _mix64(value, key1)
+            h2 = _mix64(value, key2)
+            candidate = (h1 & _HASH_MASK, h2 & _HASH_MASK, value & _HASH_MASK)
+            if best is None or candidate < best:
+                best = candidate
+        if best is None:
+            best = (0, 0, 0)
+        return best
+
+    def _edge_pairs(
+        self, salt: int, hashes: Sequence[int]
+    ) -> Tuple[Tuple[int, int, int], ...]:
+        if not hashes:
+            return tuple()
+        pairs: List[Tuple[int, int, int]] = []
+        rotations = self._element_rotations[salt]
+        count = len(hashes)
+        for idx in range(count):
+            left = hashes[idx]
+            right = hashes[(idx + 1) % count]
+            rotation = rotations[idx % len(rotations)]
+            edge_hash = left ^ _rotl64(right, rotation)
+            pairs.append((left, right, edge_hash & _HASH_MASK))
+        return tuple(pairs)
 
 
 # ---------------------------------------------------------------------------
@@ -4185,6 +4322,13 @@ _BIDI_CONTROL_CODEPOINTS: Set[int] = {
 }
 _DISALLOWED_UNICODE_POINTS: Set[int] = set(_BIDI_CONTROL_CODEPOINTS)
 _DISALLOWED_UNICODE_POINTS.add(0x200D)  # ZERO WIDTH JOINER
+
+
+def _rotl64(value: int, shift: int) -> int:
+    shift &= 63
+    if shift == 0:
+        return value & _HASH_MASK
+    return ((value << shift) | (value >> (64 - shift))) & _HASH_MASK
 
 
 def _mix64(value: int, seed: int = 0) -> int:
