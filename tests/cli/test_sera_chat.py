@@ -162,11 +162,11 @@ def test_dashboard_formatter_snapshot() -> None:
         "trust_gamma": 0.07,
         "trust_beta_min": 0.1,
         "trust_beta_cap": 0.9,
-        "cfr_mode": "ACTIVE",
-        "cfr_beta": 0.5,
-        "cfr_guard": True,
-        "cfr_health_ok": False,
-        "cfr_y_cfr": 1.2,
+        "corrector_mode": "CORRECTOR-MIX",
+        "corrector_beta": 0.5,
+        "corrector_guard": True,
+        "corrector_health_ok": False,
+        "corrector_y_corrector": 1.2,
     }
     output = sera_chat._format_dashboard(
         diag,
@@ -180,7 +180,7 @@ def test_dashboard_formatter_snapshot() -> None:
         "capacity(load/slack/margin)=0.40/0.60/0.10 frozen=True\n"
         "  attention: updates=11 clip=0.33 min_den=0.02 lambda*=0.90 tree_sims=5\n"
         "  trust: m=4 gamma=0.07 beta=[0.10, 0.90]\n"
-        "  cfr: mode=ACTIVE beta=0.50 guard=True health=False y_cfr=1.20"
+        "  corrector: mode=CORRECTOR-MIX beta=0.50 guard=True health=False y=1.20"
     )
     assert output == expected
 
