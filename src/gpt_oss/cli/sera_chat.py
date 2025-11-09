@@ -17,6 +17,7 @@ decision on which integrations to enable.
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.util
 import json
 import os
@@ -39,6 +40,24 @@ from typing import (
     List,
     TextIO,
 )
+
+
+_NUMPY_REQUIREMENT_MSG = (
+    "gpt-oss-sera-chat requires the real numpy package. "
+    "Install it with 'pip install numpy'."
+)
+
+
+def _ensure_real_numpy_available() -> None:
+    """Ensure the runtime can rely on a real numpy installation."""
+
+    spec = importlib.util.find_spec("numpy")
+    if spec is None:
+        raise ModuleNotFoundError(_NUMPY_REQUIREMENT_MSG)
+
+    module = importlib.import_module("numpy")
+    if getattr(module, "__gpt_oss_numpy_stub__", False):
+        raise ModuleNotFoundError(_NUMPY_REQUIREMENT_MSG)
 
 if TYPE_CHECKING:  # pragma: no cover - import only used for type checkers
     from gpt_oss.inference.sera import Sera
@@ -329,6 +348,7 @@ class TranscriptLogger:
 
 
 def _load_sera_class():
+    _ensure_real_numpy_available()
     sera_path = Path(__file__).resolve().parents[1] / "inference" / "sera.py"
     spec = importlib.util.spec_from_file_location("_sera_runtime", sera_path)
     if spec is None or spec.loader is None:  # pragma: no cover - defensive
