@@ -2663,53 +2663,72 @@ def convert(
             except Exception:  # pragma: no cover - extremely defensive
                 base_config = None
 
-            if base_config is not None and dataclasses.is_dataclass(base_config):
-                pieces = tokenizer_meta.get("pieces", [])
-                tokenizer_vocab = {piece: token for piece, token in pieces}
-                max_piece_length = tokenizer_meta.get(
-                    "max_piece_length", base_config.tokenizer.max_piece_length
+            runtime_snapshot_error: Dict[str, str] | None = None
+            try:
+                if base_config is not None and dataclasses.is_dataclass(base_config):
+                    pieces = tokenizer_meta.get("pieces", [])
+                    tokenizer_vocab = {piece: token for piece, token in pieces}
+                    max_piece_length = tokenizer_meta.get(
+                        "max_piece_length", base_config.tokenizer.max_piece_length
+                    )
+                    tokenizer_config = dataclasses.replace(
+                        base_config.tokenizer,
+                        vocabulary=tokenizer_vocab,
+                        max_piece_length=max_piece_length,
+                    )
+                    whitening_sig2 = metadata["attention"].get("whitening_sig2") or [1.0]
+                    beta_floor = max(1e-3, min(float(value) for value in whitening_sig2))
+                    value_dim = len(overlays.get("overlays_U", [])) or cfg.d_model
+                    attention_config = dataclasses.replace(
+                        base_config.attention,
+                        dim=cfg.d_model,
+                        value_dim=value_dim,
+                        features=local_r,
+                        tau=getattr(cfg, "tau", base_config.attention.tau),
+                        beta_floor=beta_floor,
+                    )
+                    linear_capacity = max(
+                        len(linear_meta.get("keys", [])), base_config.linear.capacity
+                    )
+                    linear_config = dataclasses.replace(
+                        base_config.linear, capacity=linear_capacity
+                    )
+                    bridge_config = dataclasses.replace(
+                        base_config.bridge,
+                        hub_window=max(
+                            base_config.bridge.hub_window, bridge_meta.get("legs", 0) * 4
+                        ),
+                    )
+                    sera_config = dataclasses.replace(
+                        base_config,
+                        tokenizer=tokenizer_config,
+                        attention=attention_config,
+                        linear=linear_config,
+                        bridge=bridge_config,
+                    )
+                    sera_model = sera_cls(sera_config)
+                    runtime_snapshot = sera_model.snapshot()
+                else:
+                    config_instance = base_config if base_config is not None else object()
+                    sera_model = sera_cls(config_instance)
+                    runtime_snapshot = sera_model.snapshot()
+            except Exception as exc:  # pragma: no cover - defensive continuation
+                logger.warning(
+                    "Failed to materialise Sera runtime snapshot; continuing without runtime state (%s: %s)",
+                    exc.__class__.__name__,
+                    exc,
+                    exc_info=True,
                 )
-                tokenizer_config = dataclasses.replace(
-                    base_config.tokenizer,
-                    vocabulary=tokenizer_vocab,
-                    max_piece_length=max_piece_length,
-                )
-                whitening_sig2 = metadata["attention"].get("whitening_sig2") or [1.0]
-                beta_floor = max(1e-3, min(float(value) for value in whitening_sig2))
-                value_dim = len(overlays.get("overlays_U", [])) or cfg.d_model
-                attention_config = dataclasses.replace(
-                    base_config.attention,
-                    dim=cfg.d_model,
-                    value_dim=value_dim,
-                    features=local_r,
-                    tau=getattr(cfg, "tau", base_config.attention.tau),
-                    beta_floor=beta_floor,
-                )
-                linear_capacity = max(
-                    len(linear_meta.get("keys", [])), base_config.linear.capacity
-                )
-                linear_config = dataclasses.replace(
-                    base_config.linear, capacity=linear_capacity
-                )
-                bridge_config = dataclasses.replace(
-                    base_config.bridge,
-                    hub_window=max(
-                        base_config.bridge.hub_window, bridge_meta.get("legs", 0) * 4
-                    ),
-                )
-                sera_config = dataclasses.replace(
-                    base_config,
-                    tokenizer=tokenizer_config,
-                    attention=attention_config,
-                    linear=linear_config,
-                    bridge=bridge_config,
-                )
-                sera_model = sera_cls(sera_config)
-                runtime_snapshot = sera_model.snapshot()
-            else:
-                config_instance = base_config if base_config is not None else object()
-                sera_model = sera_cls(config_instance)
-                runtime_snapshot = sera_model.snapshot()
+                runtime_snapshot_error = {
+                    "type": exc.__class__.__name__,
+                    "message": str(exc),
+                }
+                runtime_snapshot = {
+                    "status": "error",
+                    "error": runtime_snapshot_error,
+                }
+            if runtime_snapshot_error is not None:
+                metadata["runtime_snapshot_error"] = runtime_snapshot_error
 
             snapshot_path = output / "sera_state.pkl"
             snapshot = {
