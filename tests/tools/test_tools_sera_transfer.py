@@ -834,6 +834,54 @@ def test_cli_verbose_emits_search_hints(tmp_path: Path) -> None:
     assert "Constructing bridge records" in log_output
 
 
+def test_cli_produces_conversion_artifacts(tmp_path: Path) -> None:
+    """End-to-end CLI conversion should emit manifest, arrays, and snapshot."""
+
+    source = _create_openai_checkpoint(tmp_path / "cli_conversion")
+    output = tmp_path / "sera_out"
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "gpt_oss.tools.sera_transfer",
+        "--source",
+        str(source),
+        "--output",
+        str(output),
+        "--r",
+        "4",
+        "--rv",
+        "2",
+        "--topL",
+        "2",
+    ]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join([str(ROOT / "src"), str(ROOT)])
+
+    completed = subprocess.run(
+        cmd,
+        check=True,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    stdout = completed.stdout
+    assert "Sera Transfer Conversion Summary" in stdout
+
+    manifest = output / "sera_manifest.bin"
+    arrays_dir = output / "arrays"
+    snapshot = output / "sera_state.pkl"
+
+    assert manifest.is_file()
+    assert manifest.stat().st_size > 0
+    assert arrays_dir.is_dir()
+    assert any(arrays_dir.glob("*.bin"))
+    assert snapshot.is_file()
+    assert snapshot.stat().st_size > 0
+
+
 def test_format_model_config_keys_preserves_remaining_order() -> None:
     config = {
         "zeta": 0,
