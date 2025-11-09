@@ -2071,10 +2071,29 @@ class BridgeGuardRecord:
     def check(self) -> bool:
         """Evaluate the guard inequality from spec §10.5."""
 
-        half_margin = 0.5 * float(self.margin) + float(self.eps_row)
-        if float(self.leg_bound_in) + float(self.leg_bound_out) >= half_margin:
+        margin = float(self.margin)
+        eps_row = float(self.eps_row)
+        leg_in = float(self.leg_bound_in)
+        leg_out = float(self.leg_bound_out)
+        competitor_bounds = tuple(float(b) for b in self.competitor_bounds)
+
+        if not math.isfinite(margin) or margin <= 0.0:
             return False
-        return all(float(bound) < half_margin for bound in self.competitor_bounds)
+        if not math.isfinite(eps_row) or eps_row < 0.0:
+            return False
+        if not math.isfinite(leg_in) or leg_in < 0.0:
+            return False
+        if not math.isfinite(leg_out) or leg_out < 0.0:
+            return False
+        if any((not math.isfinite(b) or b < 0.0) for b in competitor_bounds):
+            return False
+
+        half_margin = 0.5 * margin + eps_row
+        if half_margin <= 0.0:
+            return False
+        if leg_in + leg_out >= half_margin:
+            return False
+        return all(bound < half_margin for bound in competitor_bounds)
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -2230,19 +2249,23 @@ class BridgeState:
 
     def _best_route(
         self, ctx: int, token: Optional[int]
-    ) -> Tuple[Optional[int], float]:
+    ) -> Tuple[Optional[int], float, float]:
         if token is None:
-            return None, float("inf")
+            return None, float("inf"), float("inf")
         best_cost = float("inf")
+        runner_up = float("inf")
         best_hub: Optional[int] = None
         for hub in self._enumerate_hubs(ctx, token):
             din = self._qdin.get((hub, token), float("inf"))
             dout = self._qdout.get((ctx, hub), float("inf"))
             cost = din + dout
             if cost < best_cost:
+                runner_up = best_cost
                 best_cost = cost
                 best_hub = hub
-        return best_hub, best_cost
+            elif cost < runner_up:
+                runner_up = cost
+        return best_hub, best_cost, runner_up
 
     def read(self, ctx: int, token: Optional[int]) -> Tuple[np.ndarray, bool, bytes]:
         if token is None:
@@ -2260,12 +2283,33 @@ class BridgeState:
             return self._empty_value(), False, proof
 
         entry = self._store.get((ctx, token))
-        best_hub, best_cost = self._best_route(ctx, token)
+        best_hub, best_cost, runner_up_cost = self._best_route(ctx, token)
         guard_record = entry.guard if entry is not None else None
+
+        inferred_margin = float("nan")
+        if best_hub is not None and math.isfinite(best_cost):
+            if math.isfinite(runner_up_cost):
+                inferred_margin = runner_up_cost - best_cost
+            else:
+                inferred_margin = float("inf")
+
+        margin_consistent = False
+        if guard_record is not None:
+            guard_margin = float(guard_record.margin)
+            inferred_positive = inferred_margin > 0.0
+            if math.isfinite(inferred_margin):
+                margin_consistent = (
+                    inferred_positive
+                    and guard_margin <= inferred_margin + 1e-12
+                )
+            else:
+                margin_consistent = inferred_positive
+
         guard_ok = (
-            bool(guard_record.check()) and best_hub is not None
-            if guard_record is not None
-            else False
+            guard_record is not None
+            and bool(guard_record.check())
+            and margin_consistent
+            and best_hub is not None
         )
 
         if entry is not None and guard_ok:
