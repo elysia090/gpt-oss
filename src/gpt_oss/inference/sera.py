@@ -1245,7 +1245,7 @@ class FusionState:
 
 @dataclass(frozen=True)
 class TrustGateConfig:
-    dimension: int = 16
+    dimension: int = 24
     salts: int = 5
     acceptance_k: int = 3
     neg_threshold: float = -0.25
@@ -1377,6 +1377,9 @@ class TrustGateState:
         return matrix
 
     def _default_vector(self, diagnostics: "SeraDiagnostics") -> np.ndarray:
+        mode = (diagnostics.cfr_mode or "").upper()
+        if mode not in {"OFF", "CFR-REPLAY", "CFR-MIX"}:
+            mode = "OFF"
         features = [
             _safe_tanh(diagnostics.attention_den_min, scale=10.0),
             _safe_tanh(diagnostics.attention_clip_rate, scale=1.0),
@@ -1393,6 +1396,14 @@ class TrustGateState:
             _safe_tanh(diagnostics.tokenizer_probe_max, scale=32.0),
             _safe_tanh(diagnostics.tok_emitted % 1024, scale=1024.0),
             _safe_tanh(diagnostics.tok_bytes_in % 1024, scale=1024.0),
+            _safe_tanh(diagnostics.cfr_beta, scale=1.0),
+            _safe_tanh(diagnostics.cfr_y_cfr, scale=1.0),
+            float(bool(diagnostics.cfr_guard)),
+            float(bool(diagnostics.cfr_health_ok)),
+            float(mode == "CFR-MIX"),
+            float(mode == "CFR-REPLAY"),
+            float(mode == "OFF"),
+            _safe_tanh(diagnostics.tree_simulations, scale=16.0),
             1.0,
         ]
         if len(features) < self.config.dimension:
