@@ -982,6 +982,42 @@ def test_convert_handles_stat_failure(tmp_path: Path, monkeypatch) -> None:
     assert (output / "sera_manifest.bin").exists()
 
 
+def test_convert_continues_when_snapshot_generation_fails(tmp_path: Path, monkeypatch) -> None:
+    module = importlib.reload(sera_transfer)
+
+    class DummyConfig:
+        pass
+
+    class BrokenSera:
+        def __init__(self, config):  # noqa: D401,ARG002 - signature matches runtime expectation
+            self.config = config
+
+        def snapshot(self):  # noqa: D401 - simple stub method
+            raise RuntimeError("snap failure")
+
+    def broken_loader():
+        return BrokenSera, DummyConfig
+
+    monkeypatch.setattr(module, "_load_sera_runtime", broken_loader)
+
+    source = _create_checkpoint(tmp_path / "snapshot_failure")
+    output = tmp_path / "output"
+
+    summary = module.convert(source, output, r=4, r_v=2, top_l=2)
+
+    assert summary.output == output
+    snapshot_path = output / "sera_state.pkl"
+    json_path = output / "sera_state.json"
+    assert snapshot_path.exists()
+    assert json_path.exists()
+
+    snapshot_blob = pickle.loads(snapshot_path.read_bytes())
+    runtime_snapshot = snapshot_blob["sera_snapshot"]
+    assert runtime_snapshot["status"] == "error"
+    assert runtime_snapshot["error"]["type"] == "RuntimeError"
+    assert snapshot_blob["metadata"]["runtime_snapshot_error"]["message"] == "snap failure"
+
+
 def test_deterministic_conversion(tmp_path: Path) -> None:
     source = _create_checkpoint(tmp_path / "deterministic")
     out_a = tmp_path / "out_a"
