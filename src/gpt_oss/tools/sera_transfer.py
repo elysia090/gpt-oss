@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import hashlib
 import importlib.util
@@ -52,6 +53,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing helper
     TensorLike = list | _NDArray | _TorchTensor
 else:  # pragma: no cover - runtime alias
     TensorLike = Any
+
+_MISSING = object()
+_MEMORY_BUDGET_OVERHEAD = 512 * 1024 * 1024
 
 _TORCH_IMPORT_ATTEMPTED = False
 _TORCH_MODULE = None
@@ -2032,6 +2036,37 @@ def _decode_safetensor_entry(dtype: str, shape: Sequence[int], data: memoryview)
     return array.reshape(tuple(int(dim) for dim in shape))
 
 
+def _entry_payload_bytes(entry: Mapping[str, Any]) -> int:
+    offsets = entry.get("data_offsets")
+    if isinstance(offsets, (tuple, list)) and len(offsets) == 2:
+        try:
+            return int(offsets[1]) - int(offsets[0])
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return 0
+    return 0
+
+
+def _estimate_tensor_nbytes(entry: Mapping[str, Any], tensor: TensorLike) -> int:
+    if tensor is None:
+        return 0
+    if isinstance(tensor, _Bfloat16Tensor):
+        return tensor.nbytes
+    nbytes = getattr(tensor, "nbytes", None)
+    if nbytes is not None:
+        try:
+            return int(nbytes)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            pass
+    itemsize = getattr(tensor, "itemsize", None)
+    size = getattr(tensor, "size", None)
+    if itemsize is not None and size is not None:
+        try:
+            return int(itemsize) * int(size)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            pass
+    return _entry_payload_bytes(entry)
+
+
 def _read_safetensors_index(path: Path) -> Tuple[Dict[str, Dict[str, Any]], int]:
     with path.open("rb") as handle:
         header_len_raw = handle.read(8)
@@ -2105,48 +2140,254 @@ def _load_tensors_from_deserialize(
     return tensors
 
 
-def load_tensors(path: Path) -> Dict[str, TensorLike]:
-    index: Dict[str, Dict[str, Any]] | None = None
-    base_offset = 0
-    tensors: Dict[str, TensorLike] = {}
-    fallback_entries: List[Tuple[str, Dict[str, Any]]] = []
-    opener = _resolve_safe_open()
+class _TensorLease(contextlib.AbstractContextManager[TensorLike | None]):
+    def __init__(
+        self,
+        store: "LazyTensorStore",
+        key: str,
+        default: object = _MISSING,
+    ) -> None:
+        self._store = store
+        self._key = key
+        self._default = default
+        self._bytes = 0
+        self._value: TensorLike | None | object = _MISSING
 
-    try:
-        with opener(path, framework="numpy") as tensor_file:
-            index, base_offset = _read_safetensors_index(path)
-            for key in tensor_file.keys():
-                entry = index.get(key)
-                if entry is None:
+    def __enter__(self) -> TensorLike | None:
+        value, size = self._store._acquire(self._key, self._default)
+        self._bytes = size
+        self._value = value
+        return value
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._bytes:
+            self._store._release(self._bytes)
+        self._value = _MISSING
+        self._bytes = 0
+        return False
+
+
+class LazyTensorStore(MutableMapping[str, TensorLike]):
+    """Lazy, mmap-backed tensor access for safetensors checkpoints."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._overrides: Dict[str, TensorLike] = {}
+        self._safe_cm = None
+        self._safe_reader = None
+        self._current_leased = 0
+        self._peak_leased = 0
+        self._open_reader()
+        self._index, self._base_offset = _read_safetensors_index(path)
+        self.max_layer_bytes = max(
+            (_entry_payload_bytes(entry) for entry in self._index.values()),
+            default=0,
+        )
+        self.memory_budget_bytes = self.max_layer_bytes + _MEMORY_BUDGET_OVERHEAD
+        logger.debug(
+            "Initialised LazyTensorStore for %s (budget=%d, max_layer=%d)",
+            path,
+            self.memory_budget_bytes,
+            self.max_layer_bytes,
+        )
+
+    @property
+    def index(self) -> Mapping[str, Mapping[str, Any]]:
+        return self._index
+
+    @property
+    def peak_leased_bytes(self) -> int:
+        return self._peak_leased
+
+    def _open_reader(self) -> None:
+        opener = _resolve_safe_open()
+        try:
+            context = opener(self._path, framework="numpy")
+        except TypeError:
+            context = opener(self._path, framework="numpy")
+        try:
+            self._safe_cm = context
+            self._safe_reader = context.__enter__()
+        except SafetensorError as exc:
+            if "bf16" not in str(exc).lower():
+                raise
+            logger.debug(
+                "safe_open fallback for %s due to unsupported dtype: %s",
+                self._path,
+                exc,
+            )
+            self._safe_cm = None
+            self._safe_reader = None
+
+    def close(self) -> None:
+        if self._safe_cm is not None:
+            self._safe_cm.__exit__(None, None, None)
+            self._safe_cm = None
+            self._safe_reader = None
+
+    def __enter__(self) -> "LazyTensorStore":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
+
+    def __del__(self):  # pragma: no cover - defensive
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __contains__(self, key: object) -> bool:
+        if not isinstance(key, str):
+            return False
+        return key in self._overrides or key in self._index
+
+    def __getitem__(self, key: str) -> TensorLike:
+        if key in self._overrides:
+            return self._overrides[key]
+        entry = self._index.get(key)
+        if entry is None:
+            raise KeyError(key)
+        return self._materialize_entry(key, entry)
+
+    def __setitem__(self, key: str, value: TensorLike) -> None:
+        self._overrides[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        if key in self._overrides:
+            del self._overrides[key]
+            return
+        raise KeyError(key)
+
+    def __iter__(self):
+        seen: set[str] = set()
+        for key in self._overrides:
+            seen.add(key)
+            yield key
+        for key in self._index:
+            if key not in seen:
+                yield key
+
+    def __len__(self) -> int:
+        override_only = sum(1 for key in self._overrides if key not in self._index)
+        return len(self._index) + override_only
+
+    def get(self, key: str, default: Optional[TensorLike] = None):  # type: ignore[override]
+        if key in self._overrides:
+            return self._overrides[key]
+        entry = self._index.get(key)
+        if entry is None:
+            return default
+        try:
+            return self._materialize_entry(key, entry)
+        except KeyError:
+            return default
+
+    def checkout(
+        self, key: str, *, default: object = _MISSING
+    ) -> _TensorLease:
+        return _TensorLease(self, key, default)
+
+    def stream(self, keys: Iterable[str]) -> Iterable[Tuple[str, TensorLike]]:
+        for name in keys:
+            with self.checkout(name, default=None) as tensor:
+                if tensor is None:
                     continue
-                dtype = entry["dtype"]
-                if dtype == "BF16":
-                    fallback_entries.append((key, entry))
-                    continue
-                try:
-                    array = tensor_file.get_tensor(key)
-                    if _NP_ARRAY_TYPES and isinstance(array, _NP_ARRAY_TYPES):
-                        array = array.copy()
-                    elif _is_torch_tensor(array):
-                        array = array.clone()
-                    tensors[key] = array
-                except TypeError:
-                    fallback_entries.append((key, entry))
-    except SafetensorError as exc:
-        if "bf16" not in str(exc).lower():
+                yield name, tensor
+
+    # Internal helpers -------------------------------------------------
+
+    def _materialize_entry(self, key: str, entry: Mapping[str, Any]) -> TensorLike:
+        tensor = None
+        if self._safe_reader is not None and entry.get("dtype") != "BF16":
+            try:
+                tensor = self._safe_reader.get_tensor(key)
+            except (KeyError, TypeError):  # pragma: no cover - defensive
+                tensor = None
+        if tensor is None:
+            with self._path.open("rb") as handle:
+                payload = _read_tensor_payload(handle, self._base_offset, entry)
+            tensor = _decode_safetensor_entry(entry["dtype"], entry["shape"], payload)
+        return tensor
+
+    def _acquire(
+        self, key: str, default: object = _MISSING
+    ) -> Tuple[TensorLike | None, int]:
+        if key in self._overrides:
+            return self._overrides[key], 0
+        entry = self._index.get(key)
+        if entry is None:
+            if default is _MISSING:
+                raise KeyError(key)
+            return default, 0
+        tensor = self._materialize_entry(key, entry)
+        size = _estimate_tensor_nbytes(entry, tensor)
+        try:
+            self._register_lease(size)
+        except MemoryError:
             raise
-        return _load_tensors_from_deserialize(path)
+        return tensor, size
 
-    if fallback_entries:
-        if index is None:
-            index, base_offset = _read_safetensors_index(path)
-        with path.open("rb") as handle:
-            for key, entry in fallback_entries:
-                payload = _read_tensor_payload(handle, base_offset, entry)
-                tensors[key] = _decode_safetensor_entry(
-                    entry["dtype"], entry["shape"], payload
-                )
-    return tensors
+    def _register_lease(self, size: int) -> None:
+        if size <= 0:
+            return
+        self._current_leased += size
+        if self._current_leased > self.memory_budget_bytes:
+            self._current_leased -= size
+            raise MemoryError(
+                "Tensor lease exceeded memory budget: "
+                f"{self._current_leased + size} > {self.memory_budget_bytes}"
+            )
+        if self._current_leased > self._peak_leased:
+            self._peak_leased = self._current_leased
+            logger.debug(
+                "Tensor lease peak updated: %d bytes (budget=%d)",
+                self._peak_leased,
+                self.memory_budget_bytes,
+            )
+
+    def _release(self, size: int) -> None:
+        if size <= 0:
+            return
+        self._current_leased = max(0, self._current_leased - size)
+
+
+def load_tensors(path: Path) -> LazyTensorStore:
+    return LazyTensorStore(path)
+
+
+@contextlib.contextmanager
+def _tensor_lease(
+    tensors: Mapping[str, TensorLike],
+    name: str,
+    *,
+    default: object = _MISSING,
+):
+    checkout = getattr(tensors, "checkout", None)
+    if callable(checkout):
+        manager = checkout(name, default=default)
+        with manager as value:
+            yield value
+        return
+    if default is _MISSING:
+        yield tensors[name]
+    else:
+        yield tensors.get(name, default)
+
+
+@contextlib.contextmanager
+def _tensor_block(
+    tensors: Mapping[str, TensorLike],
+    *names: str,
+    default: object = _MISSING,
+):
+    with contextlib.ExitStack() as stack:
+        values: List[TensorLike | None] = []
+        for name in names:
+            ctx = _tensor_lease(tensors, name, default=default)
+            values.append(stack.enter_context(ctx))
+        yield tuple(values)
 
 
 # ---------------------------------------------------------------------------
@@ -2173,16 +2414,16 @@ def compute_prf(cfg: ModelConfig, tensors: Mapping[str, TensorLike], r: int) -> 
     diag_accum = [0.0 for _ in range(cfg.d_model)]
     counts = [0 for _ in range(cfg.d_model)]
     for layer in cfg.layers:
-        matrix = tensors.get(layer.w_k)
-        if matrix is None:
-            continue
-        digest.update(layer.w_k.encode("utf-8"))
-        tensor_bytes = _tensor_bytes(matrix)
-        digest.update(tensor_bytes)
-        for row in matrix:
-            for idx, value in enumerate(row[: cfg.d_model]):
-                diag_accum[idx] += float(value) * float(value)
-                counts[idx] += 1
+        with _tensor_lease(tensors, layer.w_k, default=None) as matrix:
+            if matrix is None:
+                continue
+            digest.update(layer.w_k.encode("utf-8"))
+            tensor_bytes = _tensor_bytes(matrix)
+            digest.update(tensor_bytes)
+            for row in matrix:
+                for idx, value in enumerate(row[: cfg.d_model]):
+                    diag_accum[idx] += float(value) * float(value)
+                    counts[idx] += 1
 
     diag: List[float] = []
     for idx in range(cfg.d_model):
@@ -2247,21 +2488,21 @@ def compute_overlays(
     layer_count = 0
     digest = hashlib.sha256()
     for layer in cfg.layers:
-        w_o = tensors.get(layer.w_o)
-        if w_o is None:
-            continue
-        digest.update(layer.w_o.encode("utf-8"))
-        digest.update(_tensor_bytes(w_o))
-        layer_rows = _tensor_len(w_o)
-        layer_cols = _tensor_len(w_o[0]) if layer_rows else 0
-        if accumulator is None:
-            accumulator = [[0.0 for _ in range(layer_cols)] for _ in range(layer_rows)]
-        for i in range(min(layer_rows, len(accumulator))):
-            row = accumulator[i]
-            layer_row = w_o[i]
-            for j in range(min(layer_cols, len(row))):
-                row[j] += float(layer_row[j])
-        layer_count += 1
+        with _tensor_lease(tensors, layer.w_o, default=None) as w_o:
+            if w_o is None:
+                continue
+            digest.update(layer.w_o.encode("utf-8"))
+            digest.update(_tensor_bytes(w_o))
+            layer_rows = _tensor_len(w_o)
+            layer_cols = _tensor_len(w_o[0]) if layer_rows else 0
+            if accumulator is None:
+                accumulator = [[0.0 for _ in range(layer_cols)] for _ in range(layer_rows)]
+            for i in range(min(layer_rows, len(accumulator))):
+                row = accumulator[i]
+                layer_row = w_o[i]
+                for j in range(min(layer_cols, len(row))):
+                    row[j] += float(layer_row[j])
+            layer_count += 1
 
     if accumulator is None or layer_count == 0:
         raise ValueError("No W_O tensors available to compute overlays")
@@ -2336,42 +2577,59 @@ def collapse_ffn(
     base_bias = 0.0
 
     for layer_index, layer in enumerate(cfg.layers):
-        W1 = tensors[layer.w1]
-        W2 = tensors[layer.w2]
-        b1 = tensors[layer.b1]
-        b2 = tensors[layer.b2]
-        hidden_dim = len(W1)
+        missing = [
+            name
+            for name in (layer.w1, layer.w2, layer.b1, layer.b2)
+            if name not in tensors
+        ]
+        if missing:
+            raise KeyError(missing[0])
 
-        base_bias += sum(float(x) for x in b2)
-        base_bias += sum(max(0.0, float(x)) for x in b1)
+        with _tensor_lease(tensors, layer.b2) as b2:
+            base_bias += sum(float(x) for x in b2)
+        with _tensor_lease(tensors, layer.b1) as b1:
+            base_bias += sum(max(0.0, float(x)) for x in b1)
 
-        abs_W1 = matrix_abs(W1)
-        abs_W2 = matrix_abs(W2)
+        with _tensor_lease(tensors, layer.w2) as W2:
+            out_dim = _tensor_len(W2)
+            hidden_dim = _tensor_len(W2[0]) if out_dim else 0
+            sign_sums = [0.0 for _ in range(hidden_dim)]
+            col_abs = [0.0 for _ in range(hidden_dim)]
+            for row in W2:
+                for h in range(hidden_dim):
+                    value = float(row[h])
+                    sign_sums[h] += value
+                    col_abs[h] += abs(value)
 
-        for feature in range(cfg.d_model):
-            scores: List[float] = []
-            for h in range(hidden_dim):
-                col_sum = sum(abs_W2[out_idx][h] for out_idx in range(len(abs_W2)))
-                scores.append(col_sum * abs_W1[h][feature])
-            idxs = set(top_indices(scores, top_l))
-            effect = 0.0
-            for h in idxs:
-                sign_sum = sum(
-                    float(W2[out_idx][h]) for out_idx in range(len(W2))
-                )
-                effect += sign(sign_sum) * max(0.0, float(W1[h][feature]))
-            key = (layer_index << 32) | feature
-            weight_map[key] = effect
+        with _tensor_lease(tensors, layer.w1) as W1:
+            hidden_dim = len(W1)
+            if len(col_abs) < hidden_dim:
+                col_abs.extend([0.0 for _ in range(hidden_dim - len(col_abs))])
+                sign_sums.extend([0.0 for _ in range(hidden_dim - len(sign_sums))])
+            elif len(col_abs) > hidden_dim:
+                del col_abs[hidden_dim:]
+                del sign_sums[hidden_dim:]
+            scores = [0.0 for _ in range(hidden_dim)]
+            positive = [0.0 for _ in range(hidden_dim)]
+            for feature in range(cfg.d_model):
+                for h in range(hidden_dim):
+                    value = float(W1[h][feature])
+                    positive[h] = max(0.0, value)
+                    scores[h] = col_abs[h] * abs(value)
+                top_h = top_indices(scores, top_l)
+                top_set = set(top_h)
+                effect = 0.0
+                for h in top_h:
+                    effect += sign(sign_sums[h]) * positive[h]
+                key = (layer_index << 32) | feature
+                weight_map[key] = effect
 
-            for h in range(hidden_dim):
-                if h in idxs:
-                    continue
-                sign_sum = sum(
-                    float(W2[out_idx][h]) for out_idx in range(len(W2))
-                )
-                residual = sign(sign_sum) * max(0.0, float(W1[h][feature]))
-                if abs(residual) > 0.0:
-                    residual_entries.append((key, h, residual))
+                for h in range(hidden_dim):
+                    if h in top_set:
+                        continue
+                    residual = sign(sign_sums[h]) * positive[h]
+                    if abs(residual) > 0.0:
+                        residual_entries.append((key, h, residual))
 
     slot_keys = list(weight_map.keys())
     seeds, ordered_keys, slot_lookup = _build_two_level_mph(slot_keys)
@@ -2437,10 +2695,10 @@ def _layer_seed(layer: LayerConfig, tensors: Mapping[str, TensorLike]) -> int:
         layer.b1,
         layer.b2,
     ):
-        tensor = tensors.get(name)
-        if tensor is None:
-            continue
-        digest.update(_tensor_bytes(tensor))
+        with _tensor_lease(tensors, name, default=None) as tensor:
+            if tensor is None:
+                continue
+            digest.update(_tensor_bytes(tensor))
     return int.from_bytes(digest.digest()[:8], "little", signed=False)
 
 
@@ -2463,24 +2721,11 @@ def bridge_records(
     vocab = vocab_size or cfg.d_model or 16
     vocab = max(1, vocab)
     missing_inputs: set[str] = set()
-    resolved_layers: List[Tuple[LayerConfig, TensorLike, TensorLike, TensorLike, TensorLike]] = []
 
     for layer in cfg.layers:
-        w1 = tensors.get(layer.w1)
-        w2 = tensors.get(layer.w2)
-        b1 = tensors.get(layer.b1)
-        b2 = tensors.get(layer.b2)
-        for name, value in (
-            (layer.w1, w1),
-            (layer.w2, w2),
-            (layer.b1, b1),
-            (layer.b2, b2),
-        ):
-            if value is None:
+        for name in (layer.w1, layer.w2, layer.b1, layer.b2):
+            if name not in tensors:
                 missing_inputs.add(name)
-        if any(value is None for value in (w1, w2, b1, b2)):
-            continue
-        resolved_layers.append((layer, w1, w2, b1, b2))
 
     disabled_arrays = {
         "bridge_hubs": [],
@@ -2511,24 +2756,43 @@ def bridge_records(
     aggregated_out = [0.0 for _ in range(vocab)]
     seeds: List[int] = []
     digest = hashlib.sha256()
-    for layer, W1, W2, b1, b2 in resolved_layers:
+    for layer in cfg.layers:
         layer_seed = _layer_seed(layer, tensors)
         seeds.append(layer_seed)
         digest.update(struct.pack("<Q", layer_seed))
-        hidden_dim = len(W1)
-        out_dim = len(W2)
-        for token in range(vocab):
-            feature = token % cfg.d_model
-            feature_h = feature % max(1, hidden_dim)
-            feature_out = feature % max(1, out_dim)
-            avg_w1 = sum(float(W1[h][feature % len(W1[h])]) for h in range(hidden_dim)) / max(1, hidden_dim)
-            avg_w2 = sum(float(value) for value in W2[feature_out]) / max(1, len(W2[feature_out]))
-            b1_len = _tensor_len(b1)
-            b2_len = _tensor_len(b2)
-            bias1 = float(b1[feature_h % b1_len]) if b1_len else 0.0
-            bias2 = float(b2[feature_out % b2_len]) if b2_len else 0.0
-            aggregated_in[token] += avg_w1 + bias1
-            aggregated_out[token] += avg_w2 + bias2
+
+        with _tensor_lease(tensors, layer.b1) as b1_tensor:
+            b1_values = [float(x) for x in b1_tensor]
+        with _tensor_lease(tensors, layer.b2) as b2_tensor:
+            b2_values = [float(x) for x in b2_tensor]
+        with _tensor_lease(tensors, layer.w2) as W2:
+            out_dim = _tensor_len(W2)
+            avg_w2_rows = [
+                sum(float(value) for value in row) / max(1, len(row))
+                for row in W2
+            ]
+        with _tensor_lease(tensors, layer.w1) as W1:
+            hidden_dim = len(W1)
+            hidden_len = max(1, hidden_dim)
+            out_len = max(1, out_dim)
+            b1_len = len(b1_values)
+            b2_len = len(b2_values)
+            for token in range(vocab):
+                feature = token % cfg.d_model
+                total = 0.0
+                for h in range(hidden_dim):
+                    row = W1[h]
+                    row_len = len(row)
+                    if row_len:
+                        total += float(row[feature % row_len])
+                avg_w1 = total / max(1, hidden_dim)
+                feature_h = feature % hidden_len
+                bias1 = b1_values[feature_h % b1_len] if b1_len else 0.0
+                feature_out = feature % out_len
+                avg_w2 = avg_w2_rows[feature_out] if out_dim else 0.0
+                bias2 = b2_values[feature_out % b2_len] if b2_len else 0.0
+                aggregated_in[token] += avg_w1 + bias1
+                aggregated_out[token] += avg_w2 + bias2
 
     global_seed = int.from_bytes(digest.digest()[:8], "little", signed=False)
 
