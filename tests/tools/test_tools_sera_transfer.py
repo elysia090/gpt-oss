@@ -1580,7 +1580,7 @@ def test_array_checksums_regression(tmp_path: Path) -> None:
     }
 
     expected = {
-        "R_init.bin": "767b79bfd95b68f965283ffad093ca55a187222b59d7c161d201c4ba5100ea8b",
+        "R_init.bin": "7046f2e270cbc419b77a69b4b2f42f0e16f15d92132d9079b5b07c22e6021a84",
         "T_1.bin": "3c4683b929755dc6d56cc211ffb080dc5b0e5cb160d30add07ebaa7c0e257343",
         "T_2.bin": "fba29db3eaa080104efcbc655e577f9355d6e88749b6a8cfdcc79150a411d39e",
         "T_3.bin": "0f53b34731af55a91b78cd4cc0c681e3d4324410126c5fba741a261e4ec722f1",
@@ -1599,11 +1599,11 @@ def test_array_checksums_regression(tmp_path: Path) -> None:
         "overlays_H.bin": "8822076e87c71898268117b514363d4d0a1e94979a82660592c15dd8d2bd007b",
         "overlays_U.bin": "2e52afbe02b59190268a21f35aaf73d6fd414c9a6d0401fc3d1fc6ebcb50bbea",
         "peer_scores.bin": "47f9b55acb21720cfcafce10a09be10389b3dd32d07354163f01e752afe9f8c9",
-        "prf_W.bin": "82f12b35a3b21cfda599a42ffb8ad775515c4346ebff8675066e225a0143ee69",
+        "prf_W.bin": "40376765c4fbba35d9d9290dbdfed444275d6d6f584c116fe57f4454b959e0cf",
         "s_init.bin": "0e4e4aa04d00bdb4bab468d59d41814335e8acf684c5b0f777e1c504bf69d4f6",
         "tokenizer_fst.bin": "22dc36f9948ec635b865778daf710cd6235c5cf232e9b4e5e0045c5768c6a188",
         "whitening_mu.bin": "a604d77b6148b5b708757df5d5beea754058441b732eebf039c694747a3e6ab5",
-        "whitening_sig2.bin": "471d801b75e45a7cc4680b05e1fd7cae0150c40eef007dcc47c30a20696eb8e0",
+        "whitening_sig2.bin": "6bf0893b248ac5dc84a0b9419942a7d7fef903720cf4be44b56c90095dbe052b",
     }
     differences = {
         name: (checksums[name], expected.get(name))
@@ -1611,6 +1611,29 @@ def test_array_checksums_regression(tmp_path: Path) -> None:
         if checksums[name] != expected.get(name)
     }
     assert differences == {}
+
+
+def test_prf_scaling_and_statistics(tmp_path: Path) -> None:
+    source = _create_checkpoint(tmp_path / "prf")
+    with sera_transfer.load_tensors(source / "model.safetensors") as tensors:
+        config_data = json.loads((source / "config.json").read_text())
+        cfg = sera_transfer.ModelConfig.from_dict(config_data, tensors=tensors)
+        prf = sera_transfer.compute_prf(cfg, tensors, r=4)
+
+    expected_weights = [
+        [0.44182086, -0.13644387, -0.06752249, 0.12999673],
+        [0.20792733, 0.09692822, 0.35228884, 0.30912128],
+        [-0.16638626, 0.60510892, -0.19965000, -0.19413671],
+        [0.14394116, 0.41389084, -0.56297547, 0.12709041],
+    ]
+    expected_sigmas = [0.06015896, 0.07170280, 0.12774922, 0.15027206]
+    expected_r_row = [0.06398630, 0.06859852, 0.07446024, 0.05519042]
+    expected_s = [0.26223549] * 4
+
+    np.testing.assert_allclose(prf["prf_W"], expected_weights, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(prf["whitening_sig2"], expected_sigmas, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(prf["R_init"], [expected_r_row] * 4, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(prf["s_init"], expected_s, rtol=1e-6, atol=1e-6)
 
 def test_tokenizer_dump_matches_fixture(tmp_path: Path) -> None:
     source = _create_checkpoint(tmp_path / "dump_fixture")
