@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import gc
+import hashlib
 import json
+from array import array
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
 try:
+    import numpy as np
     from gpt_oss.tools import sera_transfer
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
     if "pip install numpy" in str(exc):
@@ -313,3 +318,32 @@ def test_convert_writes_error_log(tmp_path: Path):
     assert log_path.exists()
     log_text = log_path.read_text(encoding="utf-8")
     assert "Unable to locate 'config.json'" in log_text
+
+
+def _legacy_tensor_bytes(tensor) -> bytes:
+    flat = sera_transfer._flatten(tensor)
+    buf = array("d")
+    buf.extend(float(value) for value in flat)
+    return buf.tobytes()
+
+
+def test_tensor_bytes_streams_numpy_without_flatten():
+    tensor = np.arange(256 * 256, dtype=np.float32).reshape(256, 256)
+
+    with mock.patch.object(
+        sera_transfer,
+        "_iter_tensor_values",
+        side_effect=AssertionError("streaming path should bypass fallback"),
+    ):
+        digest = hashlib.sha256()
+        for chunk in sera_transfer._tensor_bytes(tensor):
+            digest.update(chunk)
+
+    expected_digest = hashlib.sha256(_legacy_tensor_bytes(tensor)).digest()
+    assert digest.digest() == expected_digest
+
+    gc.collect()
+    large_lists = [
+        obj for obj in gc.get_objects() if isinstance(obj, list) and len(obj) >= tensor.size
+    ]
+    assert not large_lists

@@ -18,11 +18,12 @@ import re
 import struct
 import sys
 import textwrap
+from array import array
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Mapping as _Mapping, MutableMapping
 from enum import IntEnum, IntFlag
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
 _SAFETENSORS_MISSING_MSG = (
     "The `safetensors` package is required for Sera conversion. "
@@ -717,6 +718,36 @@ def _flatten(values) -> List[float]:
     return result
 
 
+def _iter_tensor_values(values) -> Iterator[float]:
+    if isinstance(values, (list, tuple)):
+        for item in values:
+            yield from _iter_tensor_values(item)
+        return
+    if isinstance(values, _Bfloat16Tensor):
+        yield from _iter_tensor_values(values.to_float32())
+        return
+    if _NP_ARRAY_TYPES and isinstance(values, _NP_ARRAY_TYPES):
+        ndim = getattr(values, "ndim", 0)
+        if ndim == 0:
+            yield float(values)
+        else:
+            for item in values:
+                yield from _iter_tensor_values(item)
+        return
+    if _is_torch_tensor(values):
+        if getattr(values, "ndim", 0) == 0:
+            yield float(values)
+        else:
+            for item in values:
+                yield from _iter_tensor_values(item)
+        return
+    if hasattr(values, "__iter__") and not isinstance(values, (str, bytes, bytearray)):
+        for item in values:
+            yield from _iter_tensor_values(item)
+        return
+    yield float(values)
+
+
 def _infer_shape(values) -> Tuple[int, ...]:
     if isinstance(values, (int, float)):
         return ()
@@ -1081,13 +1112,47 @@ def _mix64(value: int, seed: int = 0) -> int:
     return (z ^ (z >> 31)) & 0xFFFFFFFFFFFFFFFF
 
 
-def _tensor_bytes(tensor: TensorLike) -> bytes:
-    from array import array
+def _tensor_bytes(tensor: TensorLike) -> Iterable[bytes | memoryview]:
+    if isinstance(tensor, _Bfloat16Tensor):
+        try:
+            raw = tensor.raw_bytes()
+        except RuntimeError:
+            array64 = _np.ascontiguousarray(
+                tensor.to_float32().astype(_np.float64, copy=False)
+            )
+            yield memoryview(array64).cast("B")
+        else:
+            yield raw
+        return
 
-    flat = _flatten(tensor)
-    buf = array("d")
-    buf.extend(float(x) for x in flat)
-    return buf.tobytes()
+    if _NP_ARRAY_TYPES and isinstance(tensor, _NP_ARRAY_TYPES):
+        array64 = _np.asarray(tensor, dtype=_np.float64)
+        array64 = _np.ascontiguousarray(array64)
+        yield memoryview(array64).cast("B")
+        return
+
+    if _is_torch_tensor(tensor):
+        torch_module = _get_torch()
+        if torch_module is None:
+            raise TypeError("Torch tensors require torch to be available")
+        torch_array = tensor.detach().cpu()
+        if torch_array.dtype != torch_module.float64:
+            torch_array = torch_array.to(dtype=torch_module.float64)
+        torch_array = torch_array.contiguous()
+        np_array = torch_array.numpy()
+        np_array = _np.ascontiguousarray(np_array)
+        yield memoryview(np_array).cast("B")
+        return
+
+    chunk_size = 1 << 14  # 16384 doubles per buffer (~128 KiB)
+    buffer = array("d")
+    for value in _iter_tensor_values(tensor):
+        buffer.append(float(value))
+        if len(buffer) >= chunk_size:
+            yield buffer.tobytes()
+            buffer = array("d")
+    if buffer:
+        yield buffer.tobytes()
 
 
 def _hash_bytes(data: bytes) -> int:
@@ -2200,6 +2265,14 @@ class _Bfloat16Tensor:
     def tolist(self):
         return self._ensure_float32().tolist()
 
+    def raw_bytes(self) -> memoryview:
+        buffer = self._buffer
+        if buffer is None:
+            raise RuntimeError("BF16 tensor payload has already been released")
+        if buffer.format == "B":
+            return buffer
+        return buffer.cast("B")
+
     def __array__(self, dtype=None):
         arr = self._ensure_float32()
         if dtype is not None and arr.dtype != dtype:
@@ -2615,8 +2688,8 @@ def compute_prf(cfg: ModelConfig, tensors: Mapping[str, TensorLike], r: int) -> 
             if matrix is None:
                 continue
             digest.update(layer.w_k.encode("utf-8"))
-            tensor_bytes = _tensor_bytes(matrix)
-            digest.update(tensor_bytes)
+            for chunk in _tensor_bytes(matrix):
+                digest.update(chunk)
             for row in matrix:
                 for idx, value in enumerate(row[: cfg.d_model]):
                     diag_accum[idx] += float(value) * float(value)
@@ -2688,7 +2761,8 @@ def compute_overlays(
             if w_o is None:
                 continue
             digest.update(layer.w_o.encode("utf-8"))
-            digest.update(_tensor_bytes(w_o))
+            for chunk in _tensor_bytes(w_o):
+                digest.update(chunk)
             layer_rows = _tensor_len(w_o)
             layer_cols = _tensor_len(w_o[0]) if layer_rows else 0
             if accumulator is None:
@@ -2894,7 +2968,8 @@ def _layer_seed(layer: LayerConfig, tensors: Mapping[str, TensorLike]) -> int:
         with _tensor_lease(tensors, name, default=None) as tensor:
             if tensor is None:
                 continue
-            digest.update(_tensor_bytes(tensor))
+            for chunk in _tensor_bytes(tensor):
+                digest.update(chunk)
     return int.from_bytes(digest.digest()[:8], "little", signed=False)
 
 
