@@ -475,6 +475,14 @@ def write_array(path: Path, data, dtype: str, flags: int = 0x1) -> bytes:
 
 
 @dataclass(frozen=True)
+class ArrayDigest:
+    """Digest information required to describe an array payload."""
+
+    bytes: int
+    sha256: bytes
+
+
+@dataclass(frozen=True)
 class ArrayInfo:
     """Lightweight description of an array artefact produced during conversion."""
 
@@ -2364,10 +2372,32 @@ def tokenizer_arrays(
 # Manifest writing
 
 
-def write_manifest(path: Path, cfg: ModelConfig, artefacts: Mapping[str, bytes], *, r: int, r_v: int, vocab_size: int) -> None:
+def write_manifest(
+    path: Path,
+    cfg: ModelConfig,
+    artefacts: Mapping[str, ArrayDigest],
+    *,
+    r: int,
+    r_v: int,
+    vocab_size: int,
+) -> None:
     schema_path = Path("docs/specs/Sera-Transfer.txt")
-    schema_digest = hashlib.sha256(schema_path.read_bytes()).digest() if schema_path.exists() else hashlib.sha256(b"sera").digest()
+    schema_digest = (
+        hashlib.sha256(schema_path.read_bytes()).digest()
+        if schema_path.exists()
+        else hashlib.sha256(b"sera").digest()
+    )
     seed_digest = hashlib.sha256(b"sera-transfer").digest()
+
+    empty_digest = hashlib.sha256(b"").digest()
+
+    def _digest(name: str) -> bytes:
+        info = artefacts.get(name)
+        return info.sha256 if info is not None else empty_digest
+
+    def _length(name: str) -> int:
+        info = artefacts.get(name)
+        return info.bytes if info is not None else 0
 
     with path.open("wb") as f:
         f.write(struct.pack("<I", 0x5345524D))
@@ -2379,16 +2409,15 @@ def write_manifest(path: Path, cfg: ModelConfig, artefacts: Mapping[str, bytes],
         S_norm = 1.0
         L_norm = 1.0
         P_gen = vocab_size
-        sp_cert = hashlib.sha256(artefacts.get("tokenizer_fst", b""))
         f.write(struct.pack("<IffI", L_tok, S_norm, L_norm, P_gen))
-        f.write(sp_cert.digest())
+        f.write(_digest("tokenizer_fst"))
         _write_utf8(f, "byte_level")
 
         f.write(struct.pack("<Ifdd", r, cfg.tau, 1e-8, 3.0))
         f.write(struct.pack("<d", 1e-3))
         f.write(hashlib.sha256(b"lambda").digest())
 
-        C = len(artefacts.get("linear_weights", b"")) // 4 if artefacts.get("linear_weights") else 0
+        C = _length("linear_weights") // 4
         f.write(struct.pack("<5Idd", C, cfg.d_model, 2, 1, 8, 0.1, 1.0))
 
         f.write(struct.pack("<6Id", 1, 2, 1, 1, 32, 4, 0.95))
@@ -2396,17 +2425,16 @@ def write_manifest(path: Path, cfg: ModelConfig, artefacts: Mapping[str, bytes],
         _write_utf8(f, "l2")
         f.write(struct.pack("<fi", 0.5, 4))
 
-        proj_digest = hashlib.sha256(artefacts.get("bridge_hubs", b""))
         f.write(struct.pack("<III", vocab_size, 2, cfg.d_model))
-        f.write(proj_digest.digest())
+        f.write(_digest("bridge_hubs"))
         f.write(struct.pack("<ff", 0.1, 1.0))
         f.write(struct.pack("<II", 0, 0))
         f.write(struct.pack("<III", 4, 2, 8))
 
         f.write(struct.pack("<IIIIfff", 8, 16, 4, 2, 1.3, 0.01, 0.05))
         f.write(struct.pack("<f f f f", 0.5, 20.0, 0.1, 0.05))
-        f.write(hashlib.sha256(artefacts.get("linear_mphf", b"" )).digest())
-        f.write(hashlib.sha256(artefacts.get("linear_keys", b"" )).digest())
+        f.write(_digest("linear_mphf"))
+        f.write(_digest("linear_keys"))
         f.write(hashlib.sha256(b"prev").digest())
         f.write(hashlib.sha256(b"curr").digest())
 
@@ -2544,7 +2572,7 @@ def convert(
             arrays_dir = output / "arrays"
             arrays_dir.mkdir(parents=True, exist_ok=True)
 
-            artefact_payloads: Dict[str, bytes] = {}
+            artefact_digests: Dict[str, ArrayDigest] = {}
             artefact_records: Dict[str, Dict[str, object]] = {}
             metadata: Dict[str, object] = {}
             array_infos: List[ArrayInfo] = []
@@ -2555,13 +2583,14 @@ def convert(
                 payload = write_array_fn(path, data, dtype)
                 shape = _infer_shape(data)
                 payload_len = len(payload)
-                artefact_payloads[name] = payload
+                digest = hashlib.sha256(payload).digest()
+                artefact_digests[name] = ArrayDigest(bytes=payload_len, sha256=digest)
                 artefact_records[name] = {
                     "path": str(path),
                     "dtype": dtype,
                     "shape": shape,
                     "bytes": payload_len,
-                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "sha256": digest.hex(),
                 }
                 array_infos.append(
                     ArrayInfo(
@@ -2570,9 +2599,10 @@ def convert(
                         dtype=dtype,
                         shape=shape,
                         bytes=payload_len,
-                        sha256=artefact_records[name]["sha256"],
+                        sha256=digest.hex(),
                     )
                 )
+                del payload
 
             log_notice("Generating tokenizer arrays")
             tokenizer_data, tokenizer_meta = tokenizer_fn(cfg, tensors)
@@ -2651,7 +2681,7 @@ def convert(
             write_manifest_fn(
                 manifest_path,
                 cfg,
-                artefact_payloads,
+                artefact_digests,
                 r=local_r,
                 r_v=local_r_v,
                 vocab_size=cfg.vocab_size or 16,
