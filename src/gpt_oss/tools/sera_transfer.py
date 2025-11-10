@@ -2633,20 +2633,19 @@ def compute_prf(cfg: ModelConfig, tensors: Mapping[str, TensorLike], r: int) -> 
     prng = SplitMix64(seed=prng_seed)
     prf_W: List[List[float]] = []
     whitening_sig2: List[float] = []
-    total_diag = sum(diag) / max(1, len(diag))
+    inv_sqrt_r = 1.0 / math.sqrt(float(max(r, 1)))
     for _ in range(r):
         gaussian = gaussian_vector(prng, cfg.d_model)
-        scaled = [g * math.sqrt(diag[j]) for j, g in enumerate(gaussian)]
-        variance = sum(value * value for value in scaled) / max(1, len(scaled))
-        whitening_sig2.append(max(variance, 1e-6))
+        scaled = [g * math.sqrt(diag[j]) * inv_sqrt_r for j, g in enumerate(gaussian)]
+        energy = sum((scaled[j] * scaled[j]) * diag[j] for j in range(len(scaled)))
+        whitening_sig2.append(max(energy, 1e-6))
         prf_W.append(scaled)
 
-    r_init = []
-    for i in range(r):
-        scale = 1.0 / float(i + 1)
-        r_init.append([diag[j] * scale for j in range(cfg.d_model)])
+    r_safe = float(max(r, 1))
+    r_init = [[diag[j] / r_safe for j in range(cfg.d_model)] for _ in range(r)]
 
-    s_init = [total_diag for _ in range(r)]
+    s_value = max(sum(diag) / r_safe, 1e-6)
+    s_init = [s_value for _ in range(r)]
     whitening_mu = [0.0 for _ in range(r)]
     return {
         "prf_W": prf_W,
