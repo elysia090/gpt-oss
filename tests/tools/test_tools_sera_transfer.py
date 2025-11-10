@@ -21,6 +21,18 @@ np = pytest.importorskip("numpy")
 safetensors_numpy = pytest.importorskip("safetensors.numpy")
 save_file = safetensors_numpy.save_file
 
+SPEC_DTYPE_CODES = {
+    "f64": 1,
+    "f32": 2,
+    "i32": 3,
+    "i16": 4,
+    "i8": 5,
+    "u8": 6,
+    "q8_8": 7,
+    "q4_12": 8,
+    "bf16": 9,
+}
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -718,9 +730,58 @@ def _read_header(path: Path) -> sera_transfer.ArrayHeader:
 
 
 def _payload(path: Path) -> bytes:
+    header = _read_header(path)
     data = path.read_bytes()
-    return data[sera_transfer.ArrayHeader.HEADER_STRUCT.size :]
+    header_size = sera_transfer.ArrayHeader.HEADER_STRUCT.size
+    alignment = 0
+    if header.flags & sera_transfer.ARRAY_FLAG_ALIGNED_64B:
+        alignment = (-header_size) % 64
+    start = header_size + alignment
+    end = start + header.byte_len
+    return data[start:end]
 
+
+@pytest.mark.parametrize(
+    "dtype,data,expected_rank,expected_dims",
+    [
+        ("f64", 1.0, 0, (1, 1, 1, 1, 1)),
+        ("f32", [1.0, -1.0], 1, (2, 1, 1, 1, 1)),
+        ("i32", [[1, 2], [3, 4]], 2, (2, 2, 1, 1, 1)),
+        ("i16", [1, -2, 3], 1, (3, 1, 1, 1, 1)),
+        ("i8", [-4, 5, -6, 7], 1, (4, 1, 1, 1, 1)),
+        ("u8", [0, 1, 2, 3, 4], 1, (5, 1, 1, 1, 1)),
+        ("q8_8", [[256, -128], [512, 64]], 2, (2, 2, 1, 1, 1)),
+        ("q4_12", [0x1234, 0x0001, 0x00FF], 1, (3, 1, 1, 1, 1)),
+        ("bf16", [0.25, -1.5, 0.0, 7.0], 1, (4, 1, 1, 1, 1)),
+    ],
+)
+def test_write_array_header_matches_spec(tmp_path: Path, dtype, data, expected_rank, expected_dims):
+    target = tmp_path / f"{dtype}.bin"
+    payload = sera_transfer.write_array(target, data, dtype)
+    raw = target.read_bytes()
+    header_size = sera_transfer.ArrayHeader.HEADER_STRUCT.size
+    header_bytes = raw[:header_size]
+    header_fields = sera_transfer.ArrayHeader.HEADER_STRUCT.unpack(header_bytes)
+
+    assert header_fields[0] == sera_transfer.MAGIC_SERA_ARRAY
+    assert header_fields[1] == SPEC_DTYPE_CODES[dtype]
+    assert header_fields[2] == expected_rank
+    assert header_fields[3:8] == expected_dims
+    assert header_fields[8] == len(payload)
+    assert header_fields[11] == (
+        sera_transfer.ARRAY_FLAG_ROW_MAJOR
+        | sera_transfer.ARRAY_FLAG_ALIGNED_64B
+        | sera_transfer.ARRAY_FLAG_FTZ
+    )
+
+    alignment = (-header_size) % 64
+    payload_offset = header_size + alignment
+    assert payload_offset % 64 == 0
+    if alignment:
+        assert raw[header_size:payload_offset] == b"\x00" * alignment
+
+    assert raw[payload_offset : payload_offset + len(payload)] == payload
+    assert raw[payload_offset + len(payload) :] == b""
 
 def test_model_config_infers_layers_from_openai_layout(tmp_path: Path) -> None:
     source = _create_openai_checkpoint(tmp_path / "openai_infer")

@@ -12,6 +12,9 @@ ARRAY_MAGIC = 0x53455241
 MANIFEST_MAGIC = 0x5345524D
 MANIFEST_VERSION = 0x3
 ARRAY_HEADER_STRUCT = struct.Struct("<I H H 5Q Q Q Q I I")
+ARRAY_FLAG_ROW_MAJOR = 0x1
+ARRAY_FLAG_ALIGNED_64B = 0x2
+ARRAY_FLAG_FTZ = 0x4
 DTYPE_CODES: Dict[int, str] = {
     1: "f64",
     2: "f32",
@@ -88,13 +91,29 @@ def load_array_file(path: Path) -> tuple[SeraArrayHeader, bytes]:
         if len(header_raw) != ARRAY_HEADER_STRUCT.size:
             raise SeraArrayError(f"Array file {path} is truncated")
         values = ARRAY_HEADER_STRUCT.unpack(header_raw)
-        payload = fh.read()
-    header = parse_array_header(values)
-    if len(payload) != header.byte_len:
-        raise SeraArrayError(
-            f"Array payload length mismatch for {path}: "
-            f"expected {header.byte_len}, got {len(payload)}"
-        )
+        header = parse_array_header(values)
+        if header.flags & ARRAY_FLAG_ALIGNED_64B:
+            alignment = (-ARRAY_HEADER_STRUCT.size) % 64
+            if alignment:
+                padding = fh.read(alignment)
+                if len(padding) != alignment:
+                    raise SeraArrayError(
+                        f"Array file {path} is truncated before payload alignment"
+                    )
+                if any(padding):
+                    raise SeraArrayError(
+                        f"Array file {path} has non-zero alignment padding"
+                    )
+        payload = fh.read(header.byte_len)
+        if len(payload) != header.byte_len:
+            raise SeraArrayError(
+                f"Array payload length mismatch for {path}: "
+                f"expected {header.byte_len}, got {len(payload)}"
+            )
+        trailing = fh.read()
+        if trailing:
+            if not (header.flags & ARRAY_FLAG_ALIGNED_64B) or any(trailing):
+                raise SeraArrayError(f"Array file {path} contains unexpected trailing data")
     return header, payload
 
 
@@ -148,6 +167,9 @@ def ensure_bytes(value: Union[str, bytes, bytearray, memoryview, Iterable[int]])
 
 
 __all__ = [
+    "ARRAY_FLAG_ALIGNED_64B",
+    "ARRAY_FLAG_FTZ",
+    "ARRAY_FLAG_ROW_MAJOR",
     "ARRAY_HEADER_STRUCT",
     "ARRAY_MAGIC",
     "DEFAULT_STATE_FILENAMES",
