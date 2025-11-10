@@ -919,6 +919,7 @@ def test_model_config_handles_gpt_oss_mxfp4_layout(gpt_oss_mxfp4_layout) -> None
     assert bridge_data["bridge_hubs"]
     assert bridge_meta["enabled"] is True
     assert bridge_meta["status"] == "enabled"
+    assert bridge_meta["mode"] == "on"
     assert len(bridge_meta["layer_seeds"]) == len(cfg.layers)
 
 
@@ -1490,6 +1491,7 @@ def test_written_arrays_match_reference(tmp_path: Path) -> None:
     bridge_data, bridge_meta = sera_transfer.bridge_records(cfg, tensors, cfg.vocab_size)
     assert bridge_meta["enabled"] is True
     assert bridge_meta["status"] == "enabled"
+    assert bridge_meta["mode"] == "on"
     assert bridge_meta["legs"] == 2
     assert len(bridge_meta["in_scales"]) == cfg.vocab_size
     assert _payload(arrays_dir / "bridge_qDin.bin") == sera_transfer._pack_values(
@@ -1509,7 +1511,14 @@ def test_written_arrays_match_reference(tmp_path: Path) -> None:
     bridge_meta_snapshot = snapshot["metadata"].get("bridge", {})
     assert bridge_meta_snapshot.get("status") == "enabled"
     assert bridge_meta_snapshot.get("enabled") is True
+    assert bridge_meta_snapshot.get("mode") == "on"
     assert snapshot["sera_snapshot"]["config"]["attention"]["features"] == 4
+
+    manifest_bytes = (output / "sera_manifest.bin").read_bytes()
+    manifest = sera_transfer.decode_manifest(manifest_bytes)
+    optional_flags = sera_transfer.OptionalModule(manifest.optional_modules.flags)
+    assert optional_flags & sera_transfer.OptionalModule.BRIDGE
+    assert optional_flags & sera_transfer.OptionalModule.SEARCH
 
 
 def test_convert_skips_bridge_when_inputs_missing(tmp_path: Path, monkeypatch) -> None:
@@ -1537,6 +1546,7 @@ def test_convert_skips_bridge_when_inputs_missing(tmp_path: Path, monkeypatch) -
     bridge_meta = snapshot["metadata"].get("bridge", {})
     assert bridge_meta.get("status") == "disabled"
     assert bridge_meta.get("enabled") is False
+    assert bridge_meta.get("mode") == "off"
     assert bridge_meta.get("legs") == 0
     missing_inputs = bridge_meta.get("missing_inputs", [])
     assert any(name.endswith("ffn.w1.bias") for name in missing_inputs)
@@ -1549,7 +1559,7 @@ def test_convert_skips_bridge_when_inputs_missing(tmp_path: Path, monkeypatch) -
     assert manifest.bridge.proj_cols == 0
     assert manifest.bridge.proj_digest == sera_transfer.ManifestDigest((0, 0))
     optional_flags = sera_transfer.OptionalModule(manifest.optional_modules.flags)
-    assert not (optional_flags & sera_transfer.OptionalModule.BRIDGE)
+    assert optional_flags & sera_transfer.OptionalModule.BRIDGE
     assert not (optional_flags & sera_transfer.OptionalModule.SEARCH)
     assert manifest.search.a_max == 0.0
     assert manifest.search.a_cap == 0.0
