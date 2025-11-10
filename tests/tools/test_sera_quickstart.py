@@ -25,6 +25,8 @@ SafetensorError = safetensors.SafetensorError
 safetensors_numpy = pytest.importorskip("safetensors.numpy")
 save_file = safetensors_numpy.save_file
 
+from tests.tokenizer_fixtures import install_sample_tokenizer
+
 try:
     import gpt_oss.tools.sera_quickstart as quickstart
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
@@ -53,7 +55,7 @@ def _create_checkpoint(tmp_path: Path, *, nested: bool = False) -> Path:
         "d_model": 4,
         "n_heads": 2,
         "head_dim": 2,
-        "vocab_size": 8,
+        "vocab_size": 11,
         "tau": 0.5,
         "rope_theta": 10000.0,
         "layers": [
@@ -70,9 +72,8 @@ def _create_checkpoint(tmp_path: Path, *, nested: bool = False) -> Path:
     }
     (payload_root / "config.json").write_text(json.dumps(config))
 
-    tokenizer_stub = json.dumps({"tokenizer": "stub"})
-    for filename in quickstart.TOKENIZER_FILENAMES:
-        (original / filename).write_text(tokenizer_stub)
+    install_sample_tokenizer(original, filenames=quickstart.TOKENIZER_FILENAMES)
+    install_sample_tokenizer(source, filenames=quickstart.TOKENIZER_FILENAMES)
 
     rng = random.Random(0)
     tensors = {
@@ -280,7 +281,7 @@ def test_quickstart_reports_missing_safetensors(tmp_path: Path, monkeypatch, cap
         "d_model": 4,
         "n_heads": 2,
         "head_dim": 2,
-        "vocab_size": 8,
+        "vocab_size": 11,
         "tau": 0.5,
     }
     (checkpoint_dir / "config.json").write_text(json.dumps(config))

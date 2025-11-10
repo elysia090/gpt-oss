@@ -11,6 +11,8 @@ np = pytest.importorskip("numpy")
 safetensors_numpy = pytest.importorskip("safetensors.numpy")
 save_file = safetensors_numpy.save_file
 
+from tests.tokenizer_fixtures import install_sample_tokenizer
+
 try:
     from gpt_oss.tools import sera_transfer
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
@@ -55,7 +57,7 @@ def _create_checkpoint(root: Path) -> Path:
         "d_model": 4,
         "n_heads": 2,
         "head_dim": 2,
-        "vocab_size": 8,
+        "vocab_size": 11,
         "tau": 0.5,
     }
     layers = []
@@ -85,6 +87,7 @@ def _create_checkpoint(root: Path) -> Path:
     (source / "config.json").write_text(json.dumps(config))
     array_tensors = {name: np.array(value, dtype=np.float32) for name, value in tensors.items()}
     save_file(array_tensors, source / "model.safetensors")
+    install_sample_tokenizer(source)
     return source
 
 

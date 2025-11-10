@@ -18,6 +18,8 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
+from tests.tokenizer_fixtures import install_sample_tokenizer
+
 safetensors_numpy = pytest.importorskip("safetensors.numpy")
 save_file = safetensors_numpy.save_file
 
@@ -117,7 +119,7 @@ def _sample_checkpoint_contents() -> tuple[dict, dict[str, np.ndarray]]:
         "d_model": 4,
         "n_heads": 2,
         "head_dim": 2,
-        "vocab_size": 8,
+        "vocab_size": 11,
         "tau": 0.5,
         "rope_theta": 10000.0,
     }
@@ -155,6 +157,7 @@ def _create_checkpoint(root: Path) -> Path:
     config, tensors = _sample_checkpoint_contents()
     (source / "config.json").write_text(json.dumps(config))
     save_file(_as_numpy_tensors(tensors), source / "model.safetensors")
+    install_sample_tokenizer(source)
     return source
 
 
@@ -166,7 +169,7 @@ def _create_openai_checkpoint(root: Path) -> Path:
         "d_model": 4,
         "n_heads": 2,
         "head_dim": 2,
-        "vocab_size": 8,
+        "vocab_size": 11,
         "tau": 0.5,
         "rope_theta": 10000.0,
     }
@@ -189,6 +192,7 @@ def _create_openai_checkpoint(root: Path) -> Path:
 
     tensors["tok_embeddings.weight"] = _create_matrix(config["vocab_size"], config["d_model"], rng)
     save_file(_as_numpy_tensors(tensors), source / "model.safetensors")
+    install_sample_tokenizer(source)
     return source
 
 
@@ -227,7 +231,7 @@ def gpt_oss_mxfp4_layout() -> tuple[dict[str, object], dict[str, list]]:
         "d_model": 4,
         "n_heads": 2,
         "head_dim": 2,
-        "vocab_size": 8,
+        "vocab_size": 11,
         "tau": 0.5,
     }
 
@@ -457,7 +461,7 @@ def test_model_config_accepts_hf_config_fields() -> None:
         "hidden_size": 4,
         "num_attention_heads": 2,
         "num_key_value_heads": 2,
-        "vocab_size": 8,
+        "vocab_size": 11,
         "rope_theta": 10000.0,
     }
 
@@ -690,7 +694,7 @@ def test_model_config_records_optional_fields() -> None:
         "hidden_size": 4,
         "num_attention_heads": 2,
         "num_key_value_heads": 2,
-        "vocab_size": 8,
+        "vocab_size": 11,
         "num_hidden_layers": 1,
         "num_experts": 32,
         "experts_per_token": 4,
@@ -958,12 +962,14 @@ def test_convert_preserves_optional_config_metadata(tmp_path: Path) -> None:
     source = tmp_path / "optional_config"
     source.mkdir()
 
+    install_sample_tokenizer(source)
+
     config = {
         "hidden_size": 4,
         "num_attention_heads": 2,
         "num_key_value_heads": 2,
         "head_dim": 2,
-        "vocab_size": 8,
+        "vocab_size": 11,
         "num_hidden_layers": 1,
         "num_experts": 32,
         "experts_per_token": 4,
@@ -1135,7 +1141,7 @@ def test_cli_reports_missing_safetensors(tmp_path: Path, monkeypatch, capsys) ->
         "d_model": 4,
         "n_heads": 2,
         "head_dim": 2,
-        "vocab_size": 8,
+        "vocab_size": 11,
         "tau": 0.5,
     }
     (source / "config.json").write_text(json.dumps(config))
@@ -1377,7 +1383,10 @@ def test_written_arrays_match_reference(tmp_path: Path) -> None:
     cfg = sera_transfer.ModelConfig.from_dict(config_data, tensors=tensors)
     arrays_dir = output / "arrays"
 
-    tokenizer_data, tokenizer_meta = sera_transfer.tokenizer_arrays(cfg, tensors)
+    tokenizer_assets = sera_transfer.load_tokenizer_assets([source])
+    tokenizer_data, tokenizer_meta = sera_transfer.tokenizer_arrays(
+        cfg, tensors, tokenizer_assets=tokenizer_assets
+    )
     fst_payload = _payload(arrays_dir / "tokenizer_fst.bin")
     expected_fst = sera_transfer._pack_values(tokenizer_data["tokenizer_fst"], "B")
     assert fst_payload == expected_fst
@@ -1388,6 +1397,15 @@ def test_written_arrays_match_reference(tmp_path: Path) -> None:
         assert table_payload == expected_table
         mph_info = tokenizer_meta["mph"][length]
         assert mph_info["table_size"] >= len(mph_info["key_hashes"])
+
+    provenance = tokenizer_meta.get("provenance", {})
+    assert provenance.get("format") in {"tokenizer.json", "tokenizer.model"}
+    salts = tokenizer_meta.get("salts", {})
+    assert isinstance(salts.get("global_seed"), int)
+    sp_record = tokenizer_meta.get("sardinas_patterson", {})
+    assert sp_record.get("digest")
+    levels = sp_record.get("levels", [])
+    assert isinstance(levels, list)
 
     linear_data, linear_meta = sera_transfer.collapse_ffn(cfg, tensors, top_l=2)
     assert set(linear_meta["keys"]) == {
@@ -1445,35 +1463,55 @@ def test_array_checksums_regression(tmp_path: Path) -> None:
     }
 
     expected = {
-        "R_init.bin": "7d7f9cf695a015d4dd5e862e102e6fc39ab76b69b5b9318434a5a6f196b0c595",
-        "T_1.bin": "575385afc5de59cd4cff920b8f5ca9c5f57d2f1a469d1ffadcc9ecfc689d1209",
-        "T_2.bin": "0313a62554d8b532bce4261a39baafc98526e26bf473265b58aa3b12f3e1c3e9",
-        "T_3.bin": "e87942391bf2fe9d6fa5d81cd3d1f2b023d123bb9fb5a4adefc5595ad00c9b9b",
-        "T_4.bin": "797e35cc1d64523fa13907ce9b0e0dc06c913cd07b07eb28052cd30dd6c0919f",
-        "bridge_hubs.bin": "b1765af176adc937bbdcaded86d2e8bc756358dba74a03412e16240b2f8eff30",
-        "bridge_qDin.bin": "1edef4d83792250982a9ee583b85ccffbe40cc13c4ecf080e2cbfa1a09606709",
-        "bridge_qDout.bin": "2090c735da1cbcbe3fc1a72437219ce325eecdb978f7f1e9c60785a92b374197",
-        "cuckoo_delta.bin": "576acdb10a9d0d9f5dcb9970eb7b6105d930cd3317afcf2a07c62330586a3145",
-        "delaybuf_init.bin": "2d65a9ed7f442cc54cb983094b6feb9a99635210701c038b6d316e451a2b3654",
-        "linear_bias.bin": "9c4dcbf57c1e5a6890a9c882e3ba12a90ece9fbf99a86818652b9969170d37ba",
-        "linear_keys.bin": "15913f521cf0e0ca841b4617aecf55b7dece60ff8bb610968f8fd13b081a6d27",
-        "linear_mphf.bin": "990652fb2ceaa7532b2b0e40b7ac1a145262b6272e119c04664ba15b53ff3283",
-        "linear_weights.bin": "b9e896e87767b2defb037a085d5bbd9776b7ee429fe3f7aa3882370ba5923961",
-        "memory_coeff.bin": "724d23280561eb1e7909a86fefdc778a6d8ba0e209734bd7f26edffe48a76182",
-        "overlays_DeltaW.bin": "6cd9368a0c3333594fe8a356d010538cd4c577b94c5f974183831b42dccbd1c6",
-        "overlays_H.bin": "646005ada365721c1a4c7c6c4c75d2f8153ffa24f937e58be8224b79dc2c411b",
-        "overlays_U.bin": "9ba6d03ff54587bdd0304c6b9b128d4acb73afd449c305e87f3fc841edf551b1",
-        "peer_scores.bin": "7044204096c6000dacb5c823a58031797bbea9515d08f7383f76064dbdf7d227",
-        "prf_W.bin": "b94cc880877de076921f8bea3a3f3b9d46a7bf91349208107d515da9659cdbb5",
-        "s_init.bin": "5a534c99468d8f1d53ed0b4058e1b376265361a42fc8fd57cbf7d28e11d0eab2",
-        "tokenizer_fst.bin": "3f7f982b24185fe6da5aa84f43adec88cd4236447ed7f8f854399c4700455115",
-        "whitening_mu.bin": "6de8277b57b6819bda93c1e23cdbc536d9e3806760ec71b78de79c8d7cb45982",
-        "whitening_sig2.bin": "a49a905b5c9d158bf85efc300b0bb9c29908c4d95fc68dc582ffa054569d8447",
+        "R_init.bin": "767b79bfd95b68f965283ffad093ca55a187222b59d7c161d201c4ba5100ea8b",
+        "T_1.bin": "3c4683b929755dc6d56cc211ffb080dc5b0e5cb160d30add07ebaa7c0e257343",
+        "T_2.bin": "fba29db3eaa080104efcbc655e577f9355d6e88749b6a8cfdcc79150a411d39e",
+        "T_3.bin": "0f53b34731af55a91b78cd4cc0c681e3d4324410126c5fba741a261e4ec722f1",
+        "T_4.bin": "72fa52c7be6d4c0f08f43be30611c6f85e4fd639fd67c6970b28662db1989f65",
+        "bridge_hubs.bin": "116088fcd8831a85720d85c2854d889ecef28c85aba92e34538a885aa732f604",
+        "bridge_qDin.bin": "277d15af54828d88ab4a1a9930633b4f1222ccbc42128399ce372f25a1320bf7",
+        "bridge_qDout.bin": "eb6a2dd503cf06e2f9cea2d711e6e71c80612c923f6c5ddffc9690f03067c037",
+        "cuckoo_delta.bin": "cd8c8c974b7682baf09587ce7d7f10c1ed67aac84202d287028856913dd4d836",
+        "delaybuf_init.bin": "858d7ea20d671f071b09cd8a218a58cc9c9c6b37a01689d0cf26bfdd4ebe0e20",
+        "linear_bias.bin": "5a15788aa0c4d6ffba5dee2045aa9fd3cc4fe1b299dca25e895149bdb5055c7b",
+        "linear_keys.bin": "c19a87129f6f9c90ddbd2235584e32b844d3e3639807c6c97ccd017e2fd616f4",
+        "linear_mphf.bin": "a5b434137454136fef0e07388c515168b64a50866fc0a666f82d9c4c770e8830",
+        "linear_weights.bin": "0fdff77dc84abcbe972367768e3a260d6e0a45497d4727daca0f66ee2c60f38b",
+        "memory_coeff.bin": "612b3e529f1f1efe23db8d2426e9464c99db586e5d92ab6a6ba6a930005afc29",
+        "overlays_DeltaW.bin": "c1aa5b54a009160a156df46627eae1ba1560aeb6cefca9eb8a909f7f64722d90",
+        "overlays_H.bin": "8822076e87c71898268117b514363d4d0a1e94979a82660592c15dd8d2bd007b",
+        "overlays_U.bin": "2e52afbe02b59190268a21f35aaf73d6fd414c9a6d0401fc3d1fc6ebcb50bbea",
+        "peer_scores.bin": "47f9b55acb21720cfcafce10a09be10389b3dd32d07354163f01e752afe9f8c9",
+        "prf_W.bin": "82f12b35a3b21cfda599a42ffb8ad775515c4346ebff8675066e225a0143ee69",
+        "s_init.bin": "0e4e4aa04d00bdb4bab468d59d41814335e8acf684c5b0f777e1c504bf69d4f6",
+        "tokenizer_fst.bin": "22dc36f9948ec635b865778daf710cd6235c5cf232e9b4e5e0045c5768c6a188",
+        "whitening_mu.bin": "a604d77b6148b5b708757df5d5beea754058441b732eebf039c694747a3e6ab5",
+        "whitening_sig2.bin": "471d801b75e45a7cc4680b05e1fd7cae0150c40eef007dcc47c30a20696eb8e0",
     }
-
     differences = {
         name: (checksums[name], expected.get(name))
         for name in sorted(checksums)
         if checksums[name] != expected.get(name)
     }
     assert differences == {}
+
+def test_tokenizer_dump_matches_fixture(tmp_path: Path) -> None:
+    source = _create_checkpoint(tmp_path / "dump_fixture")
+    output = tmp_path / "output"
+    sera_transfer.convert(source, output, r=4, r_v=2, top_l=2)
+
+    fixture_path = Path(__file__).resolve().parents[1] / "data" / "sample_tokenizer_dump.json"
+    fixture = json.loads(fixture_path.read_text())
+    arrays_dir = output / "arrays"
+
+    for name, expected in fixture["digests"].items():
+        payload = _payload(arrays_dir / name)
+        digest = hashlib.sha256(payload).hexdigest()
+        assert digest == expected
+
+    snapshot = pickle.loads((output / "sera_state.pkl").read_bytes())
+    tokenizer_meta = snapshot["metadata"]["tokenizer"]
+
+    assert tokenizer_meta["vocab_digest"] == fixture["metadata"]["vocab_digest"]
+    assert tokenizer_meta["sardinas_patterson"]["digest"] == fixture["metadata"]["sardinas_patterson_digest"]
+    assert tokenizer_meta["salts"]["global_seed"] == fixture["metadata"]["salts"]["global_seed"]

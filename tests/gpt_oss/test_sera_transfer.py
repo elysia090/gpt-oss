@@ -45,7 +45,7 @@ def patch_conversion_dependencies(monkeypatch):
     )
     dummy_cfg = SimpleNamespace(
         d_model=16,
-        vocab_size=8,
+        vocab_size=11,
         layers=[dummy_layer],
         rope_theta=None,
         num_key_value_heads=None,
@@ -71,6 +71,16 @@ def patch_conversion_dependencies(monkeypatch):
         "tokenizer_arrays",
         lambda *args, **kwargs: ({"tok": [0]}, {"info": "tokenizer"}),
     )
+    dummy_pieces = tuple((bytes([idx + 1]), idx) for idx in range(dummy_cfg.vocab_size))
+    dummy_text_pieces = tuple((chr(65 + idx), idx) for idx in range(dummy_cfg.vocab_size))
+    dummy_assets = sera_transfer.TokenizerAssets(
+        kind="BPE",
+        pieces=dummy_pieces,
+        text_pieces=dummy_text_pieces,
+        provenance={"format": "tokenizer.json", "path": "dummy", "sha256": "00"},
+        config={"type": "BPE", "vocab_size": dummy_cfg.vocab_size, "added_tokens": 0},
+    )
+    monkeypatch.setattr(sera_transfer, "load_tokenizer_assets", lambda _roots: dummy_assets)
     monkeypatch.setattr(sera_transfer, "compute_prf", lambda *args, **kwargs: {"prf": [0.0]})
     monkeypatch.setattr(
         sera_transfer,
@@ -151,7 +161,7 @@ def test_convert_finds_files_in_original(tmp_path: Path, monkeypatch):
     )
     dummy_cfg = SimpleNamespace(
         d_model=16,
-        vocab_size=8,
+        vocab_size=11,
         layers=[dummy_layer],
         rope_theta=None,
         num_key_value_heads=None,
@@ -217,7 +227,7 @@ def test_convert_honours_original_subdir(tmp_path: Path, monkeypatch):
     )
     dummy_cfg = SimpleNamespace(
         d_model=16,
-        vocab_size=8,
+        vocab_size=11,
         layers=[dummy_layer],
         rope_theta=None,
         num_key_value_heads=None,
