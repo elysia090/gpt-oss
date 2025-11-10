@@ -653,6 +653,7 @@ _DTYPE_INFO: Mapping[str, Tuple[int, Callable[[object], bytes]]] = {
     "q8_8": (7, lambda data: _pack_values(data, "h")),
     "q4_12": (8, lambda data: _pack_values(data, "H")),
     "bf16": (9, _pack_bf16),
+    "u64": (10, lambda data: _pack_values(data, "Q")),
 }
 
 
@@ -894,6 +895,10 @@ def _hash_bytes(data: bytes) -> int:
     return int.from_bytes(hashlib.sha256(data).digest()[:8], "little", signed=False)
 
 
+class MinimalPerfectHashError(RuntimeError):
+    """Raised when two-level MPHF construction cannot be completed."""
+
+
 def _assign_positions(
     options: Sequence[Tuple[int, int]], occupied: Sequence[bool]
 ) -> Optional[List[int]]:
@@ -912,7 +917,12 @@ def _assign_positions(
     return placement
 
 
-def _build_two_level_mph(keys: Sequence[int]) -> Tuple[List[int], List[int], Dict[int, int]]:
+def _build_two_level_mph(
+    keys: Sequence[int],
+    *,
+    max_seed_attempts: int | None = None,
+    failure_mode: str = "error",
+) -> Tuple[List[int], List[int], Dict[int, int]]:
     """Construct a deterministic two-level minimal perfect hash (spec §4.4).
 
     The helper mirrors the construction used in both the tokenizer and the
@@ -920,7 +930,14 @@ def _build_two_level_mph(keys: Sequence[int]) -> Tuple[List[int], List[int], Dic
     returns a tuple ``(seeds, ordered_keys, slot_lookup)`` where ``seeds`` is
     the table of bucket seeds, ``ordered_keys`` are the keys arranged in slot
     order, and ``slot_lookup`` maps each key to its slot index.
+
+    ``max_seed_attempts`` bounds the number of seed candidates considered for
+    each bucket.  When ``failure_mode`` is ``"disabled"`` and the attempts are
+    exhausted, the helper returns empty results instead of raising.
     """
+
+    if failure_mode not in {"error", "disabled"}:
+        raise ValueError("failure_mode must be 'error' or 'disabled'")
 
     capacity = len(keys)
     if capacity == 0:
@@ -937,12 +954,18 @@ def _build_two_level_mph(keys: Sequence[int]) -> Tuple[List[int], List[int], Dic
         buckets.setdefault(bucket, []).append(key)
 
     slot_lookup: Dict[int, int] = {}
+    attempt_limit = (
+        max(0, max_seed_attempts)
+        if max_seed_attempts is not None
+        else 1 << 16
+    )
     ordered_buckets = sorted(
         buckets.items(), key=lambda item: (len(item[1]), item[0]), reverse=True
     )
     for bucket, bucket_keys in ordered_buckets:
         local_keys = sorted(bucket_keys)
-        for seed_candidate in range(1 << 16):
+        for attempt in range(attempt_limit):
+            seed_candidate = attempt
             options: List[Tuple[int, int]] = []
             for key in local_keys:
                 pos0 = _mix64(key, seed_candidate) % capacity
@@ -957,8 +980,12 @@ def _build_two_level_mph(keys: Sequence[int]) -> Tuple[List[int], List[int], Dic
                 occupied[slot] = True
                 slot_lookup[key] = slot
             break
-        else:  # pragma: no cover - deterministic bound ensures termination
-            raise RuntimeError("Unable to build minimal perfect hash (seed cap reached)")
+        else:
+            if failure_mode == "disabled":
+                return [], [], {}
+            raise MinimalPerfectHashError(
+                "Unable to build minimal perfect hash (seed cap reached)"
+            )
 
     ordered_keys = [key for key in slots if key is not None]
     return seeds, ordered_keys, slot_lookup
@@ -2349,14 +2376,18 @@ def collapse_ffn(
     slot_keys = list(weight_map.keys())
     seeds, ordered_keys, slot_lookup = _build_two_level_mph(slot_keys)
     mphf = [[(seed >> (8 * i)) & 0xFF for i in range(4)] for seed in seeds]
-    key_bytes = [[(key >> (8 * i)) & 0xFF for i in range(8)] for key in ordered_keys]
     weights = [weight_map[key] for key in ordered_keys]
+
+    seed_bytes = b"".join(struct.pack("<I", seed & 0xFFFFFFFF) for seed in seeds)
+    key_bytes = b"".join(struct.pack("<Q", key & 0xFFFFFFFFFFFFFFFF) for key in ordered_keys)
+    mphf_salt_bytes = hashlib.sha256(b"sera::linear_mphf::" + seed_bytes).digest()
+    key_salt_bytes = hashlib.sha256(b"sera::linear_keys::" + key_bytes).digest()
 
     cuckoo_blob = _serialize_cuckoo(residual_entries)
 
     arrays = {
         "linear_mphf": mphf,
-        "linear_keys": key_bytes,
+        "linear_keys": ordered_keys,
         "linear_weights": weights,
         "linear_bias": [base_bias],
         "cuckoo_delta": cuckoo_blob,
@@ -2367,6 +2398,10 @@ def collapse_ffn(
         "bias": base_bias,
         "residuals": len(residual_entries),
         "slot_lookup": slot_lookup,
+        "salts": {
+            "mphf": mphf_salt_bytes.hex(),
+            "key": key_salt_bytes.hex(),
+        },
     }
     return arrays, metadata
 
@@ -3723,6 +3758,7 @@ def write_manifest(
     r_v: int,
     vocab_size: int,
     determinism: DeterminismSettings | None = None,
+    salts: Mapping[str, bytes] | None = None,
 ) -> None:
     schema_path = Path("docs/specs/Sera-Transfer.txt")
     schema_digest_bytes = (
@@ -3733,6 +3769,7 @@ def write_manifest(
     seed_digest_bytes = hashlib.sha256(b"sera-transfer").digest()
 
     determinism = determinism or DeterminismSettings()
+    salts = dict(salts or {})
 
     abi_flags = 0
     if determinism.assume_fma:
@@ -3832,13 +3869,19 @@ def write_manifest(
     linear_mphf = artefacts.get("linear_mphf")
     linear_keys = artefacts.get("linear_keys")
 
-    mphf_digest_bytes = hashlib.sha256(
-        b"mphf::" + (linear_mphf.sha256 if linear_mphf is not None else b"")
-    ).digest()
-    key_digest_bytes = hashlib.sha256(
-        b"key::" + (linear_keys.sha256 if linear_keys is not None else b"")
-    ).digest()
-    trust_salt_bytes = hashlib.sha256(b"trust::disabled").digest()
+    mphf_digest_bytes = salts.get("mphf")
+    if mphf_digest_bytes is None:
+        mphf_digest_bytes = hashlib.sha256(
+            b"mphf::" + (linear_mphf.sha256 if linear_mphf is not None else b"")
+        ).digest()
+    key_digest_bytes = salts.get("key")
+    if key_digest_bytes is None:
+        key_digest_bytes = hashlib.sha256(
+            b"key::" + (linear_keys.sha256 if linear_keys is not None else b"")
+        ).digest()
+    trust_salt_bytes = salts.get("trust_gate")
+    if trust_salt_bytes is None:
+        trust_salt_bytes = hashlib.sha256(b"trust::disabled").digest()
 
     salts_section = SaltsSection(
         mphf=_manifest_digest(mphf_digest_bytes),
@@ -4096,6 +4139,7 @@ def convert(
             artefact_digests: Dict[str, ArrayDigest] = {}
             artefact_records: Dict[str, Dict[str, object]] = {}
             metadata: Dict[str, object] = {}
+            manifest_salts: Dict[str, bytes] = {}
             array_infos: List[ArrayInfo] = []
             snapshot_infos: List[SnapshotInfo] = []
 
@@ -4168,7 +4212,7 @@ def convert(
             log_notice("Collapsing FFN weights")
             linear_data, linear_meta = collapse_fn(cfg, tensors, top_l)
             store_array("linear_mphf", linear_data["linear_mphf"], "u8")
-            store_array("linear_keys", linear_data["linear_keys"], "u8")
+            store_array("linear_keys", linear_data["linear_keys"], "u64")
             store_array("linear_weights", linear_data["linear_weights"], "f32")
             store_array("linear_bias", linear_data["linear_bias"], "f32")
             store_array("cuckoo_delta", linear_data["cuckoo_delta"], "u8")
@@ -4183,6 +4227,20 @@ def convert(
                 if value is not None:
                     linear_meta[key] = value
             metadata["linear"] = linear_meta
+            linear_salts_meta = linear_meta.get("salts")
+            if isinstance(linear_salts_meta, Mapping):
+                mphf_hex = linear_salts_meta.get("mphf")
+                if isinstance(mphf_hex, str):
+                    try:
+                        manifest_salts["mphf"] = bytes.fromhex(mphf_hex)
+                    except ValueError:  # pragma: no cover - defensive
+                        pass
+                key_hex = linear_salts_meta.get("key")
+                if isinstance(key_hex, str):
+                    try:
+                        manifest_salts["key"] = bytes.fromhex(key_hex)
+                    except ValueError:  # pragma: no cover - defensive
+                        pass
 
             log_notice("Computing memory coefficients")
             memory_data, memory_meta = memory_fn(cfg)
@@ -4200,6 +4258,17 @@ def convert(
             determinism_meta = _determinism_metadata(active_settings, observer)
             metadata["determinism"] = determinism_meta
 
+            trust_manifest_salt_bytes = hashlib.sha256(b"trust::disabled").digest()
+            manifest_salts.setdefault("trust_gate", trust_manifest_salt_bytes)
+            trust_profile_salt_bytes = hashlib.sha256(b"trust-profile::none").digest()
+            metadata["trust_gate"] = {
+                "status": "disabled",
+                "salts": {
+                    "manifest": trust_manifest_salt_bytes.hex(),
+                    "profile": trust_profile_salt_bytes.hex(),
+                },
+            }
+
             manifest_path = output / "sera_manifest.bin"
             write_manifest_fn(
                 manifest_path,
@@ -4209,6 +4278,7 @@ def convert(
                 r_v=local_r_v,
                 vocab_size=cfg.vocab_size or 16,
                 determinism=active_settings,
+                salts=manifest_salts,
             )
             determinism_meta["manifest_path"] = manifest_path.name
             try:

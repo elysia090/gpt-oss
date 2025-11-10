@@ -33,6 +33,7 @@ SPEC_DTYPE_CODES = {
     "q8_8": 7,
     "q4_12": 8,
     "bf16": 9,
+    "u64": 10,
 }
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -902,6 +903,32 @@ def test_model_config_handles_gpt_oss_mxfp4_layout(gpt_oss_mxfp4_layout) -> None
     assert len(bridge_meta["layer_seeds"]) == len(cfg.layers)
 
 
+def test_build_two_level_mph_success() -> None:
+    keys = [0xDEADBEEF, 0xFEEDFACE, 0x12345678]
+    seeds, ordered_keys, slot_lookup = sera_transfer._build_two_level_mph(keys)
+
+    assert sorted(ordered_keys) == sorted(keys)
+    assert all(0 <= slot_lookup[key] < len(ordered_keys) for key in keys)
+    assert len(seeds) >= 1
+
+
+def test_build_two_level_mph_disable_mode() -> None:
+    seeds, ordered_keys, slot_lookup = sera_transfer._build_two_level_mph(
+        [1, 2, 3],
+        max_seed_attempts=0,
+        failure_mode="disabled",
+    )
+
+    assert seeds == []
+    assert ordered_keys == []
+    assert slot_lookup == {}
+
+
+def test_build_two_level_mph_failure_raises() -> None:
+    with pytest.raises(sera_transfer.MinimalPerfectHashError):
+        sera_transfer._build_two_level_mph([1, 2, 3], max_seed_attempts=0)
+
+
 @pytest.mark.parametrize(
     "factory",
     [
@@ -945,6 +972,11 @@ def test_cli_round_trip(tmp_path: Path, factory) -> None:
     snapshot_cfg = snapshot["sera_snapshot"]["config"]
     assert snapshot_cfg["tokenizer"]["max_piece_length"] == 4
     assert snapshot["metadata"]["attention"]["features"] == 4
+    trust_meta = snapshot["metadata"].get("trust_gate", {})
+    assert trust_meta.get("status") == "disabled"
+    trust_salts = trust_meta.get("salts", {})
+    assert trust_salts.get("manifest")
+    assert trust_salts.get("profile")
 
     manifest_bytes = (output / "sera_manifest.bin").read_bytes()
     assert manifest_bytes[:4] == struct.pack("<I", 0x5345524D)
@@ -1416,8 +1448,13 @@ def test_written_arrays_match_reference(tmp_path: Path) -> None:
     assert len(linear_meta["weights"]) == cfg.d_model * len(cfg.layers)
     assert linear_meta["residuals"] > 0
     assert _payload(arrays_dir / "linear_keys.bin") == sera_transfer._pack_values(
-        linear_data["linear_keys"], "B"
+        linear_data["linear_keys"], "Q"
     )
+    linear_salts = linear_meta.get("salts", {})
+    assert set(linear_salts) == {"mphf", "key"}
+    for value in linear_salts.values():
+        assert isinstance(value, str)
+        assert len(value) >= 32
     assert _payload(arrays_dir / "linear_weights.bin") == sera_transfer._pack_values(
         linear_data["linear_weights"], "f"
     )
@@ -1474,7 +1511,7 @@ def test_array_checksums_regression(tmp_path: Path) -> None:
         "cuckoo_delta.bin": "cd8c8c974b7682baf09587ce7d7f10c1ed67aac84202d287028856913dd4d836",
         "delaybuf_init.bin": "858d7ea20d671f071b09cd8a218a58cc9c9c6b37a01689d0cf26bfdd4ebe0e20",
         "linear_bias.bin": "5a15788aa0c4d6ffba5dee2045aa9fd3cc4fe1b299dca25e895149bdb5055c7b",
-        "linear_keys.bin": "c19a87129f6f9c90ddbd2235584e32b844d3e3639807c6c97ccd017e2fd616f4",
+        "linear_keys.bin": "ba1a7672cffb39878712ce5f3f6859b5863753dc4df3811310df9acfa19a1de1",
         "linear_mphf.bin": "a5b434137454136fef0e07388c515168b64a50866fc0a666f82d9c4c770e8830",
         "linear_weights.bin": "0fdff77dc84abcbe972367768e3a260d6e0a45497d4727daca0f66ee2c60f38b",
         "memory_coeff.bin": "612b3e529f1f1efe23db8d2426e9464c99db586e5d92ab6a6ba6a930005afc29",
