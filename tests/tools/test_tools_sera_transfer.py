@@ -491,6 +491,39 @@ def test_model_config_accepts_hf_config_fields() -> None:
     assert layer.b2.endswith("mlp.down_proj.bias")
 
 
+def test_materialize_qkv_layers_reports_inference_failure() -> None:
+    layer = sera_transfer.LayerConfig(
+        name="layer0",
+        w_q="layer0.attn.qkv__sera_qkv__W_Q",
+        w_k="layer0.attn.qkv__sera_qkv__W_K",
+        w_v="layer0.attn.qkv__sera_qkv__W_V",
+        w_o="layer0.attn.o.weight",
+        w1="layer0.ffn.w1.weight",
+        w2="layer0.ffn.w2.weight",
+        b1="layer0.ffn.w1.bias",
+        b2="layer0.ffn.w2.bias",
+    )
+    tensors: dict[str, np.ndarray] = {
+        "layer0.attn.qkv": np.zeros((4,), dtype=np.float32),
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        sera_transfer.ModelConfig._materialize_qkv_layers(
+            [layer],
+            tensors,
+            d_model=4,
+            n_heads=2,
+            head_dim=2,
+            num_key_value_heads=None,
+        )
+
+    message = str(excinfo.value)
+    assert "layer0.attn.qkv" in message
+    assert "(4,)" in message
+    assert "n_heads=2" in message
+    assert "num_key_value_heads=unspecified" in message
+
+
 def test_model_config_infers_layers_from_generic_suffixes() -> None:
     config = {
         "hidden_size": 4,
@@ -1124,6 +1157,30 @@ def test_cli_reports_missing_safetensors(tmp_path: Path, monkeypatch, capsys) ->
     assert "pip install safetensors" in stderr
     assert "No artefacts were written" in stderr
     assert not output.exists()
+
+
+def test_cli_reports_value_error(monkeypatch, capsys, tmp_path: Path) -> None:
+    module = importlib.reload(sera_transfer)
+
+    def failing_convert(*args, **kwargs):  # noqa: ARG001
+        raise ValueError("example failure message")
+
+    monkeypatch.setattr(module, "convert", failing_convert)
+
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+
+    with pytest.raises(SystemExit) as excinfo:
+        module.main([
+            "--source",
+            str(source),
+            "--output",
+            str(output),
+        ])
+
+    assert excinfo.value.code == 1
+    stderr = capsys.readouterr().err
+    assert "sera_transfer: example failure message" in stderr
 
 
 def test_convert_handles_path_resolution_failures(tmp_path: Path, monkeypatch) -> None:
