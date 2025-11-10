@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import hashlib
 import json
+import multiprocessing
 import os
 import pickle
 import random
@@ -46,6 +47,57 @@ def _create_vector(length: int, rng: random.Random) -> list[float]:
 
 def _as_numpy_tensors(tensors: dict[str, list]) -> dict[str, np.ndarray]:
     return {name: np.array(value, dtype=np.float32) for name, value in tensors.items()}
+
+
+def _memory_worker(checkpoint: str, queue) -> None:
+    import importlib
+    import resource
+    from pathlib import Path
+
+    worker_module = importlib.import_module("gpt_oss.tools.sera_transfer")
+    path = Path(checkpoint)
+    index, _ = worker_module._read_safetensors_index(path)
+    max_layer_bytes = max(
+        entry["data_offsets"][1] - entry["data_offsets"][0]
+        for entry in index.values()
+    )
+
+    start_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    tensors = worker_module.load_tensors(path)
+    del tensors
+    peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    queue.put({
+        "peak": max(0, peak_rss - start_rss),
+        "max_layer": max_layer_bytes,
+    })
+
+
+def _bf16_payload(values: np.ndarray) -> bytes:
+    data = np.asarray(values, dtype=np.float32)
+    uint32 = data.view(np.uint32)
+    bf16 = (uint32 >> 16).astype(np.uint16)
+    return bf16.tobytes()
+
+
+def _write_safetensors(path: Path, tensors: dict[str, tuple[str, tuple[int, ...], bytes]]) -> None:
+    header: dict[str, dict[str, object]] = {}
+    offset = 0
+    payloads: list[bytes] = []
+    for name, (dtype, shape, data) in tensors.items():
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + len(data)],
+        }
+        payloads.append(data)
+        offset += len(data)
+
+    header_bytes = json.dumps(header).encode("utf-8")
+    with path.open("wb") as handle:
+        handle.write(len(header_bytes).to_bytes(8, "little"))
+        handle.write(header_bytes)
+        for chunk in payloads:
+            handle.write(chunk)
 
 
 def _sample_checkpoint_contents() -> tuple[dict, dict[str, np.ndarray]]:
@@ -206,6 +258,12 @@ def test_load_tensors_requires_safetensors(tmp_path, monkeypatch):
     checkpoint = tmp_path / "model.safetensors"
     checkpoint.write_bytes(b"")
 
+    monkeypatch.setattr(
+        module,
+        "_read_safetensors_index",
+        lambda path: ({"foo": {"dtype": "F32", "shape": (1,), "data_offsets": (0, 4)}}, 0),
+    )
+
     def missing_safe_open(*args, **kwargs):  # noqa: ARG001
         raise ModuleNotFoundError(module._SAFETENSORS_MISSING_MSG)
 
@@ -240,6 +298,11 @@ def test_load_tensors_passes_numpy_framework(tmp_path, monkeypatch):
         calls.append(framework)
         return _FakeSafeFile()
 
+    monkeypatch.setattr(
+        module,
+        "_read_safetensors_index",
+        lambda path: ({"foo": {"dtype": "F32", "shape": (1,), "data_offsets": (0, 4)}}, 0),
+    )
     monkeypatch.setattr(module, "safe_open", recording_safe_open)
 
     checkpoint = tmp_path / "model.safetensors"
@@ -302,7 +365,7 @@ def test_load_tensors_keyword_only_safe_open_backward_compat(tmp_path, monkeypat
     calls: list[tuple[str, str]] = []
     payload = {"foo": [[1.0, 2.0]]}
 
-    def keyword_only_safe_open(path, *args, framework, device=None):  # noqa: ARG001
+    def keyword_only_safe_open(path, *args, framework, device=None, **kwargs):  # noqa: ARG001
         if args:
             raise TypeError("safe_open() takes 1 positional argument but 2 were given")
         calls.append(("keyword", framework))
@@ -311,6 +374,11 @@ def test_load_tensors_keyword_only_safe_open_backward_compat(tmp_path, monkeypat
     checkpoint = tmp_path / "model.safetensors"
     checkpoint.write_bytes(b"")
 
+    monkeypatch.setattr(
+        module,
+        "_read_safetensors_index",
+        lambda path: ({"foo": {"dtype": "F32", "shape": (1,), "data_offsets": (0, 4)}}, 0),
+    )
     monkeypatch.setattr(module, "safe_open", keyword_only_safe_open)
 
     tensors = module.load_tensors(checkpoint)
@@ -320,6 +388,56 @@ def test_load_tensors_keyword_only_safe_open_backward_compat(tmp_path, monkeypat
     assert tensor.tolist() == payload["foo"]
     assert calls == [("keyword", "numpy")]
 
+
+def test_load_tensors_preserves_bf16_payload(tmp_path):
+    module = importlib.reload(sera_transfer)
+
+    path = tmp_path / "model.safetensors"
+    values = np.arange(32, dtype=np.float32).reshape(4, 8)
+    _write_safetensors(
+        path,
+        {"layer.weight": ("BF16", values.shape, _bf16_payload(values))},
+    )
+
+    tensors = module.load_tensors(path)
+
+    bf_tensor = tensors["layer.weight"]
+    bf_cls = getattr(module, "_Bfloat16Tensor")
+    assert isinstance(bf_tensor, bf_cls)
+    assert bf_tensor.shape == (4, 8)
+    assert bf_tensor.nbytes == values.size * 2
+
+    decoded = bf_tensor.to_float32()
+    np.testing.assert_allclose(decoded, values)
+
+
+def test_load_tensors_memory_budget_for_20b(tmp_path):
+    module = importlib.reload(sera_transfer)
+
+    path = tmp_path / "gpt-oss-20b.safetensors"
+    qkv = np.zeros((5120, 2880), dtype=np.float32)
+    o_proj = np.zeros((4096, 1024), dtype=np.float32)
+    embed = np.zeros((32000, 128), dtype=np.float32)
+    _write_safetensors(
+        path,
+        {
+            "model.layers.0.attention.qkv.weight": ("BF16", qkv.shape, _bf16_payload(qkv)),
+            "model.layers.0.attention.o_proj.weight": ("F32", o_proj.shape, o_proj.tobytes()),
+            "model.embed_tokens.weight": ("F32", embed.shape, embed.tobytes()),
+        },
+    )
+
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    proc = ctx.Process(target=_memory_worker, args=(str(path), queue))
+    proc.start()
+    proc.join()
+    assert proc.exitcode == 0
+    result = queue.get()
+    queue.close()
+    queue.join_thread()
+
+    assert result["peak"] <= result["max_layer"] + 512 * 1024 * 1024
 
 
 def test_model_config_accepts_hf_config_fields() -> None:

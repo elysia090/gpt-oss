@@ -19,7 +19,7 @@ import sys
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Iterable as _Iterable, Mapping as _Mapping, MutableMapping
+from collections.abc import Mapping as _Mapping, MutableMapping
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
 _SAFETENSORS_MISSING_MSG = (
@@ -29,7 +29,7 @@ _SAFETENSORS_MISSING_MSG = (
 
 if importlib.util.find_spec("safetensors") is None:  # pragma: no cover - deterministic import guard
     raise ModuleNotFoundError(_SAFETENSORS_MISSING_MSG)
-from safetensors import SafetensorError, deserialize
+from safetensors import SafetensorError
 
 _NUMPY_MISSING_MSG = (
     "The numpy package is required for Sera conversion. Install it with 'pip install numpy'."
@@ -44,11 +44,6 @@ if not getattr(_np, "__gpt_oss_numpy_stub__", False):
     if _missing_numpy_apis:
         raise ModuleNotFoundError(_NUMPY_MISSING_MSG)
 
-try:  # pragma: no cover - optional dependency
-    import torch as _torch
-except Exception:  # pragma: no cover - defensive
-    _torch = None
-
 if TYPE_CHECKING:  # pragma: no cover - typing helper
     from numpy import ndarray as _NDArray
     from torch import Tensor as _TorchTensor
@@ -56,6 +51,29 @@ if TYPE_CHECKING:  # pragma: no cover - typing helper
     TensorLike = list | _NDArray | _TorchTensor
 else:  # pragma: no cover - runtime alias
     TensorLike = Any
+
+_TORCH_IMPORT_ATTEMPTED = False
+_TORCH_MODULE = None
+
+
+def _get_torch():
+    global _TORCH_IMPORT_ATTEMPTED, _TORCH_MODULE
+    if not _TORCH_IMPORT_ATTEMPTED:
+        _TORCH_IMPORT_ATTEMPTED = True
+        try:  # pragma: no cover - optional dependency
+            import torch as torch_module
+        except Exception:  # pragma: no cover - defensive
+            _TORCH_MODULE = None
+        else:
+            _TORCH_MODULE = torch_module
+    return _TORCH_MODULE
+
+
+def _is_torch_tensor(value: object) -> bool:
+    if value is None or not _TORCH_IMPORT_ATTEMPTED:
+        return False
+    torch_module = _TORCH_MODULE
+    return torch_module is not None and isinstance(value, torch_module.Tensor)
 
 
 @dataclass
@@ -125,12 +143,17 @@ def _resolve_load_tensors():
 
 
 def _load_sera_common_module():
+    module_name = "_sera_common"
     sera_common_path = Path(__file__).resolve().parents[1] / "inference" / "sera_common.py"
-    spec = importlib.util.spec_from_file_location("_sera_common", sera_common_path)
+    spec = importlib.util.spec_from_file_location(module_name, sera_common_path)
     if spec is None or spec.loader is None:  # pragma: no cover - defensive
         raise RuntimeError("Unable to locate Sera runtime helpers")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules.setdefault(spec.name, module)
+    module = sys.modules.get(module_name)
+    if module is None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+    else:
+        module.__spec__ = spec
     spec.loader.exec_module(module)
     return module
 
@@ -145,7 +168,6 @@ if getattr(_np, "__gpt_oss_numpy_stub__", False):
     _NP_ARRAY_TYPES: tuple[type, ...] = ()
 else:
     _NP_ARRAY_TYPES = (_np.ndarray,) if _np is not None else ()
-_TORCH_TENSOR_TYPES = (_torch.Tensor,) if _torch is not None else ()
 
 _MXFP4_SUFFIXES = (".blocks", ".scales")
 
@@ -246,16 +268,20 @@ def _record_mxfp4_backend(backend: str) -> None:
 
 
 def _apply_thread_configuration(settings: DeterminismSettings) -> None:
-    if settings.torch_threads is not None and _torch is not None:
-        try:
-            _torch.set_num_threads(settings.torch_threads)
-        except Exception:  # pragma: no cover - defensive logging
-            logger.debug("Unable to set torch thread count to %s", settings.torch_threads)
-        if settings.assume_ftz and hasattr(_torch, "set_flush_denormal"):
+    if settings.torch_threads is not None:
+        torch_module = _get_torch()
+        if torch_module is not None:
             try:
-                _torch.set_flush_denormal(True)
+                torch_module.set_num_threads(settings.torch_threads)
             except Exception:  # pragma: no cover - defensive logging
-                logger.debug("Unable to request torch flush-to-zero behaviour")
+                logger.debug(
+                    "Unable to set torch thread count to %s", settings.torch_threads
+                )
+            if settings.assume_ftz and hasattr(torch_module, "set_flush_denormal"):
+                try:
+                    torch_module.set_flush_denormal(True)
+                except Exception:  # pragma: no cover - defensive logging
+                    logger.debug("Unable to request torch flush-to-zero behaviour")
     if settings.numpy_threads is not None:
         thread_value = str(settings.numpy_threads)
         for env_name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
@@ -382,6 +408,9 @@ def _flatten(values) -> List[float]:
             for sub in item:
                 _recurse(sub)
             return
+        if isinstance(item, _Bfloat16Tensor):
+            _recurse(item.to_float32())
+            return
         if _NP_ARRAY_TYPES and isinstance(item, _NP_ARRAY_TYPES):
             ndim = getattr(item, "ndim", 0)
             if ndim == 0:
@@ -390,8 +419,8 @@ def _flatten(values) -> List[float]:
                 for sub in item:
                     _recurse(sub)
             return
-        if _TORCH_TENSOR_TYPES and isinstance(item, _TORCH_TENSOR_TYPES):
-            if item.ndim == 0:
+        if _is_torch_tensor(item):
+            if getattr(item, "ndim", 0) == 0:
                 result.append(float(item))
             else:
                 for sub in item:
@@ -420,10 +449,12 @@ def _infer_shape(values) -> Tuple[int, ...]:
             return (0,)
         inner = _infer_shape(values[0])
         return (len(values),) + inner
+    if isinstance(values, _Bfloat16Tensor):
+        return values.shape
     if _NP_ARRAY_TYPES and isinstance(values, _NP_ARRAY_TYPES):
         return tuple(int(dim) for dim in getattr(values, "shape", ()))
-    if _TORCH_TENSOR_TYPES and isinstance(values, _TORCH_TENSOR_TYPES):
-        return tuple(int(dim) for dim in values.shape)
+    if _is_torch_tensor(values):
+        return tuple(int(dim) for dim in getattr(values, "shape", ()))
     raise TypeError(f"Unsupported tensor type: {type(values)!r}")
 
 
@@ -431,11 +462,14 @@ def _tensor_len(value) -> int:
     try:
         return int(len(value))  # type: ignore[arg-type]
     except TypeError:
+        if isinstance(value, _Bfloat16Tensor):
+            shape = value.shape
+            return int(shape[0]) if shape else 0
         if _NP_ARRAY_TYPES and isinstance(value, _NP_ARRAY_TYPES):
             shape = getattr(value, "shape", ())
             return int(shape[0]) if shape else 0
-        if _TORCH_TENSOR_TYPES and isinstance(value, _TORCH_TENSOR_TYPES):
-            shape = value.shape
+        if _is_torch_tensor(value):
+            shape = getattr(value, "shape", ())
             return int(shape[0]) if len(shape) else 0
         return 0
 
@@ -1014,26 +1048,31 @@ def _as_nested_list(value):
         return [_as_nested_list(item) for item in value]
     if _NP_ARRAY_TYPES and isinstance(value, _NP_ARRAY_TYPES):
         return value.tolist()
-    if _TORCH_TENSOR_TYPES and isinstance(value, _TORCH_TENSOR_TYPES):
+    if _is_torch_tensor(value):
         return value.detach().cpu().tolist()
     return value
 
 
 def _decode_mxfp4_torch(blocks: "_TorchTensor", scales: TensorLike):
-    blocks_tensor = blocks.to(dtype=_torch.uint8)
-    if _TORCH_TENSOR_TYPES and isinstance(scales, _TORCH_TENSOR_TYPES):
-        scales_tensor = scales.to(dtype=_torch.int32, device=blocks_tensor.device)
+    torch_module = _get_torch()
+    if torch_module is None:
+        raise RuntimeError("Torch support is not available for MXFP4 decoding")
+    blocks_tensor = blocks.to(dtype=torch_module.uint8)
+    if _is_torch_tensor(scales):
+        scales_tensor = scales.to(dtype=torch_module.int32, device=blocks_tensor.device)
     else:
-        scales_tensor = _torch.as_tensor(
-            scales, dtype=_torch.int32, device=blocks_tensor.device
+        scales_tensor = torch_module.as_tensor(
+            scales, dtype=torch_module.int32, device=blocks_tensor.device
         )
     scales_tensor = scales_tensor - 127
-    lut = _torch.tensor(_MXFP4_FP4_VALUES, dtype=_torch.float32, device=blocks_tensor.device)
+    lut = torch_module.tensor(
+        _MXFP4_FP4_VALUES, dtype=torch_module.float32, device=blocks_tensor.device
+    )
     prefix_shape = blocks_tensor.shape[:-1]
-    idx_lo = (blocks_tensor & 0x0F).to(dtype=_torch.long)
-    idx_hi = (blocks_tensor >> 4).to(dtype=_torch.long)
-    decoded = _torch.stack((lut[idx_lo], lut[idx_hi]), dim=-1)
-    decoded = _torch.ldexp(decoded, scales_tensor.reshape(*prefix_shape, 1, 1))
+    idx_lo = (blocks_tensor & 0x0F).to(dtype=torch_module.long)
+    idx_hi = (blocks_tensor >> 4).to(dtype=torch_module.long)
+    decoded = torch_module.stack((lut[idx_lo], lut[idx_hi]), dim=-1)
+    decoded = torch_module.ldexp(decoded, scales_tensor.reshape(*prefix_shape, 1, 1))
     return decoded.reshape(*prefix_shape, blocks_tensor.shape[-1] * 2)
 
 
@@ -1076,10 +1115,13 @@ def _decode_mxfp4_python(blocks: TensorLike, scales: TensorLike):
 
 def _decode_mxfp4_pair(blocks: TensorLike, scales: TensorLike):
     settings = _active_determinism()
-    if _TORCH_TENSOR_TYPES and isinstance(blocks, _TORCH_TENSOR_TYPES):
-        if settings.allow_torch():
-            _record_mxfp4_backend("torch")
-            return _decode_mxfp4_torch(blocks, scales)
+    torch_module = None
+    if settings.allow_torch():
+        torch_module = _get_torch()
+    if torch_module is not None and isinstance(blocks, torch_module.Tensor):
+        _record_mxfp4_backend("torch")
+        return _decode_mxfp4_torch(blocks, scales)
+    if _is_torch_tensor(blocks):
         blocks = _as_nested_list(blocks)
         scales = _as_nested_list(scales)
     if _NP_ARRAY_TYPES and isinstance(blocks, _NP_ARRAY_TYPES):
@@ -1088,7 +1130,7 @@ def _decode_mxfp4_pair(blocks: TensorLike, scales: TensorLike):
             return _decode_mxfp4_numpy(blocks, scales)
         blocks = _as_nested_list(blocks)
         scales = _as_nested_list(scales)
-    if _TORCH_TENSOR_TYPES and isinstance(scales, _TORCH_TENSOR_TYPES):
+    if _is_torch_tensor(scales):
         scales = _as_nested_list(scales)
     if _NP_ARRAY_TYPES and isinstance(scales, _NP_ARRAY_TYPES):
         scales = _as_nested_list(scales)
@@ -1124,7 +1166,7 @@ def _split_qkv_tensor(
             f"[{q_dim}, {k_dim}, {v_dim}] but received shape {shape}"
         )
 
-    if _TORCH_TENSOR_TYPES and isinstance(tensor, _TORCH_TENSOR_TYPES):
+    if _is_torch_tensor(tensor):
         chunks = tensor.split((q_dim, k_dim, v_dim), dim=axis)
         if len(chunks) != 3:
             raise ValueError("QKV tensor did not split into 3 components as expected")
@@ -1933,12 +1975,96 @@ _SAFE_TENSOR_NUMPY_DTYPES = {
 }
 
 
+class _Bfloat16Tensor:
+    """Lazy view over a BF16 safetensors payload."""
+
+    __slots__ = ("_shape", "_buffer", "_uint16", "_float32_cache")
+    __array_priority__ = 1000
+
+    def __init__(self, data: memoryview, shape: Sequence[int]) -> None:
+        self._shape = tuple(int(dim) for dim in shape)
+        if data.format != "B":
+            data = memoryview(data).cast("B")
+        self._buffer = data
+        self._uint16: _np.ndarray | None = _np.frombuffer(data, dtype=_np.uint16).reshape(
+            self._shape
+        )
+        self._float32_cache: _np.ndarray | None = None
+
+    def _ensure_float32(self) -> _np.ndarray:
+        cached = self._float32_cache
+        if cached is not None:
+            return cached
+        if self._uint16 is None:
+            raise RuntimeError("BF16 tensor payload has already been released")
+        raw = self._uint16.astype(_np.uint32)
+        raw <<= 16
+        float32 = raw.view(_np.float32).reshape(self._shape)
+        self._float32_cache = float32
+        self._uint16 = None
+        try:
+            self._buffer.release()  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
+        except BufferError:
+            pass
+        self._buffer = None  # type: ignore[assignment]
+        return float32
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        return self._shape
+
+    @property
+    def ndim(self) -> int:
+        return len(self._shape)
+
+    @property
+    def size(self) -> int:
+        count = 1
+        for dim in self._shape:
+            count *= dim
+        return count
+
+    @property
+    def nbytes(self) -> int:
+        return self.size * 2
+
+    def to_float32(self) -> _np.ndarray:
+        return self._ensure_float32()
+
+    def astype(self, dtype) -> _np.ndarray:
+        return self._ensure_float32().astype(dtype)
+
+    def tolist(self):
+        return self._ensure_float32().tolist()
+
+    def __array__(self, dtype=None):
+        arr = self._ensure_float32()
+        if dtype is not None and arr.dtype != dtype:
+            return arr.astype(dtype)
+        return arr
+
+    def __iter__(self):
+        return iter(self._ensure_float32())
+
+    def __len__(self) -> int:
+        if not self._shape:
+            raise TypeError("len() of unsized object")
+        return int(self._shape[0])
+
+    def __getitem__(self, item):
+        return self._ensure_float32()[item]
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return f"_Bfloat16Tensor(shape={self._shape})"
+
+
 def _decode_safetensor_entry(dtype: str, shape: Sequence[int], data: memoryview) -> TensorLike:
     if dtype == "BF16":
-        values = _np.frombuffer(data, dtype=_np.uint16)
-        float_bits = _np.empty(values.shape, dtype=_np.float32)
-        _np.left_shift(values, 16, out=float_bits.view(_np.uint32), dtype=_np.uint32)
-        return float_bits.reshape(tuple(int(dim) for dim in shape))
+        if not isinstance(data, memoryview):
+            data = memoryview(data)
+        return _Bfloat16Tensor(data, shape)
     np_dtype = _SAFE_TENSOR_NUMPY_DTYPES.get(dtype)
     if np_dtype is None:
         raise TypeError(f"Unsupported safetensors dtype: {dtype}")
@@ -1946,59 +2072,73 @@ def _decode_safetensor_entry(dtype: str, shape: Sequence[int], data: memoryview)
     return array.reshape(tuple(int(dim) for dim in shape))
 
 
-def _iter_deserialized_entries(raw: Any) -> Iterable[tuple[str, Mapping[str, Any]]]:
-    if not isinstance(raw, _Iterable):
-        raise TypeError("Expected iterable safetensors payload")
-    for entry in raw:
-        name: Any
-        payload: Any
-        if isinstance(entry, tuple) and len(entry) == 2:
-            name, payload = entry
-        elif isinstance(entry, dict):
-            if "name" not in entry:
-                raise TypeError("Missing 'name' field in safetensors entry")
-            name = entry["name"]
-            if "tensor" in entry:
-                payload = entry["tensor"]
-            elif "value" in entry:
-                payload = entry["value"]
-            else:
-                payload = entry
-        else:
-            raise TypeError("Unrecognised safetensors entry structure")
+def _read_safetensors_index(path: Path) -> Tuple[Dict[str, Dict[str, Any]], int]:
+    with path.open("rb") as handle:
+        header_len_raw = handle.read(8)
+        if len(header_len_raw) != 8:
+            raise ValueError("Invalid safetensors header")
+        header_len = int.from_bytes(header_len_raw, "little")
+        header_bytes = handle.read(header_len)
+        if len(header_bytes) != header_len:
+            raise ValueError("Incomplete safetensors header")
+    try:
+        header = json.loads(header_bytes.decode("utf-8"))
+    except Exception as exc:  # pragma: no cover - defensive
+        raise ValueError("Unable to parse safetensors header") from exc
 
-        if not isinstance(payload, _Mapping):
-            raise TypeError("Safetensors entry payload must be a mapping")
+    if not isinstance(header, dict):
+        raise TypeError("Safetensors header must be a JSON object")
 
-        if not {"dtype", "shape", "data"}.issubset(payload.keys()):
-            raise TypeError("Safetensors entry payload missing required keys")
+    tensor_index: Dict[str, Dict[str, Any]] = {}
+    for name, entry in header.items():
+        if not isinstance(name, str):
+            continue
+        if name.startswith("__"):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if not {"dtype", "shape", "data_offsets"}.issubset(entry):
+            continue
+        tensor_index[name] = {
+            "dtype": entry["dtype"],
+            "shape": tuple(int(dim) for dim in entry["shape"]),
+            "data_offsets": tuple(int(offset) for offset in entry["data_offsets"]),
+        }
 
-        yield str(name), payload
+    data_start = 8 + header_len
+    return tensor_index, data_start
+
+
+def _read_tensor_payload(
+    handle, base_offset: int, entry: Mapping[str, Any]
+) -> memoryview:
+    start, end = entry["data_offsets"]
+    length = end - start
+    handle.seek(base_offset + start)
+    buffer = bytearray(length)
+    view = memoryview(buffer)
+    read = handle.readinto(view)
+    if read != length:
+        raise IOError("Unexpected end of safetensors payload")
+    return view
 
 
 def _load_tensors_from_deserialize(
     path: Path, keys: Optional[Sequence[str]] = None
 ) -> Dict[str, TensorLike]:
-    with path.open("rb") as handle:
-        raw = handle.read()
-    flat = deserialize(raw)
-    tensors: Dict[str, TensorLike] = {}
+    index, base_offset = _read_safetensors_index(path)
     wanted = set(keys) if keys is not None else None
+    tensors: Dict[str, TensorLike] = {}
 
-    if isinstance(flat, _Mapping):
-        entries = flat.items()
-    else:
-        try:
-            entries = list(_iter_deserialized_entries(flat))
-        except TypeError as exc:
-            raise TypeError("Unsupported safetensors deserialization format") from exc
+    with path.open("rb") as handle:
+        for name, entry in index.items():
+            if wanted is not None and name not in wanted:
+                continue
+            payload = _read_tensor_payload(handle, base_offset, entry)
+            tensors[name] = _decode_safetensor_entry(
+                entry["dtype"], entry["shape"], payload
+            )
 
-    for name, entry in entries:
-        if wanted is not None and name not in wanted:
-            continue
-        tensors[name] = _decode_safetensor_entry(
-            entry["dtype"], entry["shape"], entry["data"]
-        )
     if wanted is not None and len(tensors) != len(wanted):
         missing = sorted(set(wanted) - set(tensors))
         raise KeyError(f"Missing tensors in safetensors file: {', '.join(missing)}")
@@ -2006,27 +2146,46 @@ def _load_tensors_from_deserialize(
 
 
 def load_tensors(path: Path) -> Dict[str, TensorLike]:
+    index: Dict[str, Dict[str, Any]] | None = None
+    base_offset = 0
     tensors: Dict[str, TensorLike] = {}
-    fallback_keys: List[str] = []
+    fallback_entries: List[Tuple[str, Dict[str, Any]]] = []
     opener = _resolve_safe_open()
+
     try:
         with opener(path, framework="numpy") as tensor_file:
+            index, base_offset = _read_safetensors_index(path)
             for key in tensor_file.keys():
+                entry = index.get(key)
+                if entry is None:
+                    continue
+                dtype = entry["dtype"]
+                if dtype == "BF16":
+                    fallback_entries.append((key, entry))
+                    continue
                 try:
-                    tensors[key] = tensor_file.get_tensor(key)
-                except TypeError as exc:
-                    message = str(exc).lower()
-                    if "bfloat16" in message or "bf16" in message:
-                        fallback_keys.append(key)
-                    else:
-                        raise
+                    array = tensor_file.get_tensor(key)
+                    if _NP_ARRAY_TYPES and isinstance(array, _NP_ARRAY_TYPES):
+                        array = array.copy()
+                    elif _is_torch_tensor(array):
+                        array = array.clone()
+                    tensors[key] = array
+                except TypeError:
+                    fallback_entries.append((key, entry))
     except SafetensorError as exc:
         if "bf16" not in str(exc).lower():
             raise
         return _load_tensors_from_deserialize(path)
 
-    if fallback_keys:
-        tensors.update(_load_tensors_from_deserialize(path, fallback_keys))
+    if fallback_entries:
+        if index is None:
+            index, base_offset = _read_safetensors_index(path)
+        with path.open("rb") as handle:
+            for key, entry in fallback_entries:
+                payload = _read_tensor_payload(handle, base_offset, entry)
+                tensors[key] = _decode_safetensor_entry(
+                    entry["dtype"], entry["shape"], payload
+                )
     return tensors
 
 
