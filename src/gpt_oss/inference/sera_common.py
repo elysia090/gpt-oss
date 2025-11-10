@@ -10,7 +10,6 @@ from typing import Dict, Iterable, MutableMapping, Sequence, Tuple, Union
 JSON_BYTES_PREFIX = "__sera_bytes__:"
 ARRAY_MAGIC = 0x53455241
 MANIFEST_MAGIC = 0x5345524D
-MANIFEST_VERSION = 0x3
 ARRAY_HEADER_STRUCT = struct.Struct("<I H H 5Q Q Q Q I I")
 ARRAY_FLAG_ROW_MAJOR = 0x1
 ARRAY_FLAG_ALIGNED_64B = 0x2
@@ -176,7 +175,6 @@ __all__ = [
     "DTYPE_CODES",
     "JSON_BYTES_PREFIX",
     "MANIFEST_MAGIC",
-    "MANIFEST_VERSION",
     "PICKLE_SUFFIXES",
     "SeraArrayError",
     "SeraArrayHeader",

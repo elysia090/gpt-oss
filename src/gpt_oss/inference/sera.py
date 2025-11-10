@@ -44,7 +44,6 @@ try:
         DTYPE_CODES as _TRANSFER_DTYPE_CODES,
         JSON_BYTES_PREFIX as _TRANSFER_JSON_BYTES_PREFIX,
         MANIFEST_MAGIC as _TRANSFER_MANIFEST_MAGIC,
-        MANIFEST_VERSION as _TRANSFER_MANIFEST_VERSION,
         PICKLE_SUFFIXES as _PICKLE_SUFFIXES,
     )
 except ImportError:  # pragma: no cover - fallback for direct loading
@@ -63,7 +62,6 @@ except ImportError:  # pragma: no cover - fallback for direct loading
     _TRANSFER_DTYPE_CODES = _sera_common_module.DTYPE_CODES
     _TRANSFER_JSON_BYTES_PREFIX = _sera_common_module.JSON_BYTES_PREFIX
     _TRANSFER_MANIFEST_MAGIC = _sera_common_module.MANIFEST_MAGIC
-    _TRANSFER_MANIFEST_VERSION = _sera_common_module.MANIFEST_VERSION
     _PICKLE_SUFFIXES = _sera_common_module.PICKLE_SUFFIXES
 
 
@@ -79,8 +77,8 @@ class BudgetError(RuntimeError):
 T = TypeVar("T")
 
 
-_TRANSFER_MANIFEST_PREFIX_STRUCT = struct.Struct("<I I")
-_TRANSFER_EXPECTED_SEED_DIGEST = hashlib.sha256(b"sera-transfer").digest()
+_TRANSFER_MANIFEST_HEADER_STRUCT = struct.Struct("<I B B H Q Q Q Q")
+_TRANSFER_EXPECTED_SEED_DIGEST = hashlib.sha256(b"sera-transfer").digest()[:16]
 _CRC32C_TABLE: List[int] = []
 _CRC32C_INIT = 0xFFFFFFFF
 _ARRAY_VALIDATION_CHUNK_SIZE = 1024 * 1024
@@ -4107,26 +4105,33 @@ class Sera:
             )
 
         with manifest_path.open("rb") as fh:
-            prefix_raw = fh.read(_TRANSFER_MANIFEST_PREFIX_STRUCT.size)
-            if len(prefix_raw) != _TRANSFER_MANIFEST_PREFIX_STRUCT.size:
+            header_raw = fh.read(_TRANSFER_MANIFEST_HEADER_STRUCT.size)
+            if len(header_raw) != _TRANSFER_MANIFEST_HEADER_STRUCT.size:
                 raise ValueError("Sera manifest file is truncated")
-            magic, version = _TRANSFER_MANIFEST_PREFIX_STRUCT.unpack(prefix_raw)
+            (
+                magic,
+                endian,
+                abi_flags,
+                reserved,
+                seed_lo,
+                seed_hi,
+                schema_lo,
+                schema_hi,
+            ) = _TRANSFER_MANIFEST_HEADER_STRUCT.unpack(header_raw)
             if magic != _TRANSFER_MANIFEST_MAGIC:
                 raise ValueError("Invalid Sera manifest magic")
-            if version != _TRANSFER_MANIFEST_VERSION:
-                raise ValueError(
-                    f"Unsupported Sera manifest version: {version}"
-                )
-            seed_digest = fh.read(32)
-            if len(seed_digest) != 32:
-                raise ValueError("Sera manifest file is truncated")
+            if endian != 1:
+                raise ValueError("Unsupported Sera manifest endianness")
+            if reserved not in (0,):
+                raise ValueError("Reserved manifest header bits must be zero")
+            seed_digest = seed_lo.to_bytes(8, "little") + seed_hi.to_bytes(8, "little")
             if seed_digest != _TRANSFER_EXPECTED_SEED_DIGEST:
                 raise ValueError("Unexpected Sera manifest seed digest")
-            schema_digest = fh.read(32)
-            if len(schema_digest) != 32:
-                raise ValueError("Sera manifest file is truncated")
+            schema_digest = (
+                schema_lo.to_bytes(8, "little") + schema_hi.to_bytes(8, "little")
+            )
         manifest_header = {
-            "version": version,
+            "abi_flags": abi_flags,
             "seed_digest": seed_digest.hex(),
             "schema_sha256": schema_digest.hex(),
         }
