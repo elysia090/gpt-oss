@@ -1,0 +1,16 @@
+{
+  "digests": {
+    "tokenizer_fst.bin": "83e7ce0f907bd523907f50acc24ae2e7c6c148abb47f6aa7af11672589e2d3f8",
+    "T_1.bin": "08b00886206c13445cef58707232b475d14f0059d23a7ac710ac26f5a66936b5",
+    "T_2.bin": "b9703d24981da6d05863246e96294cc648d7d551549b08bac1e8b137f9329d2e",
+    "T_3.bin": "ef5beeffae70cda5b68f024a5be694f56b0c70a544990dac39a80540707112a1",
+    "T_4.bin": "84aeff338402acd812358b60d33672b9db3cd44d0a7c1c5f37c5e19cc6b80315"
+  },
+  "metadata": {
+    "vocab_digest": "6568555852bf5d9d87a14aabf1ede09262d34f8a9e2cd28916a06a388a8aa113",
+    "sardinas_patterson_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "salts": {
+      "global_seed": 11339429797178992741
+    }
+  }
+}

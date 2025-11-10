@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import os
 import struct
 import unicodedata
 import copy
@@ -38,6 +39,7 @@ import zlib
 
 try:
     from .sera_common import (
+        ARRAY_FLAG_ALIGNED_64B,
         ARRAY_HEADER_STRUCT as _TRANSFER_ARRAY_STRUCT,
         ARRAY_MAGIC as _TRANSFER_ARRAY_MAGIC,
         DEFAULT_STATE_FILENAMES as _TRANSFER_STATE_FILENAMES,
@@ -56,6 +58,7 @@ except ImportError:  # pragma: no cover - fallback for direct loading
     _sera_common_module = importlib.util.module_from_spec(_sera_common_spec)
     sys.modules.setdefault(_sera_common_spec.name, _sera_common_module)
     _sera_common_spec.loader.exec_module(_sera_common_module)
+    ARRAY_FLAG_ALIGNED_64B = _sera_common_module.ARRAY_FLAG_ALIGNED_64B
     _TRANSFER_ARRAY_STRUCT = _sera_common_module.ARRAY_HEADER_STRUCT
     _TRANSFER_ARRAY_MAGIC = _sera_common_module.ARRAY_MAGIC
     _TRANSFER_STATE_FILENAMES = _sera_common_module.DEFAULT_STATE_FILENAMES
@@ -4467,6 +4470,11 @@ def _validate_transfer_arrays(
             if header["magic"] != _TRANSFER_ARRAY_MAGIC:
                 raise ValueError(f"Invalid array magic for {array_path}")
             expected_len = header["byte_len"]
+            alignment = 0
+            if header["flags"] & ARRAY_FLAG_ALIGNED_64B:
+                alignment = (-_TRANSFER_ARRAY_STRUCT.size) % 64
+                if alignment:
+                    fh.seek(alignment, os.SEEK_CUR)
             crc_state = _CRC32C_INIT
             sha256 = hashlib.sha256()
             remaining = expected_len
@@ -4480,7 +4488,7 @@ def _validate_transfer_arrays(
             bytes_consumed = expected_len - remaining
             crc = (~crc_state) & 0xFFFFFFFF
             digest_bytes = sha256.digest()
-        payload_len_on_disk = max(file_size - _TRANSFER_ARRAY_STRUCT.size, 0)
+        payload_len_on_disk = max(file_size - _TRANSFER_ARRAY_STRUCT.size - alignment, 0)
         if bytes_consumed != expected_len or payload_len_on_disk != expected_len:
             raise ValueError(
                 f"Array payload length mismatch for {array_path}: expected {expected_len}, got {payload_len_on_disk}"

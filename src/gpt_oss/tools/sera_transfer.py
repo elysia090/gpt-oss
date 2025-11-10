@@ -447,6 +447,8 @@ __all__ = [
     "run_interactive_cli",
     "sha256_low64",
     "SplitMix64",
+    "TokenizerAssets",
+    "load_tokenizer_assets",
     "convert",
     "main",
 ]
@@ -2502,64 +2504,282 @@ def bridge_records(
     return arrays, metadata
 
 
+
 # ---------------------------------------------------------------------------
-# Tokenizer placeholders
+# Tokenizer helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TokenizerAssets:
+    """Materialised tokenizer vocabulary and provenance."""
+
+    kind: str
+    pieces: Tuple[Tuple[bytes, int], ...]
+    text_pieces: Tuple[Tuple[str, int], ...]
+    provenance: Dict[str, object]
+    config: Dict[str, object]
+
+
+_BYTE_LEVEL_DECODER: Dict[str, int] | None = None
+
+
+def _byte_level_decoder() -> Dict[str, int]:
+    """Return the byte-level decoder used by Hugging Face BPE tokenizers."""
+
+    global _BYTE_LEVEL_DECODER
+    if _BYTE_LEVEL_DECODER is None:
+        bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+        cs = bs[:]
+        n = 0
+        for b in range(256):
+            if b not in bs:
+                bs.append(b)
+                cs.append(256 + n)
+                n += 1
+        chars = [chr(c) for c in cs]
+        _BYTE_LEVEL_DECODER = {char: byte for byte, char in zip(bs, chars)}
+    return _BYTE_LEVEL_DECODER
+
+
+def _decode_bpe_token(token: str) -> bytes:
+    decoder = _byte_level_decoder()
+    payload = bytearray()
+    for char in token:
+        byte = decoder.get(char)
+        if byte is None:
+            payload.extend(char.encode('utf-8'))
+        else:
+            payload.append(byte)
+    return bytes(payload)
+
+
+def _load_tokenizer_json(path: Path) -> TokenizerAssets:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, Mapping):
+        raise ValueError('tokenizer.json payload must be a mapping')
+
+    model = payload.get('model')
+    if not isinstance(model, Mapping):
+        raise ValueError('tokenizer.json missing model description')
+
+    model_type = str(model.get('type', '')).lower() or 'unknown'
+    vocab = model.get('vocab')
+    if not isinstance(vocab, Mapping):
+        raise ValueError('tokenizer.json missing vocabulary')
+
+    decoder = _decode_bpe_token if model_type == 'bpe' else lambda value: value.encode('utf-8')
+
+    vocabulary: Dict[int, bytes] = {}
+    text_vocab: Dict[int, str] = {}
+    for token, idx in vocab.items():
+        if not isinstance(token, str):
+            continue
+        try:
+            token_id = int(idx)
+        except (TypeError, ValueError):
+            continue
+        vocabulary[token_id] = decoder(token)
+        text_vocab[token_id] = token
+
+    added_tokens = payload.get('added_tokens', [])
+    if isinstance(added_tokens, list):
+        for entry in added_tokens:
+            if not isinstance(entry, Mapping):
+                continue
+            token = entry.get('content')
+            token_id = entry.get('id')
+            if not isinstance(token, str):
+                continue
+            try:
+                idx = int(token_id)
+            except (TypeError, ValueError):
+                continue
+            vocabulary[idx] = decoder(token)
+            text_vocab[idx] = token
+
+    if not vocabulary:
+        raise ValueError('tokenizer.json does not define any tokens')
+
+    max_id = max(vocabulary)
+    expected = set(range(max_id + 1))
+    missing = sorted(expected.difference(vocabulary))
+    if missing:
+        raise ValueError('tokenizer vocabulary ids must be contiguous starting at zero')
+
+    ordered_ids = sorted(vocabulary)
+    pieces = tuple((vocabulary[idx], idx) for idx in ordered_ids)
+    text_pieces = tuple((text_vocab[idx], idx) for idx in ordered_ids)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    config = {
+        'type': model_type.upper(),
+        'added_tokens': len(text_vocab) - len(vocab),
+        'vocab_size': len(pieces),
+    }
+    provenance = {
+        'path': str(path),
+        'sha256': digest,
+        'format': 'tokenizer.json',
+    }
+    return TokenizerAssets(
+        kind=model_type.upper(),
+        pieces=pieces,
+        text_pieces=text_pieces,
+        provenance=provenance,
+        config=config,
+    )
+
+
+def _load_sentencepiece_model(path: Path) -> TokenizerAssets:
+    try:
+        import sentencepiece as spm  # type: ignore
+    except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError('sentencepiece is required to load tokenizer.model files') from exc
+
+    processor = spm.SentencePieceProcessor()
+    processor.Load(str(path))
+    vocabulary: List[Tuple[bytes, int]] = []
+    text_vocab: List[Tuple[str, int]] = []
+    size = int(processor.GetPieceSize())
+    for idx in range(size):
+        piece = processor.IdToPiece(idx)
+        vocabulary.append((piece.encode('utf-8'), idx))
+        text_vocab.append((piece, idx))
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    provenance = {
+        'path': str(path),
+        'sha256': digest,
+        'format': 'tokenizer.model',
+    }
+    config = {'type': 'SENTENCEPIECE', 'vocab_size': size}
+    return TokenizerAssets(
+        kind='SENTENCEPIECE',
+        pieces=tuple(vocabulary),
+        text_pieces=tuple(text_vocab),
+        provenance=provenance,
+        config=config,
+    )
+
+
+def load_tokenizer_assets(search_roots: Sequence[Path]) -> TokenizerAssets:
+    """Load tokenizer assets from *search_roots*."""
+
+    candidates: List[Path] = []
+    seen: set[Path] = set()
+    for root in search_roots:
+        for name in ('tokenizer.json', 'tokenizer.model'):
+            candidate = (root / name).resolve() if root.is_absolute() else (root / name)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if _safe_exists(candidate):
+                candidates.append(candidate)
+
+    errors: List[str] = []
+    for candidate in candidates:
+        try:
+            if candidate.suffix.lower() == '.json':
+                return _load_tokenizer_json(candidate)
+            if candidate.suffix.lower() == '.model':
+                return _load_sentencepiece_model(candidate)
+            errors.append(f'Unsupported tokenizer asset: {candidate}')
+        except Exception as exc:
+            errors.append(f'{candidate}: {exc}')
+
+    detail = ', '.join(errors) if errors else 'no tokenizer assets found'
+    raise FileNotFoundError(f'Unable to load tokenizer assets ({detail})')
+
+
+def _sardinas_patterson_trace(
+    pieces: Sequence[Tuple[bytes, int]]
+) -> Tuple[List[Tuple[int, Tuple[bytes, ...]]], str]:
+    vocabulary = [piece for piece, _ in pieces]
+    trace: List[Tuple[int, Tuple[bytes, ...]]] = []
+    visited: set[Tuple[bytes, ...]] = set()
+    current: set[bytes] = set()
+
+    for x in vocabulary:
+        for y in vocabulary:
+            if x == y:
+                continue
+            if x.startswith(y):
+                remainder = x[len(y) :]
+                if not remainder:
+                    raise ValueError('Vocabulary fails Sardinas–Patterson (epsilon witness)')
+                current.add(remainder)
+
+    while current:
+        if b'' in current:
+            raise ValueError('Vocabulary fails Sardinas–Patterson (epsilon witness)')
+        canonical = tuple(sorted(current))
+        trace.append((len(trace) + 1, canonical))
+        visited.add(canonical)
+        next_set: set[bytes] = set()
+        for word in current:
+            for piece in vocabulary:
+                if word.startswith(piece):
+                    remainder = word[len(piece) :]
+                    if remainder:
+                        next_set.add(remainder)
+                    else:
+                        raise ValueError('Vocabulary fails Sardinas–Patterson (epsilon witness)')
+                if piece.startswith(word):
+                    remainder = piece[len(word) :]
+                    if remainder:
+                        next_set.add(remainder)
+                    else:
+                        raise ValueError('Vocabulary fails Sardinas–Patterson (epsilon witness)')
+        snapshot = tuple(sorted(next_set))
+        if not snapshot or snapshot in visited:
+            break
+        current = next_set
+
+    digest_payload = bytearray()
+    for level, remainders in trace:
+        digest_payload.extend(level.to_bytes(2, 'big'))
+        for remainder in remainders:
+            digest_payload.extend(len(remainder).to_bytes(2, 'big'))
+            digest_payload.extend(remainder)
+    digest = hashlib.sha256(bytes(digest_payload)).hexdigest()
+    return trace, digest
 
 
 def tokenizer_arrays(
-    cfg: ModelConfig, tensors: Mapping[str, TensorLike], max_len: int = 4
+    cfg: ModelConfig,
+    tensors: Mapping[str, TensorLike],
+    max_len: int = 4,
+    *,
+    tokenizer_assets: TokenizerAssets | None = None,
 ) -> Tuple[Dict[str, List], Dict[str, object]]:
-    vocab = cfg.vocab_size or 256
-    vocab = max(1, vocab)
+    del tensors  # Tokenizer arrays are derived from tokenizer assets exclusively
 
-    tensor_digest = hashlib.sha256()
-    embedding: Optional[TensorLike] = None
-    for name in sorted(tensors.keys()):
-        tensor = tensors[name]
-        try:
-            tensor_bytes = _tensor_bytes(tensor)
-        except Exception:  # pragma: no cover - defensive
-            continue
-        tensor_digest.update(name.encode("utf-8"))
-        tensor_digest.update(tensor_bytes)
-        if embedding is None:
-            rows = _tensor_len(tensor)
-            if rows >= vocab:
-                try:
-                    first_row = tensor[0]  # type: ignore[index]
-                except Exception:
-                    first_row = None
-                if first_row is not None and _tensor_len(first_row) > 0:
-                    embedding = tensor
+    if tokenizer_assets is None:
+        raise ValueError('tokenizer_assets must be provided when building tokenizer arrays')
 
-    global_seed = int.from_bytes(tensor_digest.digest()[:8], "little", signed=False)
+    if not tokenizer_assets.pieces:
+        raise ValueError('Tokenizer assets are empty')
 
-    used_pieces: List[bytes] = []
-    pieces: List[Tuple[bytes, int]] = []
+    pieces = list(tokenizer_assets.pieces)
+    pieces.sort(key=lambda item: item[1])
 
-    def has_prefix_conflict(candidate: bytes) -> bool:
-        for existing in used_pieces:
-            if existing.startswith(candidate) or candidate.startswith(existing):
-                return True
-        return False
+    vocab_size = cfg.vocab_size or len(pieces)
+    if vocab_size != len(pieces):
+        raise ValueError(
+            f'Tokenizer vocabulary size mismatch: config expects {vocab_size}, '
+            f'but tokenizer provides {len(pieces)} entries'
+        )
 
-    for token in range(vocab):
-        attempt = 0
-        base_seed = _mix64(global_seed, token + 1)
-        row_seed = 0
-        if embedding is not None:
-            row = embedding[token][: cfg.d_model]
-            row_seed = _hash_bytes(_tensor_bytes([row]))
-        while True:
-            local_seed = _mix64(base_seed ^ row_seed, attempt + 1)
-            local = SplitMix64(local_seed)
-            length = 1 + (local.next() % max_len)
-            piece = bytes((local.next() & 0xFF) for _ in range(length))
-            if piece not in used_pieces and not has_prefix_conflict(piece):
-                used_pieces.append(piece)
-                pieces.append((piece, token))
-                break
-            attempt += 1
+    token_digest = hashlib.sha256()
+    for piece, token_id in pieces:
+        token_digest.update(struct.pack('<I', token_id))
+        token_digest.update(piece)
+
+    global_seed = int.from_bytes(token_digest.digest()[:8], 'little', signed=False)
+
+    max_piece_length = max(len(piece) for piece, _ in pieces)
+    max_len = max(max_len, max_piece_length)
+
+    sp_trace, sp_digest = _sardinas_patterson_trace(pieces)
 
     class _TrieNode(dict):
         pass
@@ -2590,38 +2810,56 @@ def tokenizer_arrays(
             node = child
             current = dest
 
-    lines = ["% byte level fst derived from checkpoint", "start 0", "end 0"]
+    lines = ['% byte level fst derived from tokenizer', 'start 0', 'end 0']
     for src, dst, byte, output in transitions:
-        lines.append(f"{src} {dst} {byte} {output}")
+        lines.append(f'{src} {dst} {byte} {output}')
     fst_text = "\n".join(lines).encode("utf-8")
 
     tables: Dict[str, List[int]] = {}
     mph_meta: Dict[int, Dict[str, object]] = {}
+    table_salts: Dict[int, int] = {}
     modulus = 1 << 64
     for length in range(1, max_len + 1):
         factor = pow(257, length - 1, modulus)
+        table_seed = _mix64(global_seed, length)
+        table_salts[length] = table_seed
         table_bytes: List[int] = []
         for byte in range(256):
-            value = (factor * byte + global_seed) & (modulus - 1)
-            table_bytes.extend(struct.pack("<Q", value))
-        tables[f"T_{length}"] = table_bytes
+            value = (factor * byte + table_seed) & (modulus - 1)
+            table_bytes.extend(struct.pack('<Q', value))
+        tables[f'T_{length}'] = table_bytes
 
         length_pieces = [piece for piece, _ in pieces if len(piece) == length]
+        if not length_pieces:
+            mph_meta[length] = {'table_size': 0, 'seeds': [], 'key_hashes': []}
+            continue
         key_hashes = [_hash_bytes(piece) for piece in length_pieces]
         seeds, ordered_keys, _ = _build_two_level_mph(key_hashes)
         mph_meta[length] = {
-            "table_size": len(seeds),
-            "seeds": seeds,
-            "key_hashes": ordered_keys,
+            'table_size': len(seeds),
+            'seeds': seeds,
+            'key_hashes': ordered_keys,
         }
 
-    arrays = {"tokenizer_fst": list(fst_text)}
+    arrays = {'tokenizer_fst': list(fst_text)}
     arrays.update(tables)
+
+    trace_records = [
+        {'level': level, 'remainders': list(remainders)} for level, remainders in sp_trace
+    ]
+
     metadata = {
-        "pieces": pieces,
-        "max_piece_length": max_len,
-        "seed": global_seed,
-        "mph": mph_meta,
+        'kind': tokenizer_assets.kind,
+        'pieces': pieces,
+        'text_pieces': list(tokenizer_assets.text_pieces),
+        'max_piece_length': max_piece_length,
+        'seed': global_seed,
+        'salts': {'global_seed': global_seed, 'tables': table_salts},
+        'vocab_digest': token_digest.hexdigest(),
+        'mph': mph_meta,
+        'provenance': tokenizer_assets.provenance,
+        'config': tokenizer_assets.config,
+        'sardinas_patterson': {'digest': sp_digest, 'levels': trace_records},
     }
     return arrays, metadata
 
@@ -3836,6 +4074,8 @@ def convert(
                 log_verbose("Model config keys: %s", config_keys)
             load_fn = _resolve_load_tensors()
             tensors = load_fn(model_path)
+            tokenizer_assets = load_tokenizer_assets(search_roots)
+            log_notice("Loaded tokenizer assets (%s) from %s", tokenizer_assets.kind, tokenizer_assets.provenance.get('path'))
             tokenizer_fn = _resolve_callable("tokenizer_arrays", tokenizer_arrays)
             prf_fn = _resolve_callable("compute_prf", compute_prf)
             overlays_fn = _resolve_callable("compute_overlays", compute_overlays)
@@ -3886,7 +4126,7 @@ def convert(
                 del payload
 
             log_notice("Generating tokenizer arrays")
-            tokenizer_data, tokenizer_meta = tokenizer_fn(cfg, tensors)
+            tokenizer_data, tokenizer_meta = tokenizer_fn(cfg, tensors, tokenizer_assets=tokenizer_assets)
             for name, data in tokenizer_data.items():
                 store_array(name, data, "u8")
             metadata["tokenizer"] = tokenizer_meta
