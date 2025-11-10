@@ -119,7 +119,7 @@ def patch_conversion_dependencies(monkeypatch):
                 "bridge_qDout": [0],
                 "peer_scores": [0],
             },
-            {"info": "bridge"},
+            {"info": "bridge", "enabled": True, "status": "enabled"},
         ),
     )
     monkeypatch.setattr(sera_transfer, "write_array", lambda *args, **kwargs: b"")

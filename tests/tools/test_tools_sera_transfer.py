@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib
 import hashlib
 import json
@@ -158,6 +159,22 @@ def _create_checkpoint(root: Path) -> Path:
     config, tensors = _sample_checkpoint_contents()
     (source / "config.json").write_text(json.dumps(config))
     save_file(_as_numpy_tensors(tensors), source / "model.safetensors")
+    install_sample_tokenizer(source)
+    return source
+
+
+def _create_checkpoint_missing_bridge_inputs(root: Path) -> Path:
+    source = root / "source"
+    source.mkdir(parents=True, exist_ok=True)
+
+    config, tensors = _sample_checkpoint_contents()
+    pruned = {
+        name: value
+        for name, value in tensors.items()
+        if not name.endswith("ffn.w1.bias") and not name.endswith("ffn.w2.bias")
+    }
+    (source / "config.json").write_text(json.dumps(config))
+    save_file(pruned, source / "model.safetensors")
     install_sample_tokenizer(source)
     return source
 
@@ -900,6 +917,8 @@ def test_model_config_handles_gpt_oss_mxfp4_layout(gpt_oss_mxfp4_layout) -> None
 
     bridge_data, bridge_meta = sera_transfer.bridge_records(cfg, tensors, config["vocab_size"])
     assert bridge_data["bridge_hubs"]
+    assert bridge_meta["enabled"] is True
+    assert bridge_meta["status"] == "enabled"
     assert len(bridge_meta["layer_seeds"]) == len(cfg.layers)
 
 
@@ -1469,6 +1488,8 @@ def test_written_arrays_match_reference(tmp_path: Path) -> None:
     )
 
     bridge_data, bridge_meta = sera_transfer.bridge_records(cfg, tensors, cfg.vocab_size)
+    assert bridge_meta["enabled"] is True
+    assert bridge_meta["status"] == "enabled"
     assert bridge_meta["legs"] == 2
     assert len(bridge_meta["in_scales"]) == cfg.vocab_size
     assert _payload(arrays_dir / "bridge_qDin.bin") == sera_transfer._pack_values(
@@ -1485,9 +1506,53 @@ def test_written_arrays_match_reference(tmp_path: Path) -> None:
         payload = _payload(arrays_dir / f"{name}.bin")
         assert record["sha256"] == hashlib.sha256(payload).hexdigest()
     assert snapshot["metadata"]["tokenizer"]["max_piece_length"] == 4
+    bridge_meta_snapshot = snapshot["metadata"].get("bridge", {})
+    assert bridge_meta_snapshot.get("status") == "enabled"
+    assert bridge_meta_snapshot.get("enabled") is True
     assert snapshot["sera_snapshot"]["config"]["attention"]["features"] == 4
 
 
+def test_convert_skips_bridge_when_inputs_missing(tmp_path: Path, monkeypatch) -> None:
+    full_config, full_tensors = _sample_checkpoint_contents()
+    full_cfg = sera_transfer.ModelConfig.from_dict(full_config, tensors=full_tensors)
+    collapse_data, collapse_meta = sera_transfer.collapse_ffn(full_cfg, full_tensors, top_l=2)
+
+    def _collapse_stub(cfg, tensors, top_l):
+        return (
+            {name: copy.deepcopy(value) for name, value in collapse_data.items()},
+            copy.deepcopy(collapse_meta),
+        )
+
+    monkeypatch.setattr(sera_transfer, "collapse_ffn", _collapse_stub)
+
+    source = _create_checkpoint_missing_bridge_inputs(tmp_path / "missing")
+    output = tmp_path / "output"
+    sera_transfer.convert(source, output, r=4, r_v=2, top_l=2)
+
+    arrays_dir = output / "arrays"
+    for name in ("bridge_hubs.bin", "bridge_qDin.bin", "bridge_qDout.bin", "peer_scores.bin"):
+        assert not (arrays_dir / name).exists()
+
+    snapshot = pickle.loads((output / "sera_state.pkl").read_bytes())
+    bridge_meta = snapshot["metadata"].get("bridge", {})
+    assert bridge_meta.get("status") == "disabled"
+    assert bridge_meta.get("enabled") is False
+    assert bridge_meta.get("legs") == 0
+    missing_inputs = bridge_meta.get("missing_inputs", [])
+    assert any(name.endswith("ffn.w1.bias") for name in missing_inputs)
+    assert any(name.endswith("ffn.w2.bias") for name in missing_inputs)
+
+    manifest_bytes = (output / "sera_manifest.bin").read_bytes()
+    manifest = sera_transfer.decode_manifest(manifest_bytes)
+    assert manifest.bridge.k_legs == 0
+    assert manifest.bridge.proj_rows == 0
+    assert manifest.bridge.proj_cols == 0
+    assert manifest.bridge.proj_digest == sera_transfer.ManifestDigest((0, 0))
+    optional_flags = sera_transfer.OptionalModule(manifest.optional_modules.flags)
+    assert not (optional_flags & sera_transfer.OptionalModule.BRIDGE)
+    assert not (optional_flags & sera_transfer.OptionalModule.SEARCH)
+    assert manifest.search.a_max == 0.0
+    assert manifest.search.a_cap == 0.0
 def test_array_checksums_regression(tmp_path: Path) -> None:
     source = _create_checkpoint(tmp_path / "checksums")
     output = tmp_path / "output"

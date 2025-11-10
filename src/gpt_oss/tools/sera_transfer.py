@@ -2462,6 +2462,43 @@ def bridge_records(
 ) -> Tuple[Dict[str, List], Dict[str, object]]:
     vocab = vocab_size or cfg.d_model or 16
     vocab = max(1, vocab)
+    missing_inputs: set[str] = set()
+    resolved_layers: List[Tuple[LayerConfig, TensorLike, TensorLike, TensorLike, TensorLike]] = []
+
+    for layer in cfg.layers:
+        w1 = tensors.get(layer.w1)
+        w2 = tensors.get(layer.w2)
+        b1 = tensors.get(layer.b1)
+        b2 = tensors.get(layer.b2)
+        for name, value in (
+            (layer.w1, w1),
+            (layer.w2, w2),
+            (layer.b1, b1),
+            (layer.b2, b2),
+        ):
+            if value is None:
+                missing_inputs.add(name)
+        if any(value is None for value in (w1, w2, b1, b2)):
+            continue
+        resolved_layers.append((layer, w1, w2, b1, b2))
+
+    disabled_arrays = {
+        "bridge_hubs": [],
+        "bridge_qDin": [],
+        "bridge_qDout": [],
+        "peer_scores": [],
+    }
+
+    if missing_inputs:
+        metadata = {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "missing_tensors",
+            "missing_inputs": sorted(missing_inputs),
+            "legs": 0,
+        }
+        return disabled_arrays, metadata
+
     hubs: List[List[int]] = []
     qdin: List[List[int]] = []
     qdout: List[List[int]] = []
@@ -2473,14 +2510,10 @@ def bridge_records(
     aggregated_out = [0.0 for _ in range(vocab)]
     seeds: List[int] = []
     digest = hashlib.sha256()
-    for layer in cfg.layers:
+    for layer, W1, W2, b1, b2 in resolved_layers:
         layer_seed = _layer_seed(layer, tensors)
         seeds.append(layer_seed)
         digest.update(struct.pack("<Q", layer_seed))
-        W1 = tensors[layer.w1]
-        W2 = tensors[layer.w2]
-        b1 = tensors[layer.b1]
-        b2 = tensors[layer.b2]
         hidden_dim = len(W1)
         out_dim = len(W2)
         for token in range(vocab):
@@ -2530,6 +2563,8 @@ def bridge_records(
         "peer_scores": peers,
     }
     metadata = {
+        "enabled": True,
+        "status": "enabled",
         "in_scales": in_scales,
         "out_scales": out_scales,
         "seed": global_seed,
@@ -3834,14 +3869,21 @@ def write_manifest(
         norm_def=2,
     )
 
+    bridge_enabled = all(
+        name in artefacts and artefacts[name].bytes > 0
+        for name in ("bridge_hubs", "bridge_qDin", "bridge_qDout")
+    )
     bridge_section = BridgeSection(
-        k_legs=2,
-        window=2,
-        proj_rows=vocab_size,
-        proj_cols=cfg.d_model,
-        proj_digest=_manifest_digest_for_array("bridge_hubs", artefacts),
-        beta_min=0.1,
-        beta_max=1.0,
+        k_legs=2 if bridge_enabled else 0,
+        window=2 if bridge_enabled else 0,
+        proj_rows=vocab_size if bridge_enabled else 0,
+        proj_cols=cfg.d_model if bridge_enabled else 0,
+        proj_digest=
+            _manifest_digest_for_array("bridge_hubs", artefacts)
+            if bridge_enabled
+            else ManifestDigest((0, 0)),
+        beta_min=0.1 if bridge_enabled else 0.0,
+        beta_max=1.0 if bridge_enabled else 0.0,
         guard_margin=0.0,
         guard_eps_row=0.0,
         load_max=0.0,
@@ -3849,14 +3891,15 @@ def write_manifest(
         kick_max=0.0,
     )
 
+    search_enabled = "peer_scores" in artefacts and artefacts["peer_scores"].bytes > 0
     search_section = SearchSection(
-        a_max=8.0,
-        a_cap=16.0,
-        h_sel=4.0,
-        h_roll=2.0,
-        c_puct=1.3,
-        epsilon=0.01,
-        value_loss=0.05,
+        a_max=8.0 if search_enabled else 0.0,
+        a_cap=16.0 if search_enabled else 0.0,
+        h_sel=4.0 if search_enabled else 0.0,
+        h_roll=2.0 if search_enabled else 0.0,
+        c_puct=1.3 if search_enabled else 0.0,
+        epsilon=0.01 if search_enabled else 0.0,
+        value_loss=0.05 if search_enabled else 0.0,
     )
 
     capacity_section = CapacitySection(
@@ -3910,9 +3953,9 @@ def write_manifest(
         optional_flags |= OptionalModule.OVERLAYS
     if any(name in artefacts for name in ("memory_coeff", "delaybuf_init")):
         optional_flags |= OptionalModule.MEMORY
-    if "bridge_hubs" in artefacts:
+    if bridge_enabled:
         optional_flags |= OptionalModule.BRIDGE
-    if "peer_scores" in artefacts:
+    if search_enabled:
         optional_flags |= OptionalModule.SEARCH
 
     optional_section = OptionalModulesSection(flags=int(optional_flags))
@@ -4250,11 +4293,15 @@ def convert(
 
             log_notice("Constructing bridge records")
             bridge_data, bridge_meta = bridge_fn(cfg, tensors, cfg.vocab_size)
-            store_array("bridge_hubs", bridge_data["bridge_hubs"], "u8")
-            store_array("bridge_qDin", bridge_data["bridge_qDin"], "q8_8")
-            store_array("bridge_qDout", bridge_data["bridge_qDout"], "q8_8")
-            store_array("peer_scores", bridge_data["peer_scores"], "q8_8")
             metadata["bridge"] = bridge_meta
+            if bridge_meta.get("enabled", True):
+                store_array("bridge_hubs", bridge_data["bridge_hubs"], "u8")
+                store_array("bridge_qDin", bridge_data["bridge_qDin"], "q8_8")
+                store_array("bridge_qDout", bridge_data["bridge_qDout"], "q8_8")
+                store_array("peer_scores", bridge_data["peer_scores"], "q8_8")
+            else:
+                reason = bridge_meta.get("reason", "disabled")
+                log_notice("Bridge disabled (%s); skipping bridge arrays", reason)
             determinism_meta = _determinism_metadata(active_settings, observer)
             metadata["determinism"] = determinism_meta
 
