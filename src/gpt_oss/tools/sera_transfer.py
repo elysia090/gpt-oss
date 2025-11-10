@@ -175,6 +175,77 @@ else:
 
 _MXFP4_SUFFIXES = (".blocks", ".scales")
 
+
+def _normalize_name_token(token: str) -> str:
+    return token.lower().replace("_", "").replace("-", "")
+
+
+@dataclass(frozen=True)
+class _RolePattern:
+    pattern: str
+    tokens: Tuple[str, ...]
+    role: str
+
+
+_ROLE_MANIFEST_FILENAME = "sera_transfer_roles.json"
+_ROLE_MANIFEST_PATH = Path(__file__).with_name(_ROLE_MANIFEST_FILENAME)
+_ROLE_MANIFEST_CACHE: Dict[str, List[_RolePattern]] | None = None
+_FUSED_QKV_ROLE = "__FUSED_QKV__"
+
+
+def _load_role_manifest() -> Dict[str, List[_RolePattern]]:
+    global _ROLE_MANIFEST_CACHE
+    if _ROLE_MANIFEST_CACHE is not None:
+        return _ROLE_MANIFEST_CACHE
+
+    if not _ROLE_MANIFEST_PATH.exists():
+        raise FileNotFoundError(
+            f"Role manifest not found at {_ROLE_MANIFEST_PATH}. Create "
+            "sera_transfer_roles.json with (pattern, role) mappings."
+        )
+
+    raw = json.loads(_ROLE_MANIFEST_PATH.read_text(encoding="utf-8"))
+    manifest: Dict[str, List[_RolePattern]] = {}
+    for family, entries in raw.items():
+        if not isinstance(entries, list):
+            raise ValueError(
+                "Role manifest entries must be lists of pattern-role pairs"
+            )
+        patterns: List[_RolePattern] = []
+        for entry in entries:
+            if not isinstance(entry, _Mapping):
+                raise ValueError(
+                    "Role manifest entries must be objects with 'pattern' and 'role'"
+                )
+            pattern = entry.get("pattern")
+            role = entry.get("role")
+            if not isinstance(pattern, str) or not isinstance(role, str):
+                raise ValueError(
+                    "Role manifest entries must declare string 'pattern' and 'role'"
+                )
+            tokens = tuple(
+                _normalize_name_token(part)
+                for part in pattern.split(".")
+                if part
+            )
+            if not tokens:
+                raise ValueError(
+                    f"Role manifest pattern '{pattern}' must contain at least one token"
+                )
+            patterns.append(_RolePattern(pattern=pattern, tokens=tokens, role=role))
+        manifest[family.lower()] = patterns
+
+    _ROLE_MANIFEST_CACHE = manifest
+    return manifest
+
+
+def _role_patterns_for_family(family: str) -> List[_RolePattern]:
+    manifest = _load_role_manifest()
+    family_key = family.lower()
+    if family_key in manifest:
+        return manifest[family_key]
+    return manifest.get("default", [])
+
 _MXFP4_FP4_VALUES = (
     +0.0,
     +0.5,
@@ -1360,6 +1431,7 @@ class ModelConfig:
 
         layer_entries = list(data.get("layers", []) or [])
         layers: List[LayerConfig]
+        model_family = ModelConfig._detect_model_family(raw)
         if layer_entries:
             layers = []
             for idx, layer in enumerate(layer_entries):
@@ -1387,6 +1459,7 @@ class ModelConfig:
                 d_model=d_model,
                 n_heads=n_heads,
                 head_dim=head_dim,
+                model_family=model_family,
             )
 
         if tensors is not None:
@@ -1431,208 +1504,49 @@ class ModelConfig:
         )
 
     @staticmethod
+    def _detect_model_family(config: Mapping[str, object]) -> str:
+        priority_keys = (
+            "sera_model_family",
+            "model_family",
+            "model_type",
+        )
+        for key in priority_keys:
+            candidate = config.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        architectures = config.get("architectures")
+        if isinstance(architectures, Sequence) and architectures:
+            arch = architectures[0]
+            if isinstance(arch, str) and arch.strip():
+                return arch.strip()
+        return "default"
+
+    @staticmethod
     def _infer_layers_from_tensors(
         tensors: Mapping[str, object],
         *,
         d_model: int,
         n_heads: int,
         head_dim: int,
+        model_family: str,
     ) -> List[LayerConfig]:
-        role_suffixes = {
-            "W_Q": (
-                "attn.q.weight",
-                "attn.wq.weight",
-                "attn.q_proj.weight",
-                "attn.qproj.weight",
-                "attention.q.weight",
-                "attention.wq.weight",
-                "attention.q_proj.weight",
-                "attention.qproj.weight",
-                "self_attn.q_proj.weight",
-                "self_attn.qproj.weight",
-                "q_proj.weight",
-                "qproj.weight",
-                "query_proj.weight",
-                "queryproj.weight",
-                "query.weight",
-                "q_linear.weight",
-                "q.weight",
-            ),
-            "W_K": (
-                "attn.k.weight",
-                "attn.wk.weight",
-                "attn.k_proj.weight",
-                "attn.kproj.weight",
-                "attention.k.weight",
-                "attention.wk.weight",
-                "attention.k_proj.weight",
-                "attention.kproj.weight",
-                "self_attn.k_proj.weight",
-                "self_attn.kproj.weight",
-                "k_proj.weight",
-                "kproj.weight",
-                "key_proj.weight",
-                "keyproj.weight",
-                "key.weight",
-                "k_linear.weight",
-                "k.weight",
-            ),
-            "W_V": (
-                "attn.v.weight",
-                "attn.wv.weight",
-                "attn.v_proj.weight",
-                "attn.vproj.weight",
-                "attention.v.weight",
-                "attention.wv.weight",
-                "attention.v_proj.weight",
-                "attention.vproj.weight",
-                "self_attn.v_proj.weight",
-                "self_attn.vproj.weight",
-                "v_proj.weight",
-                "vproj.weight",
-                "value_proj.weight",
-                "valueproj.weight",
-                "value.weight",
-                "v_linear.weight",
-                "v.weight",
-            ),
-            "W_O": (
-                "attn.o.weight",
-                "attn.wo.weight",
-                "attn.o_proj.weight",
-                "attn.oproj.weight",
-                "attn.out.weight",
-                "attention.o.weight",
-                "attention.wo.weight",
-                "attention.o_proj.weight",
-                "attention.out_proj.weight",
-                "attention.out.weight",
-                "attention.oproj.weight",
-                "attention.outproj.weight",
-                "self_attn.o_proj.weight",
-                "self_attn.oproj.weight",
-                "o_proj.weight",
-                "oproj.weight",
-                "out_proj.weight",
-                "outproj.weight",
-                "c_proj.weight",
-                "cproj.weight",
-                "o_linear.weight",
-                "o.weight",
-            ),
-            "FFN_W1": (
-                "ffn.w1.weight",
-                "mlp.w1.weight",
-                "ffn.gate_proj.weight",
-                "mlp.gate_proj.weight",
-                "ffn.up_proj.weight",
-                "mlp.up_proj.weight",
-                "feed_forward.w1.weight",
-                "feed_forward.up_proj.weight",
-                "ffn.wi.weight",
-                "mlp.wi.weight",
-                "ffn.gate.weight",
-                "mlp.gate.weight",
-                "ffn.upproj.weight",
-                "mlp.upproj.weight",
-                "up_proj.weight",
-                "upproj.weight",
-                "gate_proj.weight",
-                "gate.weight",
-                "w1.weight",
-                "wi.weight",
-                "mlp.mlp1_weight.blocks",
-                "mlp.mlp1_weight.scales",
-            ),
-            "FFN_W2": (
-                "ffn.w2.weight",
-                "mlp.w2.weight",
-                "ffn.down_proj.weight",
-                "mlp.down_proj.weight",
-                "ffn.proj.weight",
-                "feed_forward.w2.weight",
-                "feed_forward.down_proj.weight",
-                "ffn.wo.weight",
-                "mlp.wo.weight",
-                "ffn.downproj.weight",
-                "mlp.downproj.weight",
-                "down_proj.weight",
-                "downproj.weight",
-                "proj.weight",
-                "w2.weight",
-                "wo.weight",
-                "mlp.mlp2_weight.blocks",
-                "mlp.mlp2_weight.scales",
-            ),
-            "FFN_B1": (
-                "ffn.w1.bias",
-                "mlp.w1.bias",
-                "ffn.gate_proj.bias",
-                "mlp.gate_proj.bias",
-                "ffn.up_proj.bias",
-                "mlp.up_proj.bias",
-                "feed_forward.w1.bias",
-                "feed_forward.up_proj.bias",
-                "ffn.wi.bias",
-                "mlp.wi.bias",
-                "ffn.gate.bias",
-                "mlp.gate.bias",
-                "up_proj.bias",
-                "gate_proj.bias",
-                "gate.bias",
-                "w1.bias",
-                "wi.bias",
-                "mlp.mlp1_bias",
-            ),
-            "FFN_B2": (
-                "ffn.w2.bias",
-                "mlp.w2.bias",
-                "ffn.down_proj.bias",
-                "mlp.down_proj.bias",
-                "ffn.proj.bias",
-                "feed_forward.w2.bias",
-                "feed_forward.down_proj.bias",
-                "ffn.wo.bias",
-                "mlp.wo.bias",
-                "down_proj.bias",
-                "w2.bias",
-                "wo.bias",
-                "mlp.mlp2_bias",
-            ),
+        patterns = _role_patterns_for_family(model_family)
+        if not patterns:
+            raise ValueError(
+                f"Role manifest for model family '{model_family}' does not define any entries"
+            )
+
+        trigger_tokens = {
+            token
+            for pattern in patterns
+            for token in pattern.tokens[:-1]
+            if token not in {"weight", "bias", "blocks", "scales"}
         }
 
         expected_proj = n_heads * head_dim
         layer_map: Dict[str, Dict[str, str]] = {}
-        role_priorities: Dict[str, Dict[str, int]] = {}
-
-        qkv_suffixes = (
-            "attn.qkv.weight",
-            "attention.qkv.weight",
-            "self_attn.qkv.weight",
-            "qkv.weight",
-            "qkv_proj.weight",
-        )
-        qkv_suffix_tokens = [
-            tuple(suffix.lower().split(".")) for suffix in qkv_suffixes
-        ]
         qkv_sources: Dict[str, str] = {}
-
-        role_suffix_tokens = {
-            role: [tuple(suffix.lower().split(".")) for suffix in suffixes]
-            for role, suffixes in role_suffixes.items()
-        }
-        mxfp_priority_suffix_tokens = {
-            "FFN_W1": {
-                tuple("mlp.mlp1_weight.blocks".split(".")),
-                tuple("mlp.mlp1_weight.scales".split(".")),
-            },
-            "FFN_W2": {
-                tuple("mlp.mlp2_weight.blocks".split(".")),
-                tuple("mlp.mlp2_weight.scales".split(".")),
-            },
-            "FFN_B1": {tuple("mlp.mlp1_bias".split("."))},
-            "FFN_B2": {tuple("mlp.mlp2_bias".split("."))},
-        }
+        unmatched: List[str] = []
 
         for name, tensor in tensors.items():
             if not isinstance(name, str):
@@ -1640,59 +1554,52 @@ class ModelConfig:
 
             shape = _tensor_shape(tensor)
             name_tokens = name.split(".")
-            lower_tokens = [token.lower() for token in name_tokens]
+            normalized_tokens = [_normalize_name_token(token) for token in name_tokens]
 
-            matched_qkv = False
-            for suffix_tokens in qkv_suffix_tokens:
-                if len(lower_tokens) < len(suffix_tokens):
+            matched = False
+            for pattern in patterns:
+                suffix_tokens = pattern.tokens
+                if len(normalized_tokens) < len(suffix_tokens):
                     continue
-                tail_tokens = lower_tokens[-len(suffix_tokens) :]
-                if not ModelConfig._tokens_match(tail_tokens, suffix_tokens):
+
+                tail_tokens = normalized_tokens[-len(suffix_tokens) :]
+                if tail_tokens != list(suffix_tokens):
                     continue
+
                 prefix_tokens = name_tokens[: -len(suffix_tokens)]
                 prefix = ".".join(prefix_tokens).rstrip(".")
-                if prefix:
+                if not prefix:
+                    continue
+
+                role = pattern.role
+                if role == _FUSED_QKV_ROLE:
                     qkv_sources.setdefault(prefix, name)
-                matched_qkv = True
-                break
-
-            if matched_qkv:
-                continue
-
-            for role, suffix_token_sets in role_suffix_tokens.items():
-                matched = False
-                for suffix_tokens in suffix_token_sets:
-                    if len(lower_tokens) < len(suffix_tokens):
-                        continue
-
-                    tail_tokens = lower_tokens[-len(suffix_tokens) :]
-                    if not ModelConfig._tokens_allow_role(
-                        role, tail_tokens, suffix_tokens, shape, expected_proj
-                    ):
-                        continue
-
-                    prefix_tokens = name_tokens[: -len(suffix_tokens)]
-                    prefix = ".".join(prefix_tokens).rstrip(".")
-                    if not prefix:
-                        continue
-
-                    layer_roles = layer_map.setdefault(prefix, {})
-                    priorities = role_priorities.setdefault(prefix, {})
-                    suffix_key = tuple(suffix_tokens)
-                    priority = (
-                        1
-                        if suffix_key in mxfp_priority_suffix_tokens.get(role, set())
-                        else 0
-                    )
-                    existing_priority = priorities.get(role, -1)
-                    if priority > existing_priority:
-                        layer_roles[role] = name
-                        priorities[role] = priority
                     matched = True
                     break
 
-                if matched:
-                    break
+                if not ModelConfig._shape_allows_role(
+                    role, shape, expected_proj
+                ):
+                    continue
+
+                layer_roles = layer_map.setdefault(prefix, {})
+                layer_roles.setdefault(role, name)
+                matched = True
+                break
+
+            if not matched:
+                if ModelConfig._is_layer_role_candidate(
+                    normalized_tokens, trigger_tokens
+                ):
+                    unmatched.append(name)
+
+        if unmatched:
+            missing = ", ".join(sorted(set(unmatched)))
+            raise ValueError(
+                "No role manifest entry matched tensor names: "
+                f"{missing}. Update '{_ROLE_MANIFEST_FILENAME}' for family "
+                f"'{model_family}'."
+            )
 
         for prefix, base_name in qkv_sources.items():
             layer_roles = layer_map.setdefault(prefix, {})
@@ -1721,7 +1628,9 @@ class ModelConfig:
             }
             raise ValueError(
                 "Unable to infer layer configuration from tensors; missing roles: "
-                f"{missing_details}"
+                f"{missing_details}. Update '{_ROLE_MANIFEST_FILENAME}' for "
+                f"model family '{model_family}' or extend the manifest with the "
+                "required mappings."
             )
 
         if not layer_map:
@@ -1933,37 +1842,14 @@ class ModelConfig:
                 setattr(layer, attr, base)
 
     @staticmethod
-    def _tokens_allow_role(
-        role: str,
-        tail_tokens: Sequence[str],
-        suffix_tokens: Sequence[str],
-        shape: Tuple[int, ...],
-        expected_proj: int,
+    def _is_layer_role_candidate(
+        normalized_tokens: Sequence[str], trigger_tokens: set[str]
     ) -> bool:
-        if not ModelConfig._tokens_match(tail_tokens, suffix_tokens):
+        if not normalized_tokens:
             return False
-
-        if not ModelConfig._shape_allows_role(role, shape, expected_proj):
+        if normalized_tokens[-1] not in {"weight", "bias", "blocks", "scales"}:
             return False
-
-        return True
-
-    @staticmethod
-    def _tokens_match(
-        actual_tokens: Sequence[str],
-        expected_tokens: Sequence[str],
-    ) -> bool:
-        if len(actual_tokens) != len(expected_tokens):
-            return False
-
-        return all(
-            ModelConfig._normalize_token(actual) == ModelConfig._normalize_token(expected)
-            for actual, expected in zip(actual_tokens, expected_tokens)
-        )
-
-    @staticmethod
-    def _normalize_token(token: str) -> str:
-        return token.lower().replace("_", "").replace("-", "")
+        return any(token in trigger_tokens for token in normalized_tokens)
 
     @staticmethod
     def _shape_allows_role(
