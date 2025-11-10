@@ -1718,7 +1718,26 @@ class ModelConfig:
                             head_dim_hint=head_dim_local,
                         )
                         if inferred is None:
-                            raise
+                            shape = _tensor_shape(tensor)
+                            kv_desc = (
+                                str(kv_heads)
+                                if kv_heads is not None and kv_heads > 0
+                                else "unspecified"
+                            )
+                            head_dim_desc = (
+                                str(head_dim_local)
+                                if head_dim_local is not None and head_dim_local > 0
+                                else "unspecified"
+                            )
+                            raise ValueError(
+                                "Unable to infer fused QKV split for tensor "
+                                f"'{base}' with shape {shape or 'unknown'}; "
+                                f"expected n_heads={n_heads}, "
+                                f"num_key_value_heads={kv_desc}, "
+                                f"head_dim_hint={head_dim_desc}. "
+                                "Update the model config to provide explicit "
+                                "num_key_value_heads/head_dim or separate W_Q/W_K/W_V tensors."
+                            )
                         q_dim, kv_dim, head_dim_local, inferred_kv_heads = inferred
                         kv_heads = inferred_kv_heads
                         q, k, v = _split_qkv_tensor(tensor, q_dim, kv_dim, kv_dim)
@@ -4458,6 +4477,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.output is not None:
             hint = f" No artefacts were written to {args.output}."
         print(f"sera_transfer: {message}{hint}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    except ValueError as exc:
+        message = str(exc) or "Conversion failed with ValueError"
+        print(f"sera_transfer: {message}", file=sys.stderr)
         raise SystemExit(1) from exc
 
     try:
