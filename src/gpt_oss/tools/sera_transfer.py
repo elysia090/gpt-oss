@@ -88,6 +88,7 @@ class DeterminismSettings:
     mxfp4_backend: str = "python"
     torch_threads: int | None = None
     numpy_threads: int | None = None
+    cpu_affinity: tuple[int, ...] | None = None
     assume_ftz: bool = False
     assume_fma: bool = False
 
@@ -120,6 +121,10 @@ class DeterminismObserver:
 
 _CURRENT_DETERMINISM = DeterminismSettings()
 _DETERMINISM_OBSERVER: DeterminismObserver | None = None
+_CPU_AFFINITY_STATE: tuple[int, ...] | None = None
+_CPU_AFFINITY_ERROR: str | None = None
+_FTZ_PROBE_RESULT: bool | None = None
+_FMA_PROBE_RESULT: bool | None = None
 
 
 def safe_open(*args, **kwargs):
@@ -346,21 +351,195 @@ def _record_mxfp4_backend(backend: str) -> None:
         observer.record_backend(backend)
 
 
+def _normalise_cpu_affinity(cpu_indices: Iterable[int]) -> tuple[int, ...]:
+    indices = sorted({int(index) for index in cpu_indices})
+    if not indices:
+        raise ValueError("CPU affinity must contain at least one core")
+    if indices[0] < 0:
+        raise ValueError("CPU affinity indices must be non-negative")
+    return tuple(indices)
+
+
+def _read_process_affinity() -> tuple[int, ...] | None:
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            affinity = os.sched_getaffinity(0)
+        except Exception:  # pragma: no cover - defensive platform guard
+            pass
+        else:
+            return tuple(sorted(int(cpu) for cpu in affinity))
+    with contextlib.suppress(Exception):
+        import psutil  # type: ignore[import]
+
+        return tuple(sorted(int(cpu) for cpu in psutil.Process().cpu_affinity()))
+    return None
+
+
+def _set_process_affinity(
+    cpu_indices: Iterable[int],
+) -> tuple[bool, str | None]:
+    cpu_tuple = _normalise_cpu_affinity(cpu_indices)
+    cpu_set = set(cpu_tuple)
+    last_error: str | None = None
+    if hasattr(os, "sched_setaffinity"):
+        try:
+            os.sched_setaffinity(0, cpu_set)
+        except Exception as exc:  # pragma: no cover - platform specific
+            last_error = f"os.sched_setaffinity failed: {exc}"
+        else:
+            return True, None
+    try:
+        import psutil  # type: ignore[import]
+    except Exception as exc:  # pragma: no cover - optional dependency
+        detail = f"psutil unavailable ({exc})"
+        last_error = f"{last_error}; {detail}" if last_error else detail
+    else:
+        try:
+            psutil.Process().cpu_affinity(list(cpu_set))
+        except Exception as exc:  # pragma: no cover - platform specific
+            detail = f"psutil.Process.cpu_affinity failed: {exc}"
+            last_error = f"{last_error}; {detail}" if last_error else detail
+        else:
+            return True, None
+    return False, last_error
+
+
+def _ensure_deterministic_blas() -> None:
+    config = getattr(_np, "__config__", None)
+    if config is not None and hasattr(config, "get_info"):
+        accelerate = config.get_info("accelerate_info")
+        if accelerate:
+            raise RuntimeError(
+                "The Apple Accelerate BLAS backend is not supported for deterministic conversion"
+            )
+    os.environ.setdefault("MKL_CBWR", "COMPATIBLE")
+    os.environ.setdefault("MKL_SERVICE_FORCE_INTEL", "1")
+    os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "SSE4_2")
+
+
+def _probe_flush_to_zero() -> bool | None:
+    try:
+        denorm = math.ldexp(1.0, -1074)
+        return (denorm * 1.0) == 0.0
+    except Exception:  # pragma: no cover - extremely defensive
+        return None
+
+
+def _probe_fma_support() -> bool | None:
+    cpuinfo_path = Path("/proc/cpuinfo")
+    try:
+        contents = cpuinfo_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    flags: set[str] = set()
+    for line in contents.splitlines():
+        if line.startswith("flags") or line.startswith("Features"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                flags.update(token.strip().lower() for token in parts[1].split())
+    if not flags:
+        return None
+    if {"asimdfhm", "asimddp", "fphp"} & flags:
+        return True
+    return "fma" in flags
+
+
 def _apply_thread_configuration(settings: DeterminismSettings) -> None:
+    global _CPU_AFFINITY_STATE, _CPU_AFFINITY_ERROR, _FTZ_PROBE_RESULT, _FMA_PROBE_RESULT
+
+    _CPU_AFFINITY_ERROR = None
+    _FTZ_PROBE_RESULT = None
+    _FMA_PROBE_RESULT = None
+
+    try:
+        _ensure_deterministic_blas()
+    except RuntimeError as exc:
+        logger.error("Detected unsupported BLAS backend: %s", exc)
+        raise
+
+    if settings.cpu_affinity is None:
+        settings.cpu_affinity = _read_process_affinity()
+
+    if settings.cpu_affinity is not None:
+        try:
+            applied_affinity = _normalise_cpu_affinity(settings.cpu_affinity)
+        except ValueError as exc:
+            _CPU_AFFINITY_ERROR = str(exc)
+            raise RuntimeError(f"Invalid CPU affinity declaration: {exc}") from exc
+        success, error = _set_process_affinity(applied_affinity)
+        if not success:
+            _CPU_AFFINITY_STATE = None
+            _CPU_AFFINITY_ERROR = error or "unknown failure"
+            raise RuntimeError(
+                f"Unable to apply CPU affinity {applied_affinity}: {_CPU_AFFINITY_ERROR}"
+            )
+        _CPU_AFFINITY_STATE = applied_affinity
+        settings.cpu_affinity = applied_affinity
+    else:
+        _CPU_AFFINITY_STATE = _read_process_affinity()
+
     if settings.torch_threads is not None:
         torch_module = _get_torch()
         if torch_module is not None:
+            cuda_version = getattr(getattr(torch_module, "version", None), "cuda", None)
+            if cuda_version:
+                raise RuntimeError(
+                    "CUDA-enabled torch builds are not supported for deterministic conversion"
+                )
+            cuda_runtime = getattr(torch_module, "cuda", None)
+            if callable(getattr(cuda_runtime, "is_available", None)):
+                if cuda_runtime.is_available():  # pragma: no cover - GPU environment guard
+                    raise RuntimeError(
+                        "Torch CUDA runtime detected; deterministic CPU execution is required"
+                    )
             try:
                 torch_module.set_num_threads(settings.torch_threads)
-            except Exception:  # pragma: no cover - defensive logging
+            except Exception as exc:  # pragma: no cover - defensive logging
                 logger.debug(
-                    "Unable to set torch thread count to %s", settings.torch_threads
+                    "Unable to set torch thread count to %s: %s",
+                    settings.torch_threads,
+                    exc,
                 )
+            if hasattr(torch_module, "set_num_interop_threads"):
+                try:
+                    torch_module.set_num_interop_threads(1)
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    logger.debug("Unable to pin torch interop threads: %s", exc)
+            use_deterministic = getattr(torch_module, "use_deterministic_algorithms", None)
+            if callable(use_deterministic):
+                try:
+                    use_deterministic(True)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Unable to enable deterministic torch algorithms"
+                    ) from exc
+            else:  # pragma: no cover - torch API compatibility
+                raise RuntimeError(
+                    "torch.use_deterministic_algorithms is unavailable; cannot guarantee determinism"
+                )
+            backends = getattr(torch_module, "backends", None)
+            cudnn = getattr(backends, "cudnn", None)
+            if cudnn is not None:
+                cudnn.benchmark = False
+                cudnn.deterministic = True
+                if hasattr(cudnn, "allow_tf32"):
+                    cudnn.allow_tf32 = False
+            cuda_backends = getattr(backends, "cuda", None)
+            matmul = getattr(cuda_backends, "matmul", None)
+            if matmul is not None and hasattr(matmul, "allow_tf32"):
+                matmul.allow_tf32 = False
             if settings.assume_ftz and hasattr(torch_module, "set_flush_denormal"):
                 try:
                     torch_module.set_flush_denormal(True)
-                except Exception:  # pragma: no cover - defensive logging
-                    logger.debug("Unable to request torch flush-to-zero behaviour")
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    logger.debug("Unable to request torch flush-to-zero behaviour: %s", exc)
+            if settings.assume_ftz and hasattr(torch_module, "get_flush_denormal"):
+                if not torch_module.get_flush_denormal():
+                    raise RuntimeError("Torch runtime refused to enable flush-to-zero mode")
+        else:
+            raise RuntimeError(
+                "Deterministic torch execution requested but torch could not be imported"
+            )
     if settings.numpy_threads is not None:
         thread_value = str(settings.numpy_threads)
         for env_name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
@@ -370,6 +549,24 @@ def _apply_thread_configuration(settings: DeterminismSettings) -> None:
                 _np.set_num_threads(settings.numpy_threads)  # type: ignore[attr-defined]
             except Exception:
                 logger.debug("Unable to set numpy thread count to %s", thread_value)
+
+    _FTZ_PROBE_RESULT = _probe_flush_to_zero()
+    if settings.assume_ftz:
+        if _FTZ_PROBE_RESULT is False:
+            raise RuntimeError(
+                "Environment preserves denormal floats despite --assume-ftz attestation"
+            )
+        if _FTZ_PROBE_RESULT is None:
+            raise RuntimeError("Unable to validate flush-to-zero behaviour on this platform")
+
+    _FMA_PROBE_RESULT = _probe_fma_support()
+    if settings.assume_fma:
+        if _FMA_PROBE_RESULT is False:
+            raise RuntimeError(
+                "Fused multiply-add instructions are not available; cannot honor --assume-fma"
+            )
+        if _FMA_PROBE_RESULT is None:
+            raise RuntimeError("Unable to validate fused multiply-add support on this platform")
 
 
 _MODEL_CONFIG_LOG_ORDER: Tuple[str, ...] = (
@@ -4309,6 +4506,10 @@ def _determinism_metadata(
             "observed_backends": observed,
             "torch_threads": settings.torch_threads,
             "numpy_threads": settings.numpy_threads,
+            "cpu_affinity": settings.cpu_affinity,
+            "cpu_affinity_error": _CPU_AFFINITY_ERROR,
+            "ftz_probe": _FTZ_PROBE_RESULT,
+            "fma_probe": _FMA_PROBE_RESULT,
             "assume_ftz": settings.assume_ftz,
             "assume_fma": settings.assume_fma,
         },
@@ -4999,6 +5200,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Pin the NumPy thread count used for deterministic MXFP4 decoding.",
     )
     parser.add_argument(
+        "--cpu-affinity",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of CPU indices to bind deterministic worker threads. "
+            "Use 'auto' to preserve the current affinity."
+        ),
+    )
+    parser.add_argument(
         "--assume-ftz",
         action="store_true",
         help="Attest that the environment flushes denormal floats to zero (FTZ).",
@@ -5047,6 +5257,22 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.numpy_threads is not None and args.numpy_threads <= 0:
         parser.error("--numpy-threads must be a positive integer")
 
+    if args.cpu_affinity is None:
+        parsed_affinity: tuple[int, ...] | None = None
+    else:
+        affinity_text = args.cpu_affinity.strip()
+        if affinity_text.lower() == "auto":
+            parsed_affinity = None
+        else:
+            parts = [token.strip() for token in affinity_text.split(",") if token.strip()]
+            if not parts:
+                parser.error("--cpu-affinity must list at least one CPU index")
+            try:
+                parsed_affinity = _normalise_cpu_affinity(int(token) for token in parts)
+            except ValueError as exc:
+                parser.error(f"--cpu-affinity is invalid: {exc}")
+    args.cpu_affinity = parsed_affinity
+
     backend = args.mxfp4_backend
     if backend == "torch":
         if args.torch_threads is None:
@@ -5076,6 +5302,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         mxfp4_backend=backend,
         torch_threads=args.torch_threads,
         numpy_threads=args.numpy_threads,
+        cpu_affinity=args.cpu_affinity,
         assume_ftz=args.assume_ftz,
         assume_fma=args.assume_fma,
     )
