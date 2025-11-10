@@ -903,14 +903,22 @@ def test_cli_round_trip(tmp_path: Path, factory) -> None:
     assert sera_transfer.crc32c(payload) == header.crc32c
     assert sera_transfer.sha256_low64(payload) == header.sha256_low64
 
-    manifest = (output / "sera_manifest.bin").read_bytes()
-    assert manifest[:4] == struct.pack("<I", 0x5345524D)
-
     snapshot = pickle.loads((output / "sera_state.pkl").read_bytes())
     assert "sera_snapshot" in snapshot
     snapshot_cfg = snapshot["sera_snapshot"]["config"]
     assert snapshot_cfg["tokenizer"]["max_piece_length"] == 4
     assert snapshot["metadata"]["attention"]["features"] == 4
+
+    manifest_bytes = (output / "sera_manifest.bin").read_bytes()
+    assert manifest_bytes[:4] == struct.pack("<I", 0x5345524D)
+    manifest = sera_transfer.decode_manifest(manifest_bytes)
+    if factory.__name__ == "_create_checkpoint":
+        fixture_path = ROOT / "tests" / "data" / "sera_manifest_fixture.json"
+        fixture = json.loads(fixture_path.read_text())
+        assert manifest.to_dict() == fixture
+    else:
+        assert manifest.header.magic == 0x5345524D
+        assert manifest.tokenizer.p_gen == snapshot["model_config"].get("vocab_size", 0)
 
 
 def test_convert_preserves_optional_config_metadata(tmp_path: Path) -> None:

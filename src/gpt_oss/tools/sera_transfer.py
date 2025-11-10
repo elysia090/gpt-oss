@@ -20,6 +20,7 @@ import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Mapping as _Mapping, MutableMapping
+from enum import IntEnum, IntFlag
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
 _SAFETENSORS_MISSING_MSG = (
@@ -2721,7 +2722,853 @@ def tokenizer_arrays(
 
 
 # ---------------------------------------------------------------------------
+# Manifest schema helpers
+# ---------------------------------------------------------------------------
+
+
+class ManifestDigest(Tuple[int, int]):
+    """Helper tuple storing the low/high 64-bit halves of a digest."""
+
+    __slots__ = ()
+
+    @staticmethod
+    def from_bytes(data: bytes) -> "ManifestDigest":
+        padded = data[:16].ljust(16, b"\x00")
+        lo = int.from_bytes(padded[:8], "little", signed=False)
+        hi = int.from_bytes(padded[8:16], "little", signed=False)
+        return ManifestDigest((lo, hi))
+
+    def to_bytes(self) -> bytes:  # type: ignore[override]
+        lo, hi = self
+        return struct.pack("<QQ", lo, hi)
+
+
+@dataclass(frozen=True)
+class ArrayDescriptor:
+    """Mapping of a logical array to its digest and payload length."""
+
+    length: int
+    digest: ManifestDigest
+
+    def to_bytes(self) -> bytes:
+        return struct.pack("<Q", self.length) + self.digest.to_bytes()
+
+
+@dataclass(frozen=True)
+class ManifestHeader:
+    """Manifest prefix describing encoding and schema provenance."""
+
+    magic: int
+    endian: int
+    abi_flags: int
+    reserved: int
+    seed_digest: ManifestDigest
+    schema_digest: ManifestDigest
+
+    _STRUCT = struct.Struct("<I B B H Q Q Q Q")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(
+            self.magic,
+            self.endian,
+            self.abi_flags,
+            self.reserved,
+            self.seed_digest[0],
+            self.seed_digest[1],
+            self.schema_digest[0],
+            self.schema_digest[1],
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "ManifestHeader":
+        magic, endian, abi_flags, reserved, seed_lo, seed_hi, schema_lo, schema_hi = (
+            cls._STRUCT.unpack(payload)
+        )
+        return cls(
+            magic=magic,
+            endian=endian,
+            abi_flags=abi_flags,
+            reserved=reserved,
+            seed_digest=ManifestDigest((seed_lo, seed_hi)),
+            schema_digest=ManifestDigest((schema_lo, schema_hi)),
+        )
+
+
+@dataclass(frozen=True)
+class TokenizerSection:
+    l_tok: int
+    s_norm: int
+    l_norm: int
+    p_gen: int
+    fst: ArrayDescriptor
+    unicode_policy: int
+
+    _STRUCT = struct.Struct("<4H I Q Q B 3x")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(
+            self.l_tok,
+            self.s_norm,
+            self.l_norm,
+            0,
+            self.p_gen,
+            self.fst.digest[0],
+            self.fst.digest[1],
+            self.unicode_policy,
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes, length: int) -> "TokenizerSection":
+        l_tok, s_norm, l_norm, _reserved, p_gen, digest_lo, digest_hi, unicode_policy = (
+            cls._STRUCT.unpack(payload[: cls._STRUCT.size])
+        )
+        return cls(
+            l_tok=l_tok,
+            s_norm=s_norm,
+            l_norm=l_norm,
+            p_gen=p_gen,
+            fst=ArrayDescriptor(length=length, digest=ManifestDigest((digest_lo, digest_hi))),
+            unicode_policy=unicode_policy,
+        )
+
+
+@dataclass(frozen=True)
+class PRFSection:
+    r: int
+    tau: float
+    whitening_eps: float
+    clip_c: float
+
+    _STRUCT = struct.Struct("<I f f f")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(self.r, self.tau, self.whitening_eps, self.clip_c)
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "PRFSection":
+        r, tau, eps, clip = cls._STRUCT.unpack(payload[: cls._STRUCT.size])
+        return cls(r=r, tau=tau, whitening_eps=eps, clip_c=clip)
+
+
+@dataclass(frozen=True)
+class DenominatorSection:
+    beta_floor: float
+    lambda_digest: ManifestDigest
+
+    _STRUCT = struct.Struct("<f Q Q")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(
+            self.beta_floor, self.lambda_digest[0], self.lambda_digest[1]
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "DenominatorSection":
+        beta_floor, digest_lo, digest_hi = cls._STRUCT.unpack(payload[: cls._STRUCT.size])
+        return cls(
+            beta_floor=beta_floor,
+            lambda_digest=ManifestDigest((digest_lo, digest_hi)),
+        )
+
+
+@dataclass(frozen=True)
+class LinearSection:
+    capacity: int
+    d_model: int
+    bucket_size: int
+    stash_size: int
+    cuckoo_l: int
+    ring_q: int
+    tau_low: float
+    tau_high: float
+
+    _STRUCT = struct.Struct("<Q I I I I I f f")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(
+            self.capacity,
+            self.d_model,
+            self.bucket_size,
+            self.stash_size,
+            self.cuckoo_l,
+            self.ring_q,
+            self.tau_low,
+            self.tau_high,
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "LinearSection":
+        values = cls._STRUCT.unpack(payload[: cls._STRUCT.size])
+        return cls(*values)
+
+
+@dataclass(frozen=True)
+class MemorySection:
+    mode: int
+    p: int
+    q: int
+    L: int
+    t_phi: int
+    k: int
+    pole_radius_min: float
+
+    _STRUCT = struct.Struct("<4B I I f")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(
+            self.mode,
+            self.p,
+            self.q,
+            self.L,
+            self.t_phi,
+            self.k,
+            self.pole_radius_min,
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "MemorySection":
+        mode, p, q, L, t_phi, k, pole_radius = cls._STRUCT.unpack(
+            payload[: cls._STRUCT.size]
+        )
+        return cls(
+            mode=mode,
+            p=p,
+            q=q,
+            L=L,
+            t_phi=t_phi,
+            k=k,
+            pole_radius_min=pole_radius,
+        )
+
+
+@dataclass(frozen=True)
+class OverlaysSection:
+    slots: int
+    head_dim: int
+    rank_v: int
+
+    _STRUCT = struct.Struct("<I I I")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(self.slots, self.head_dim, self.rank_v)
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "OverlaysSection":
+        return cls(*cls._STRUCT.unpack(payload[: cls._STRUCT.size]))
+
+
+@dataclass(frozen=True)
+class CorrectorSection:
+    gamma_target: float
+    m_target: float
+    norm_def: int
+
+    _STRUCT = struct.Struct("<f f B 3x")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(self.gamma_target, self.m_target, self.norm_def)
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "CorrectorSection":
+        gamma, m_target, norm = cls._STRUCT.unpack(payload[: cls._STRUCT.size])
+        return cls(gamma_target=gamma, m_target=m_target, norm_def=norm)
+
+
+@dataclass(frozen=True)
+class BridgeSection:
+    k_legs: int
+    window: int
+    proj_rows: int
+    proj_cols: int
+    proj_digest: ManifestDigest
+    beta_min: float
+    beta_max: float
+    guard_margin: float
+    guard_eps_row: float
+    load_max: float
+    stash_max: float
+    kick_max: float
+
+    _STRUCT = struct.Struct("<B B H I I Q Q f f f f f f f")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(
+            self.k_legs,
+            self.window,
+            0,
+            self.proj_rows,
+            self.proj_cols,
+            self.proj_digest[0],
+            self.proj_digest[1],
+            self.beta_min,
+            self.beta_max,
+            self.guard_margin,
+            self.guard_eps_row,
+            self.load_max,
+            self.stash_max,
+            self.kick_max,
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "BridgeSection":
+        (
+            k_legs,
+            window,
+            _reserved,
+            proj_rows,
+            proj_cols,
+            digest_lo,
+            digest_hi,
+            beta_min,
+            beta_max,
+            guard_margin,
+            guard_eps_row,
+            load_max,
+            stash_max,
+            kick_max,
+        ) = cls._STRUCT.unpack(payload[: cls._STRUCT.size])
+        return cls(
+            k_legs=k_legs,
+            window=window,
+            proj_rows=proj_rows,
+            proj_cols=proj_cols,
+            proj_digest=ManifestDigest((digest_lo, digest_hi)),
+            beta_min=beta_min,
+            beta_max=beta_max,
+            guard_margin=guard_margin,
+            guard_eps_row=guard_eps_row,
+            load_max=load_max,
+            stash_max=stash_max,
+            kick_max=kick_max,
+        )
+
+
+@dataclass(frozen=True)
+class SearchSection:
+    a_max: float
+    a_cap: float
+    h_sel: float
+    h_roll: float
+    c_puct: float
+    epsilon: float
+    value_loss: float
+
+    _STRUCT = struct.Struct("<f f f f f f f")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(
+            self.a_max,
+            self.a_cap,
+            self.h_sel,
+            self.h_roll,
+            self.c_puct,
+            self.epsilon,
+            self.value_loss,
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "SearchSection":
+        return cls(*cls._STRUCT.unpack(payload[: cls._STRUCT.size]))
+
+
+@dataclass(frozen=True)
+class CapacitySection:
+    lambda_hat: float
+    t_rb_ms: float
+    slack: float
+    margin: float
+
+    _STRUCT = struct.Struct("<f f f f")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(
+            self.lambda_hat, self.t_rb_ms, self.slack, self.margin
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "CapacitySection":
+        return cls(*cls._STRUCT.unpack(payload[: cls._STRUCT.size]))
+
+
+@dataclass(frozen=True)
+class SaltsSection:
+    mphf: ManifestDigest
+    key: ManifestDigest
+    trust_gate: ManifestDigest
+
+    _STRUCT = struct.Struct("<Q Q Q Q Q Q")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(
+            self.mphf[0],
+            self.mphf[1],
+            self.key[0],
+            self.key[1],
+            self.trust_gate[0],
+            self.trust_gate[1],
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "SaltsSection":
+        (
+            mphf_lo,
+            mphf_hi,
+            key_lo,
+            key_hi,
+            trust_lo,
+            trust_hi,
+        ) = cls._STRUCT.unpack(payload[: cls._STRUCT.size])
+        return cls(
+            mphf=ManifestDigest((mphf_lo, mphf_hi)),
+            key=ManifestDigest((key_lo, key_hi)),
+            trust_gate=ManifestDigest((trust_lo, trust_hi)),
+        )
+
+
+@dataclass(frozen=True)
+class HashSection:
+    previous: ManifestDigest
+    current: ManifestDigest
+
+    _STRUCT = struct.Struct("<Q Q Q Q")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(
+            self.previous[0],
+            self.previous[1],
+            self.current[0],
+            self.current[1],
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "HashSection":
+        prev_lo, prev_hi, curr_lo, curr_hi = cls._STRUCT.unpack(
+            payload[: cls._STRUCT.size]
+        )
+        return cls(
+            previous=ManifestDigest((prev_lo, prev_hi)),
+            current=ManifestDigest((curr_lo, curr_hi)),
+        )
+
+
+@dataclass(frozen=True)
+class FPContractSection:
+    fma_mode: int
+    denormals_mode: int
+    ext_precision: int
+    reductions_digest: ManifestDigest
+
+    _STRUCT = struct.Struct("<B B B B Q Q")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(
+            self.fma_mode,
+            self.denormals_mode,
+            self.ext_precision,
+            0,
+            self.reductions_digest[0],
+            self.reductions_digest[1],
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "FPContractSection":
+        fma_mode, denormals_mode, ext_precision, _reserved, digest_lo, digest_hi = (
+            cls._STRUCT.unpack(payload[: cls._STRUCT.size])
+        )
+        return cls(
+            fma_mode=fma_mode,
+            denormals_mode=denormals_mode,
+            ext_precision=ext_precision,
+            reductions_digest=ManifestDigest((digest_lo, digest_hi)),
+        )
+
+
+@dataclass(frozen=True)
+class OptionalModulesSection:
+    flags: int
+
+    _STRUCT = struct.Struct("<I")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(self.flags)
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "OptionalModulesSection":
+        (flags,) = cls._STRUCT.unpack(payload[: cls._STRUCT.size])
+        return cls(flags=flags)
+
+
+@dataclass(frozen=True)
+class TrustGateSection:
+    enabled: int
+    profile_digest: ManifestDigest
+    salts_digest: ManifestDigest
+
+    _STRUCT = struct.Struct("<B 7x Q Q Q Q")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(
+            self.enabled,
+            self.profile_digest[0],
+            self.profile_digest[1],
+            self.salts_digest[0],
+            self.salts_digest[1],
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "TrustGateSection":
+        enabled, profile_lo, profile_hi, salts_lo, salts_hi = cls._STRUCT.unpack(
+            payload[: cls._STRUCT.size]
+        )
+        return cls(
+            enabled=enabled,
+            profile_digest=ManifestDigest((profile_lo, profile_hi)),
+            salts_digest=ManifestDigest((salts_lo, salts_hi)),
+        )
+
+
+@dataclass(frozen=True)
+class ManifestArrayEntry:
+    section: int
+    kind: int
+    length: int
+    digest: ManifestDigest
+
+    _STRUCT = struct.Struct("<H H Q Q Q")
+
+    def to_bytes(self) -> bytes:
+        return self._STRUCT.pack(
+            self.section,
+            self.kind,
+            self.length,
+            self.digest[0],
+            self.digest[1],
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "ManifestArrayEntry":
+        section, kind, length, digest_lo, digest_hi = cls._STRUCT.unpack(payload)
+        return cls(
+            section=section,
+            kind=kind,
+            length=length,
+            digest=ManifestDigest((digest_lo, digest_hi)),
+        )
+
+
+@dataclass(frozen=True)
+class ManifestArraysSection:
+    entries: Tuple[ManifestArrayEntry, ...]
+
+    _HEADER = struct.Struct("<H H")
+
+    def to_bytes(self) -> bytes:
+        payload = bytearray()
+        payload.extend(self._HEADER.pack(len(self.entries), 0))
+        for entry in self.entries:
+            payload.extend(entry.to_bytes())
+        return bytes(payload)
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "ManifestArraysSection":
+        count, _reserved = cls._HEADER.unpack(payload[: cls._HEADER.size])
+        offset = cls._HEADER.size
+        entries: List[ManifestArrayEntry] = []
+        for _ in range(count):
+            chunk = payload[offset : offset + ManifestArrayEntry._STRUCT.size]
+            if len(chunk) != ManifestArrayEntry._STRUCT.size:
+                raise ValueError("Manifest array table truncated")
+            entries.append(ManifestArrayEntry.from_bytes(chunk))
+            offset += ManifestArrayEntry._STRUCT.size
+        return cls(entries=tuple(entries))
+
+
+@dataclass(frozen=True)
+class ManifestPayload:
+    header: ManifestHeader
+    tokenizer: TokenizerSection
+    prf: PRFSection
+    denominator: DenominatorSection
+    linear: LinearSection
+    memory: MemorySection
+    overlays: OverlaysSection
+    corrector: CorrectorSection
+    bridge: BridgeSection
+    search: SearchSection
+    capacity: CapacitySection
+    salts: SaltsSection
+    hashes: HashSection
+    fp_contract: FPContractSection
+    optional_modules: OptionalModulesSection
+    trust_gate: TrustGateSection
+    arrays: ManifestArraysSection
+
+    def to_bytes(self) -> bytes:
+        parts = [
+            self.header.to_bytes(),
+            self.tokenizer.to_bytes(),
+            self.prf.to_bytes(),
+            self.denominator.to_bytes(),
+            self.linear.to_bytes(),
+            self.memory.to_bytes(),
+            self.overlays.to_bytes(),
+            self.corrector.to_bytes(),
+            self.bridge.to_bytes(),
+            self.search.to_bytes(),
+            self.capacity.to_bytes(),
+            self.salts.to_bytes(),
+            self.hashes.to_bytes(),
+            self.fp_contract.to_bytes(),
+            self.optional_modules.to_bytes(),
+            self.trust_gate.to_bytes(),
+            self.arrays.to_bytes(),
+        ]
+        return b"".join(parts)
+
+    def to_dict(self) -> Dict[str, object]:
+        def _digest_dict(value: ManifestDigest) -> Dict[str, int]:
+            return {"lo": value[0], "hi": value[1]}
+
+        def _array_entry(entry: ManifestArrayEntry) -> Dict[str, object]:
+            return {
+                "section": entry.section,
+                "kind": entry.kind,
+                "length": entry.length,
+                "digest": _digest_dict(entry.digest),
+            }
+
+        return {
+            "header": {
+                "magic": self.header.magic,
+                "endian": self.header.endian,
+                "abi_flags": self.header.abi_flags,
+                "seed_digest": _digest_dict(self.header.seed_digest),
+                "schema_digest": _digest_dict(self.header.schema_digest),
+            },
+            "tokenizer": {
+                "l_tok": self.tokenizer.l_tok,
+                "s_norm": self.tokenizer.s_norm,
+                "l_norm": self.tokenizer.l_norm,
+                "p_gen": self.tokenizer.p_gen,
+                "fst": {
+                    "length": self.tokenizer.fst.length,
+                    "digest": _digest_dict(self.tokenizer.fst.digest),
+                },
+                "unicode_policy": self.tokenizer.unicode_policy,
+            },
+            "prf": dataclasses.asdict(self.prf),
+            "denominator": {
+                "beta_floor": self.denominator.beta_floor,
+                "lambda_digest": _digest_dict(self.denominator.lambda_digest),
+            },
+            "linear": dataclasses.asdict(self.linear),
+            "memory": dataclasses.asdict(self.memory),
+            "overlays": dataclasses.asdict(self.overlays),
+            "corrector": dataclasses.asdict(self.corrector),
+            "bridge": {
+                "k_legs": self.bridge.k_legs,
+                "window": self.bridge.window,
+                "proj_rows": self.bridge.proj_rows,
+                "proj_cols": self.bridge.proj_cols,
+                "proj_digest": _digest_dict(self.bridge.proj_digest),
+                "beta_min": self.bridge.beta_min,
+                "beta_max": self.bridge.beta_max,
+                "guard_margin": self.bridge.guard_margin,
+                "guard_eps_row": self.bridge.guard_eps_row,
+                "load_max": self.bridge.load_max,
+                "stash_max": self.bridge.stash_max,
+                "kick_max": self.bridge.kick_max,
+            },
+            "search": dataclasses.asdict(self.search),
+            "capacity": dataclasses.asdict(self.capacity),
+            "salts": {
+                "mphf": _digest_dict(self.salts.mphf),
+                "key": _digest_dict(self.salts.key),
+                "trust_gate": _digest_dict(self.salts.trust_gate),
+            },
+            "hashes": {
+                "previous": _digest_dict(self.hashes.previous),
+                "current": _digest_dict(self.hashes.current),
+            },
+            "fp_contract": {
+                "fma_mode": self.fp_contract.fma_mode,
+                "denormals_mode": self.fp_contract.denormals_mode,
+                "ext_precision": self.fp_contract.ext_precision,
+                "reductions_digest": _digest_dict(
+                    self.fp_contract.reductions_digest
+                ),
+            },
+            "optional_modules": {"flags": self.optional_modules.flags},
+            "trust_gate": {
+                "enabled": self.trust_gate.enabled,
+                "profile_digest": _digest_dict(self.trust_gate.profile_digest),
+                "salts_digest": _digest_dict(self.trust_gate.salts_digest),
+            },
+            "arrays": {
+                "entries": [_array_entry(entry) for entry in self.arrays.entries]
+            },
+        }
+
+
+def decode_manifest(payload: bytes) -> ManifestPayload:
+    """Decode a manifest payload emitted by :func:`write_manifest`."""
+
+    offset = 0
+    header = ManifestHeader.from_bytes(
+        payload[offset : offset + ManifestHeader._STRUCT.size]
+    )
+    offset += ManifestHeader._STRUCT.size
+
+    def _slice(size: int) -> bytes:
+        nonlocal offset
+        chunk = payload[offset : offset + size]
+        if len(chunk) != size:
+            raise ValueError("Manifest truncated while decoding")
+        offset += size
+        return chunk
+
+    tokenizer_raw = _slice(TokenizerSection._STRUCT.size)
+    tokenizer = TokenizerSection.from_bytes(tokenizer_raw, length=0)
+    prf = PRFSection.from_bytes(_slice(PRFSection._STRUCT.size))
+    denominator = DenominatorSection.from_bytes(_slice(DenominatorSection._STRUCT.size))
+    linear = LinearSection.from_bytes(_slice(LinearSection._STRUCT.size))
+    memory = MemorySection.from_bytes(_slice(MemorySection._STRUCT.size))
+    overlays = OverlaysSection.from_bytes(_slice(OverlaysSection._STRUCT.size))
+    corrector = CorrectorSection.from_bytes(_slice(CorrectorSection._STRUCT.size))
+    bridge = BridgeSection.from_bytes(_slice(BridgeSection._STRUCT.size))
+    search = SearchSection.from_bytes(_slice(SearchSection._STRUCT.size))
+    capacity = CapacitySection.from_bytes(_slice(CapacitySection._STRUCT.size))
+    salts = SaltsSection.from_bytes(_slice(SaltsSection._STRUCT.size))
+    hashes = HashSection.from_bytes(_slice(HashSection._STRUCT.size))
+    fp_contract = FPContractSection.from_bytes(_slice(FPContractSection._STRUCT.size))
+    optional_modules = OptionalModulesSection.from_bytes(
+        _slice(OptionalModulesSection._STRUCT.size)
+    )
+    trust_gate = TrustGateSection.from_bytes(_slice(TrustGateSection._STRUCT.size))
+    arrays = ManifestArraysSection.from_bytes(payload[offset:])
+
+    length_map = {
+        (entry.section, entry.kind): entry.length for entry in arrays.entries
+    }
+
+    tokenizer_length = length_map.get(
+        (ManifestSectionID.TOKENIZER, ManifestArrayKind.TOKENIZER_FST),
+        tokenizer.fst.length,
+    )
+
+    tokenizer = dataclasses.replace(
+        tokenizer,
+        fst=ArrayDescriptor(length=tokenizer_length, digest=tokenizer.fst.digest),
+    )
+
+    return ManifestPayload(
+        header=header,
+        tokenizer=tokenizer,
+        prf=prf,
+        denominator=denominator,
+        linear=linear,
+        memory=memory,
+        overlays=overlays,
+        corrector=corrector,
+        bridge=bridge,
+        search=search,
+        capacity=capacity,
+        salts=salts,
+        hashes=hashes,
+        fp_contract=fp_contract,
+        optional_modules=optional_modules,
+        trust_gate=trust_gate,
+        arrays=arrays,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Manifest writing
+# ---------------------------------------------------------------------------
+
+
+class ManifestSectionID(IntEnum):
+    TOKENIZER = 1
+    PRF = 2
+    OVERLAYS = 3
+    LINEAR = 4
+    MEMORY = 5
+    BRIDGE = 6
+    CAPACITY = 7
+    SEARCH = 8
+    TRUST = 9
+
+
+class ManifestArrayKind(IntEnum):
+    TOKENIZER_FST = 1
+    TOKENIZER_TABLE = 2
+    PRF_WEIGHTS = 10
+    PRF_MU = 11
+    PRF_SIGMA = 12
+    OVERLAYS_H = 20
+    OVERLAYS_U = 21
+    OVERLAYS_DELTA = 22
+    LINEAR_MPHF = 30
+    LINEAR_KEYS = 31
+    LINEAR_WEIGHTS = 32
+    LINEAR_BIAS = 33
+    LINEAR_CUCKOO = 34
+    MEMORY_COEFF = 40
+    MEMORY_DELAYBUF = 41
+    BRIDGE_HUBS = 50
+    BRIDGE_QDIN = 51
+    BRIDGE_QDOUT = 52
+    BRIDGE_PEERS = 53
+
+
+class OptionalModule(IntFlag):
+    OVERLAYS = 0x01
+    MEMORY = 0x02
+    BRIDGE = 0x04
+    SEARCH = 0x08
+    TRUST = 0x10
+
+
+_ARRAY_SECTION_MAP: Dict[str, Tuple[int, int]] = {
+    "tokenizer_fst": (ManifestSectionID.TOKENIZER, ManifestArrayKind.TOKENIZER_FST),
+    "prf_W": (ManifestSectionID.PRF, ManifestArrayKind.PRF_WEIGHTS),
+    "whitening_mu": (ManifestSectionID.PRF, ManifestArrayKind.PRF_MU),
+    "whitening_sig2": (ManifestSectionID.PRF, ManifestArrayKind.PRF_SIGMA),
+    "overlays_H": (ManifestSectionID.OVERLAYS, ManifestArrayKind.OVERLAYS_H),
+    "overlays_U": (ManifestSectionID.OVERLAYS, ManifestArrayKind.OVERLAYS_U),
+    "overlays_DeltaW": (ManifestSectionID.OVERLAYS, ManifestArrayKind.OVERLAYS_DELTA),
+    "linear_mphf": (ManifestSectionID.LINEAR, ManifestArrayKind.LINEAR_MPHF),
+    "linear_keys": (ManifestSectionID.LINEAR, ManifestArrayKind.LINEAR_KEYS),
+    "linear_weights": (ManifestSectionID.LINEAR, ManifestArrayKind.LINEAR_WEIGHTS),
+    "linear_bias": (ManifestSectionID.LINEAR, ManifestArrayKind.LINEAR_BIAS),
+    "cuckoo_delta": (ManifestSectionID.LINEAR, ManifestArrayKind.LINEAR_CUCKOO),
+    "memory_coeff": (ManifestSectionID.MEMORY, ManifestArrayKind.MEMORY_COEFF),
+    "delaybuf_init": (ManifestSectionID.MEMORY, ManifestArrayKind.MEMORY_DELAYBUF),
+    "bridge_hubs": (ManifestSectionID.BRIDGE, ManifestArrayKind.BRIDGE_HUBS),
+    "bridge_qDin": (ManifestSectionID.BRIDGE, ManifestArrayKind.BRIDGE_QDIN),
+    "bridge_qDout": (ManifestSectionID.BRIDGE, ManifestArrayKind.BRIDGE_QDOUT),
+    "peer_scores": (ManifestSectionID.BRIDGE, ManifestArrayKind.BRIDGE_PEERS),
+}
+
+
+def _manifest_digest(data: bytes) -> ManifestDigest:
+    return ManifestDigest.from_bytes(data)
+
+
+def _manifest_digest_for_array(
+    name: str, artefacts: Mapping[str, ArrayDigest]
+) -> ManifestDigest:
+    info = artefacts.get(name)
+    if info is None:
+        return ManifestDigest((0, 0))
+    return _manifest_digest(info.sha256)
+
+
+def _array_descriptor(name: str, artefacts: Mapping[str, ArrayDigest]) -> ArrayDescriptor:
+    info = artefacts.get(name)
+    if info is None:
+        return ArrayDescriptor(length=0, digest=ManifestDigest((0, 0)))
+    return ArrayDescriptor(length=info.bytes, digest=_manifest_digest(info.sha256))
 
 
 def write_manifest(
@@ -2732,71 +3579,212 @@ def write_manifest(
     r: int,
     r_v: int,
     vocab_size: int,
+    determinism: DeterminismSettings | None = None,
 ) -> None:
     schema_path = Path("docs/specs/Sera-Transfer.txt")
-    schema_digest = (
+    schema_digest_bytes = (
         hashlib.sha256(schema_path.read_bytes()).digest()
         if schema_path.exists()
         else hashlib.sha256(b"sera").digest()
     )
-    seed_digest = hashlib.sha256(b"sera-transfer").digest()
+    seed_digest_bytes = hashlib.sha256(b"sera-transfer").digest()
 
-    empty_digest = hashlib.sha256(b"").digest()
+    determinism = determinism or DeterminismSettings()
 
-    def _digest(name: str) -> bytes:
+    abi_flags = 0
+    if determinism.assume_fma:
+        abi_flags |= 0x1
+    if determinism.assume_ftz:
+        abi_flags |= 0x2
+
+    tokenizer_section = TokenizerSection(
+        l_tok=4,
+        s_norm=1,
+        l_norm=1,
+        p_gen=vocab_size,
+        fst=_array_descriptor("tokenizer_fst", artefacts),
+        unicode_policy=1,
+    )
+
+    prf_section = PRFSection(
+        r=r,
+        tau=float(getattr(cfg, "tau", 1.0)),
+        whitening_eps=1e-8,
+        clip_c=3.0,
+    )
+
+    denominator_section = DenominatorSection(
+        beta_floor=1e-3,
+        lambda_digest=_manifest_digest(hashlib.sha256(b"lambda").digest()),
+    )
+
+    linear_info = artefacts.get("linear_weights")
+    capacity = (linear_info.bytes // 4) if linear_info is not None else 0
+
+    linear_section = LinearSection(
+        capacity=capacity,
+        d_model=cfg.d_model,
+        bucket_size=2,
+        stash_size=1,
+        cuckoo_l=8,
+        ring_q=4,
+        tau_low=0.1,
+        tau_high=1.0,
+    )
+
+    memory_section = MemorySection(
+        mode=1,
+        p=2,
+        q=1,
+        L=1,
+        t_phi=32,
+        k=4,
+        pole_radius_min=0.95,
+    )
+
+    overlays_section = OverlaysSection(
+        slots=cfg.n_heads,
+        head_dim=cfg.head_dim,
+        rank_v=r_v,
+    )
+
+    corrector_section = CorrectorSection(
+        gamma_target=0.5,
+        m_target=4.0,
+        norm_def=2,
+    )
+
+    bridge_section = BridgeSection(
+        k_legs=2,
+        window=2,
+        proj_rows=vocab_size,
+        proj_cols=cfg.d_model,
+        proj_digest=_manifest_digest_for_array("bridge_hubs", artefacts),
+        beta_min=0.1,
+        beta_max=1.0,
+        guard_margin=0.0,
+        guard_eps_row=0.0,
+        load_max=0.0,
+        stash_max=0.0,
+        kick_max=0.0,
+    )
+
+    search_section = SearchSection(
+        a_max=8.0,
+        a_cap=16.0,
+        h_sel=4.0,
+        h_roll=2.0,
+        c_puct=1.3,
+        epsilon=0.01,
+        value_loss=0.05,
+    )
+
+    capacity_section = CapacitySection(
+        lambda_hat=0.5,
+        t_rb_ms=20.0,
+        slack=0.1,
+        margin=0.05,
+    )
+
+    linear_mphf = artefacts.get("linear_mphf")
+    linear_keys = artefacts.get("linear_keys")
+
+    mphf_digest_bytes = hashlib.sha256(
+        b"mphf::" + (linear_mphf.sha256 if linear_mphf is not None else b"")
+    ).digest()
+    key_digest_bytes = hashlib.sha256(
+        b"key::" + (linear_keys.sha256 if linear_keys is not None else b"")
+    ).digest()
+    trust_salt_bytes = hashlib.sha256(b"trust::disabled").digest()
+
+    salts_section = SaltsSection(
+        mphf=_manifest_digest(mphf_digest_bytes),
+        key=_manifest_digest(key_digest_bytes),
+        trust_gate=_manifest_digest(trust_salt_bytes),
+    )
+
+    hashes_section = HashSection(
+        previous=_manifest_digest(hashlib.sha256(b"prev").digest()),
+        current=_manifest_digest(hashlib.sha256(b"curr").digest()),
+    )
+
+    fp_contract_section = FPContractSection(
+        fma_mode=1 if determinism.assume_fma else 0,
+        denormals_mode=1 if determinism.assume_ftz else 0,
+        ext_precision=0,
+        reductions_digest=_manifest_digest(
+            hashlib.sha256(
+                b"reductions::" + bytes([abi_flags & 0xFF])
+            ).digest()
+        ),
+    )
+
+    optional_flags = OptionalModule(0)
+    if any(name in artefacts for name in ("overlays_H", "overlays_U", "overlays_DeltaW")):
+        optional_flags |= OptionalModule.OVERLAYS
+    if any(name in artefacts for name in ("memory_coeff", "delaybuf_init")):
+        optional_flags |= OptionalModule.MEMORY
+    if "bridge_hubs" in artefacts:
+        optional_flags |= OptionalModule.BRIDGE
+    if "peer_scores" in artefacts:
+        optional_flags |= OptionalModule.SEARCH
+
+    optional_section = OptionalModulesSection(flags=int(optional_flags))
+
+    trust_gate_section = TrustGateSection(
+        enabled=0,
+        profile_digest=ManifestDigest((0, 0)),
+        salts_digest=_manifest_digest(hashlib.sha256(b"trust-profile::none").digest()),
+    )
+
+    entries: List[ManifestArrayEntry] = []
+    for name, (section_id, kind_id) in _ARRAY_SECTION_MAP.items():
         info = artefacts.get(name)
-        return info.sha256 if info is not None else empty_digest
+        if info is None:
+            continue
+        entries.append(
+            ManifestArrayEntry(
+                section=int(section_id),
+                kind=int(kind_id),
+                length=info.bytes,
+                digest=_manifest_digest(info.sha256),
+            )
+        )
+    entries.sort(key=lambda item: (item.section, item.kind))
+    arrays_section = ManifestArraysSection(entries=tuple(entries))
 
-    def _length(name: str) -> int:
-        info = artefacts.get(name)
-        return info.bytes if info is not None else 0
+    header = ManifestHeader(
+        magic=0x5345524D,
+        endian=1,
+        abi_flags=abi_flags,
+        reserved=0,
+        seed_digest=_manifest_digest(seed_digest_bytes),
+        schema_digest=_manifest_digest(schema_digest_bytes),
+    )
 
-    with path.open("wb") as f:
-        f.write(struct.pack("<I", 0x5345524D))
-        f.write(struct.pack("<I", 0x3))
-        f.write(seed_digest)
-        f.write(schema_digest)
+    manifest = ManifestPayload(
+        header=header,
+        tokenizer=tokenizer_section,
+        prf=prf_section,
+        denominator=denominator_section,
+        linear=linear_section,
+        memory=memory_section,
+        overlays=overlays_section,
+        corrector=corrector_section,
+        bridge=bridge_section,
+        search=search_section,
+        capacity=capacity_section,
+        salts=salts_section,
+        hashes=hashes_section,
+        fp_contract=fp_contract_section,
+        optional_modules=optional_section,
+        trust_gate=trust_gate_section,
+        arrays=arrays_section,
+    )
 
-        L_tok = 4
-        S_norm = 1.0
-        L_norm = 1.0
-        P_gen = vocab_size
-        f.write(struct.pack("<IffI", L_tok, S_norm, L_norm, P_gen))
-        f.write(_digest("tokenizer_fst"))
-        _write_utf8(f, "byte_level")
-
-        f.write(struct.pack("<Ifdd", r, cfg.tau, 1e-8, 3.0))
-        f.write(struct.pack("<d", 1e-3))
-        f.write(hashlib.sha256(b"lambda").digest())
-
-        C = _length("linear_weights") // 4
-        f.write(struct.pack("<5Idd", C, cfg.d_model, 2, 1, 8, 0.1, 1.0))
-
-        f.write(struct.pack("<6Id", 1, 2, 1, 1, 32, 4, 0.95))
-        f.write(struct.pack("<III", cfg.n_heads, cfg.head_dim, r_v))
-        _write_utf8(f, "l2")
-        f.write(struct.pack("<fi", 0.5, 4))
-
-        f.write(struct.pack("<III", vocab_size, 2, cfg.d_model))
-        f.write(_digest("bridge_hubs"))
-        f.write(struct.pack("<ff", 0.1, 1.0))
-        f.write(struct.pack("<II", 0, 0))
-        f.write(struct.pack("<III", 4, 2, 8))
-
-        f.write(struct.pack("<IIIIfff", 8, 16, 4, 2, 1.3, 0.01, 0.05))
-        f.write(struct.pack("<f f f f", 0.5, 20.0, 0.1, 0.05))
-        f.write(_digest("linear_mphf"))
-        f.write(_digest("linear_keys"))
-        f.write(hashlib.sha256(b"prev").digest())
-        f.write(hashlib.sha256(b"curr").digest())
-
-
-def _write_utf8(f: io.BufferedWriter, value: str) -> None:
-    data = value.encode("utf-8")
-    f.write(struct.pack("<H", len(data)))
-    f.write(data)
-
-
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as fh:
+        fh.write(manifest.to_bytes())
 def _determinism_metadata(
     settings: DeterminismSettings, observer: DeterminismObserver | None
 ) -> Dict[str, object]:
@@ -3075,6 +4063,7 @@ def convert(
                 r=local_r,
                 r_v=local_r_v,
                 vocab_size=cfg.vocab_size or 16,
+                determinism=active_settings,
             )
             determinism_meta["manifest_path"] = manifest_path.name
             try:
