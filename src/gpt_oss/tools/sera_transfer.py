@@ -2493,6 +2493,7 @@ def bridge_records(
         metadata = {
             "enabled": False,
             "status": "disabled",
+            "mode": "off",
             "reason": "missing_tensors",
             "missing_inputs": sorted(missing_inputs),
             "legs": 0,
@@ -2565,6 +2566,7 @@ def bridge_records(
     metadata = {
         "enabled": True,
         "status": "enabled",
+        "mode": "on",
         "in_scales": in_scales,
         "out_scales": out_scales,
         "seed": global_seed,
@@ -3794,6 +3796,7 @@ def write_manifest(
     vocab_size: int,
     determinism: DeterminismSettings | None = None,
     salts: Mapping[str, bytes] | None = None,
+    modules: Mapping[str, bool | None] | None = None,
 ) -> None:
     schema_path = Path("docs/specs/Sera-Transfer.txt")
     schema_digest_bytes = (
@@ -3805,6 +3808,7 @@ def write_manifest(
 
     determinism = determinism or DeterminismSettings()
     salts = dict(salts or {})
+    modules = modules or {}
 
     abi_flags = 0
     if determinism.assume_fma:
@@ -3869,10 +3873,19 @@ def write_manifest(
         norm_def=2,
     )
 
-    bridge_enabled = all(
+    bridge_arrays_present = all(
         name in artefacts and artefacts[name].bytes > 0
         for name in ("bridge_hubs", "bridge_qDin", "bridge_qDout")
     )
+    bridge_state = modules.get("bridge")
+    if bridge_state is True and not bridge_arrays_present:
+        raise ValueError("bridge module enabled but arrays are missing")
+    if bridge_state is False:
+        bridge_enabled = False
+    elif bridge_state is True:
+        bridge_enabled = True
+    else:
+        bridge_enabled = bridge_arrays_present
     bridge_section = BridgeSection(
         k_legs=2 if bridge_enabled else 0,
         window=2 if bridge_enabled else 0,
@@ -3953,7 +3966,8 @@ def write_manifest(
         optional_flags |= OptionalModule.OVERLAYS
     if any(name in artefacts for name in ("memory_coeff", "delaybuf_init")):
         optional_flags |= OptionalModule.MEMORY
-    if bridge_enabled:
+    include_bridge_flag = bridge_arrays_present or (bridge_state is not None)
+    if include_bridge_flag:
         optional_flags |= OptionalModule.BRIDGE
     if search_enabled:
         optional_flags |= OptionalModule.SEARCH
@@ -4183,6 +4197,7 @@ def convert(
             artefact_records: Dict[str, Dict[str, object]] = {}
             metadata: Dict[str, object] = {}
             manifest_salts: Dict[str, bytes] = {}
+            module_states: Dict[str, bool] = {}
             array_infos: List[ArrayInfo] = []
             snapshot_infos: List[SnapshotInfo] = []
 
@@ -4293,8 +4308,12 @@ def convert(
 
             log_notice("Constructing bridge records")
             bridge_data, bridge_meta = bridge_fn(cfg, tensors, cfg.vocab_size)
+            bridge_meta = dict(bridge_meta)
+            bridge_enabled = bool(bridge_meta.get("enabled"))
+            bridge_meta.setdefault("mode", "on" if bridge_enabled else "off")
             metadata["bridge"] = bridge_meta
-            if bridge_meta.get("enabled", True):
+            module_states["bridge"] = bridge_enabled
+            if bridge_enabled:
                 store_array("bridge_hubs", bridge_data["bridge_hubs"], "u8")
                 store_array("bridge_qDin", bridge_data["bridge_qDin"], "q8_8")
                 store_array("bridge_qDout", bridge_data["bridge_qDout"], "q8_8")
@@ -4326,6 +4345,7 @@ def convert(
                 vocab_size=cfg.vocab_size or 16,
                 determinism=active_settings,
                 salts=manifest_salts,
+                modules=module_states,
             )
             determinism_meta["manifest_path"] = manifest_path.name
             try:
