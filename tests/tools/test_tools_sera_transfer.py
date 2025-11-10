@@ -79,12 +79,18 @@ def _memory_worker(checkpoint: str, queue) -> None:
     )
 
     start_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-    tensors = worker_module.load_tensors(path)
-    del tensors
+    with worker_module.load_tensors(path) as tensors:
+        for name in list(tensors):
+            with tensors.checkout(name, default=None):
+                pass
+        lease_peak = getattr(tensors, "peak_leased_bytes", 0)
+        budget = getattr(tensors, "memory_budget_bytes", 0)
     peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
     queue.put({
         "peak": max(0, peak_rss - start_rss),
         "max_layer": max_layer_bytes,
+        "leased_peak": lease_peak,
+        "budget": budget,
     })
 
 
@@ -342,9 +348,8 @@ def test_load_tensors_passes_numpy_framework(tmp_path, monkeypatch):
     checkpoint = tmp_path / "model.safetensors"
     checkpoint.write_bytes(b"")
 
-    tensors = module.load_tensors(checkpoint)
-
-    assert tensors["foo"] == [[1.0, 2.0]]
+    with module.load_tensors(checkpoint) as tensors:
+        assert tensors["foo"] == [[1.0, 2.0]]
     assert calls == ["numpy"]
 
 
@@ -415,11 +420,10 @@ def test_load_tensors_keyword_only_safe_open_backward_compat(tmp_path, monkeypat
     )
     monkeypatch.setattr(module, "safe_open", keyword_only_safe_open)
 
-    tensors = module.load_tensors(checkpoint)
-
-    tensor = tensors["foo"]
-    assert isinstance(tensor, _FakeTensor)
-    assert tensor.tolist() == payload["foo"]
+    with module.load_tensors(checkpoint) as tensors:
+        tensor = tensors["foo"]
+        assert isinstance(tensor, _FakeTensor)
+        assert tensor.tolist() == payload["foo"]
     assert calls == [("keyword", "numpy")]
 
 
@@ -433,16 +437,15 @@ def test_load_tensors_preserves_bf16_payload(tmp_path):
         {"layer.weight": ("BF16", values.shape, _bf16_payload(values))},
     )
 
-    tensors = module.load_tensors(path)
+    with module.load_tensors(path) as tensors:
+        bf_tensor = tensors["layer.weight"]
+        bf_cls = getattr(module, "_Bfloat16Tensor")
+        assert isinstance(bf_tensor, bf_cls)
+        assert bf_tensor.shape == (4, 8)
+        assert bf_tensor.nbytes == values.size * 2
 
-    bf_tensor = tensors["layer.weight"]
-    bf_cls = getattr(module, "_Bfloat16Tensor")
-    assert isinstance(bf_tensor, bf_cls)
-    assert bf_tensor.shape == (4, 8)
-    assert bf_tensor.nbytes == values.size * 2
-
-    decoded = bf_tensor.to_float32()
-    np.testing.assert_allclose(decoded, values)
+        decoded = bf_tensor.to_float32()
+        np.testing.assert_allclose(decoded, values)
 
 
 def test_load_tensors_memory_budget_for_20b(tmp_path):
@@ -472,6 +475,7 @@ def test_load_tensors_memory_budget_for_20b(tmp_path):
     queue.join_thread()
 
     assert result["peak"] <= result["max_layer"] + 512 * 1024 * 1024
+    assert result["leased_peak"] <= result["budget"]
 
 
 def test_model_config_accepts_hf_config_fields() -> None:
@@ -841,20 +845,19 @@ def test_write_array_header_matches_spec(tmp_path: Path, dtype, data, expected_r
 def test_model_config_infers_layers_from_openai_layout(tmp_path: Path) -> None:
     source = _create_openai_checkpoint(tmp_path / "openai_infer")
     config_data = json.loads((source / "config.json").read_text())
-    tensors = sera_transfer.load_tensors(source / "model.safetensors")
+    with sera_transfer.load_tensors(source / "model.safetensors") as tensors:
+        cfg = sera_transfer.ModelConfig.from_dict(config_data, tensors=tensors)
+        assert len(cfg.layers) == 2
 
-    cfg = sera_transfer.ModelConfig.from_dict(config_data, tensors=tensors)
-    assert len(cfg.layers) == 2
-
-    first = cfg.layers[0]
-    assert first.w_q.endswith("attention.q_proj.weight")
-    assert first.w_k.endswith("attention.k_proj.weight")
-    assert first.w_v.endswith("attention.v_proj.weight")
-    assert first.w_o.endswith("attention.o_proj.weight")
-    assert first.w1.endswith("mlp.gate_proj.weight")
-    assert first.w2.endswith("mlp.down_proj.weight")
-    assert first.b1.endswith("mlp.gate_proj.bias")
-    assert first.b2.endswith("mlp.down_proj.bias")
+        first = cfg.layers[0]
+        assert first.w_q.endswith("attention.q_proj.weight")
+        assert first.w_k.endswith("attention.k_proj.weight")
+        assert first.w_v.endswith("attention.v_proj.weight")
+        assert first.w_o.endswith("attention.o_proj.weight")
+        assert first.w1.endswith("mlp.gate_proj.weight")
+        assert first.w2.endswith("mlp.down_proj.weight")
+        assert first.b1.endswith("mlp.gate_proj.bias")
+        assert first.b2.endswith("mlp.down_proj.bias")
 
 
 def test_model_config_handles_gpt_oss_mxfp4_layout(gpt_oss_mxfp4_layout) -> None:
@@ -1431,30 +1434,32 @@ def test_written_arrays_match_reference(tmp_path: Path) -> None:
     sera_transfer.convert(source, output, r=4, r_v=2, top_l=2)
 
     config_data = json.loads((source / "config.json").read_text())
-    tensors = sera_transfer.load_tensors(source / "model.safetensors")
-    cfg = sera_transfer.ModelConfig.from_dict(config_data, tensors=tensors)
-    arrays_dir = output / "arrays"
+    with sera_transfer.load_tensors(source / "model.safetensors") as tensors:
+        cfg = sera_transfer.ModelConfig.from_dict(config_data, tensors=tensors)
+        arrays_dir = output / "arrays"
 
-    tokenizer_assets = sera_transfer.load_tokenizer_assets([source])
-    tokenizer_data, tokenizer_meta = sera_transfer.tokenizer_arrays(
-        cfg, tensors, tokenizer_assets=tokenizer_assets
-    )
-    fst_payload = _payload(arrays_dir / "tokenizer_fst.bin")
-    expected_fst = sera_transfer._pack_values(tokenizer_data["tokenizer_fst"], "B")
-    assert fst_payload == expected_fst
-    assert len(tokenizer_meta["pieces"]) == cfg.vocab_size
-    for length in range(1, tokenizer_meta["max_piece_length"] + 1):
-        table_payload = _payload(arrays_dir / f"T_{length}.bin")
-        expected_table = sera_transfer._pack_values(tokenizer_data[f"T_{length}"], "B")
-        assert table_payload == expected_table
-        mph_info = tokenizer_meta["mph"][length]
-        assert mph_info["table_size"] >= len(mph_info["key_hashes"])
+        tokenizer_assets = sera_transfer.load_tokenizer_assets([source])
+        tokenizer_data, tokenizer_meta = sera_transfer.tokenizer_arrays(
+            cfg, tensors, tokenizer_assets=tokenizer_assets
+        )
+        fst_payload = _payload(arrays_dir / "tokenizer_fst.bin")
+        expected_fst = sera_transfer._pack_values(tokenizer_data["tokenizer_fst"], "B")
+        assert fst_payload == expected_fst
+        assert len(tokenizer_meta["pieces"]) == cfg.vocab_size
+        for length in range(1, tokenizer_meta["max_piece_length"] + 1):
+            table_payload = _payload(arrays_dir / f"T_{length}.bin")
+            expected_table = sera_transfer._pack_values(
+                tokenizer_data[f"T_{length}"], "B"
+            )
+            assert table_payload == expected_table
+            mph_info = tokenizer_meta["mph"][length]
+            assert mph_info["table_size"] >= len(mph_info["key_hashes"])
 
-    provenance = tokenizer_meta.get("provenance", {})
-    assert provenance.get("format") in {"tokenizer.json", "tokenizer.model"}
-    salts = tokenizer_meta.get("salts", {})
-    assert isinstance(salts.get("global_seed"), int)
-    sp_record = tokenizer_meta.get("sardinas_patterson", {})
+        provenance = tokenizer_meta.get("provenance", {})
+        assert provenance.get("format") in {"tokenizer.json", "tokenizer.model"}
+        salts = tokenizer_meta.get("salts", {})
+        assert isinstance(salts.get("global_seed"), int)
+        sp_record = tokenizer_meta.get("sardinas_patterson", {})
     assert sp_record.get("digest")
     levels = sp_record.get("levels", [])
     assert isinstance(levels, list)
