@@ -160,6 +160,9 @@ def _load_sera_common_module():
 
 _sera_common = _load_sera_common_module()
 ARRAY_MAGIC = _sera_common.ARRAY_MAGIC
+ARRAY_FLAG_ROW_MAJOR = _sera_common.ARRAY_FLAG_ROW_MAJOR
+ARRAY_FLAG_ALIGNED_64B = _sera_common.ARRAY_FLAG_ALIGNED_64B
+ARRAY_FLAG_FTZ = _sera_common.ARRAY_FLAG_FTZ
 JSON_BYTES_PREFIX = _sera_common.JSON_BYTES_PREFIX
 encode_snapshot_blob = _sera_common.encode_snapshot_blob
 ensure_bytes = _sera_common.ensure_bytes
@@ -361,6 +364,9 @@ def _normalise_path(path: Path) -> Path:
 __all__ = [
     "ArrayHeader",
     "ArrayInfo",
+    "ARRAY_FLAG_ALIGNED_64B",
+    "ARRAY_FLAG_FTZ",
+    "ARRAY_FLAG_ROW_MAJOR",
     "ConversionSummary",
     "SnapshotInfo",
     "crc32c",
@@ -538,43 +544,58 @@ class ArrayHeader:
 # Array serialisation
 
 
-_DTYPE_INFO: Mapping[str, Tuple[int, str]] = {
-    "f64": (1, "d"),
-    "f32": (2, "f"),
-    "i32": (3, "i"),
-    "i16": (4, "h"),
-    "i8": (5, "b"),
-    "u8": (6, "B"),
-}
+_FLOAT_FORMATS = {"f", "d"}
 
 
 def _pack_values(data, fmt: str) -> bytes:
     from array import array
 
+    flat = _flatten(data)
     arr = array(fmt)
-    if isinstance(data, (list, tuple)):
-        if data and isinstance(data[0], (list, tuple)):
-            flat = _flatten(data)
-            if fmt in {"f", "d"}:
-                arr.extend(flat)
-            else:
-                arr.extend(int(round(x)) for x in flat)
-        else:
-            arr.extend(float(x) if fmt in {"f", "d"} else int(round(x)) for x in data)
+    if fmt in _FLOAT_FORMATS:
+        arr.extend(float(value) for value in flat)
     else:
-        arr.append(float(data) if fmt in {"f", "d"} else int(round(data)))
+        arr.extend(int(round(value)) for value in flat)
     return arr.tobytes()
 
 
-def write_array(path: Path, data, dtype: str, flags: int = 0x1) -> bytes:
+def _pack_bf16(data) -> bytes:
+    flat = _flatten(data)
+    if not flat:
+        return b""
+    array = _np.asarray(flat, dtype=_np.float32)
+    uint32 = array.view(_np.uint32)
+    bf16 = (uint32 >> 16).astype(_np.uint16)
+    return bf16.tobytes()
+
+
+_DTYPE_INFO: Mapping[str, Tuple[int, Callable[[object], bytes]]] = {
+    "f64": (1, lambda data: _pack_values(data, "d")),
+    "f32": (2, lambda data: _pack_values(data, "f")),
+    "i32": (3, lambda data: _pack_values(data, "i")),
+    "i16": (4, lambda data: _pack_values(data, "h")),
+    "i8": (5, lambda data: _pack_values(data, "b")),
+    "u8": (6, lambda data: _pack_values(data, "B")),
+    "q8_8": (7, lambda data: _pack_values(data, "h")),
+    "q4_12": (8, lambda data: _pack_values(data, "H")),
+    "bf16": (9, _pack_bf16),
+}
+
+
+def write_array(path: Path, data, dtype: str, flags: int | None = None) -> bytes:
     if dtype not in _DTYPE_INFO:
         raise ValueError(f"Unsupported dtype {dtype}")
-    code, fmt = _DTYPE_INFO[dtype]
-    payload = _pack_values(data, fmt)
+    code, packer = _DTYPE_INFO[dtype]
+    payload = packer(data)
     shape = _infer_shape(data)
     dims = list(shape[:5])
     while len(dims) < 5:
         dims.append(1)
+    effective_flags = (
+        ARRAY_FLAG_ROW_MAJOR | ARRAY_FLAG_ALIGNED_64B | ARRAY_FLAG_FTZ
+        if flags is None
+        else flags
+    )
     header = ArrayHeader(
         magic=MAGIC_SERA_ARRAY,
         dtype_code=code,
@@ -583,11 +604,15 @@ def write_array(path: Path, data, dtype: str, flags: int = 0x1) -> bytes:
         byte_len=len(payload),
         crc32c=crc32c(payload),
         sha256_low64=sha256_low64(payload),
-        flags=flags,
+        flags=effective_flags,
     )
+    header_bytes = header.to_bytes()
+    alignment = (-len(header_bytes)) % 64
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as f:
-        f.write(header.to_bytes())
+        f.write(header_bytes)
+        if alignment:
+            f.write(b"\x00" * alignment)
         f.write(payload)
     return payload
 
@@ -3035,9 +3060,9 @@ def convert(
             log_notice("Constructing bridge records")
             bridge_data, bridge_meta = bridge_fn(cfg, tensors, cfg.vocab_size)
             store_array("bridge_hubs", bridge_data["bridge_hubs"], "u8")
-            store_array("bridge_qDin", bridge_data["bridge_qDin"], "i16")
-            store_array("bridge_qDout", bridge_data["bridge_qDout"], "i16")
-            store_array("peer_scores", bridge_data["peer_scores"], "i16")
+            store_array("bridge_qDin", bridge_data["bridge_qDin"], "q8_8")
+            store_array("bridge_qDout", bridge_data["bridge_qDout"], "q8_8")
+            store_array("peer_scores", bridge_data["peer_scores"], "q8_8")
             metadata["bridge"] = bridge_meta
             determinism_meta = _determinism_metadata(active_settings, observer)
             metadata["determinism"] = determinism_meta
