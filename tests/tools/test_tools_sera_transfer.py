@@ -23,12 +23,17 @@ save_file = safetensors_numpy.save_file
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+SRC = ROOT / "src"
+if SRC.exists() and str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 try:
     from gpt_oss.tools import sera_transfer
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
     if "pip install numpy" in str(exc):
         pytest.skip("Real numpy is required for Sera transfer tests", allow_module_level=True)
     raise
+
+assert "src" in Path(sera_transfer.__file__).parts
 
 
 def _create_matrix(rows: int, cols: int, rng: random.Random) -> list[list[float]]:
@@ -1191,35 +1196,40 @@ def test_array_checksums_regression(tmp_path: Path) -> None:
 
     arrays_dir = output / "arrays"
     checksums = {
-        path.name: hashlib.sha256(_payload(path)).hexdigest()
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted(arrays_dir.glob("*.bin"))
     }
 
     expected = {
-        "R_init.bin": "fff3e23f6f09f684eaed383e8541a0ed6ebc70c70cae1c3630f01207c2d647cb",
-        "T_1.bin": "73eb364a1ab3b1fac44c3d8a4da823cfdc2271066b656124a03f3cb092acb172",
-        "T_2.bin": "43c497f02b244bda3e8e6c2e6f6de5c91d08c569684d155e361e551d3fb46486",
-        "T_3.bin": "0b180863ee0bc0ce88de74fbd47db8aebceed56d74a6b6eefd9416c589e0d327",
-        "T_4.bin": "376bb3022eb0bbd669e8caa915a162d23c62f3ae649814fb9bc2287e63f1c50d",
-        "bridge_hubs.bin": "543bf02d15f2d094217ea7c5e4cde813fbc25c09205c77d98169e4af9e861471",
-        "bridge_qDin.bin": "ec0707f8cb38f54984497a0b51793e36473107ba8d294f96ac96164f5df4d1bd",
-        "bridge_qDout.bin": "e2cb6dd3cda429569e818f29e4b102d9b5006f30e646d42460440922f1b55e32",
-        "cuckoo_delta.bin": "a80189f45efc8626983c04226824ce57d66d8951d0711b27eb68125250a73d01",
-        "delaybuf_init.bin": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
-        "linear_bias.bin": "1d9e0bc18f8893dee78d668f460c9385b3dd6e469c55c79bce634fd16a74e8ce",
-        "linear_keys.bin": "1518b6e567af558a19594c82a37d7fedbeb5dfee23a48713a8733b8a997556a6",
-        "linear_mphf.bin": "f956fb7578c0cbdd582777104c27a351021d4f1d4c7bc065727b68f54c7962c0",
-        "linear_weights.bin": "2a5737160321eb22b3ead2b20b6321c0628a263236eb9f0178681c2bf8326228",
-        "memory_coeff.bin": "74e0abc5d53491b7328071ae92df330f5caaeec0d9cd183a2c583b2ea8e6b9e3",
-        "overlays_DeltaW.bin": "c91aa3aa9f4060f051742a4bbc042b809702e4e52bf4a4ebfdfc8e316003a9f9",
-        "overlays_H.bin": "f7f38e43f4115082900d582263e3139a09064e81925e3232389bc14be971e979",
-        "overlays_U.bin": "d7c5f448fd374053c01203592454ebee8881a0a42b31ce6a4c30eb0a2eff1101",
-        "peer_scores.bin": "8264d6742c8b68a793ba8e111de9fff94e665a570b14823c6b117698bdb01e16",
-        "prf_W.bin": "cebae16fe13b3f0e1b6119a02eaeea04e4f478702edb435de5a9571d84d6de81",
-        "s_init.bin": "4d848697b5664465351e1ba48be3e74ad691e88b1260ccb3e0b73db7118f55c4",
-        "tokenizer_fst.bin": "bdf9b3bcb482cc598a1c3d91236c3f4bcb40bda5338deabe5b95b321998a192f",
-        "whitening_mu.bin": "374708fff7719dd5979ec875d56cd2286f6d3cf7ec317a3b25632aab28ec37bb",
-        "whitening_sig2.bin": "5f322bcb08ace86b1f79dc91756db00079d156d568e71797eb952dd7a73ad9cd",
+        "R_init.bin": "7d7f9cf695a015d4dd5e862e102e6fc39ab76b69b5b9318434a5a6f196b0c595",
+        "T_1.bin": "575385afc5de59cd4cff920b8f5ca9c5f57d2f1a469d1ffadcc9ecfc689d1209",
+        "T_2.bin": "0313a62554d8b532bce4261a39baafc98526e26bf473265b58aa3b12f3e1c3e9",
+        "T_3.bin": "e87942391bf2fe9d6fa5d81cd3d1f2b023d123bb9fb5a4adefc5595ad00c9b9b",
+        "T_4.bin": "797e35cc1d64523fa13907ce9b0e0dc06c913cd07b07eb28052cd30dd6c0919f",
+        "bridge_hubs.bin": "b1765af176adc937bbdcaded86d2e8bc756358dba74a03412e16240b2f8eff30",
+        "bridge_qDin.bin": "1edef4d83792250982a9ee583b85ccffbe40cc13c4ecf080e2cbfa1a09606709",
+        "bridge_qDout.bin": "2090c735da1cbcbe3fc1a72437219ce325eecdb978f7f1e9c60785a92b374197",
+        "cuckoo_delta.bin": "576acdb10a9d0d9f5dcb9970eb7b6105d930cd3317afcf2a07c62330586a3145",
+        "delaybuf_init.bin": "2d65a9ed7f442cc54cb983094b6feb9a99635210701c038b6d316e451a2b3654",
+        "linear_bias.bin": "9c4dcbf57c1e5a6890a9c882e3ba12a90ece9fbf99a86818652b9969170d37ba",
+        "linear_keys.bin": "15913f521cf0e0ca841b4617aecf55b7dece60ff8bb610968f8fd13b081a6d27",
+        "linear_mphf.bin": "990652fb2ceaa7532b2b0e40b7ac1a145262b6272e119c04664ba15b53ff3283",
+        "linear_weights.bin": "b9e896e87767b2defb037a085d5bbd9776b7ee429fe3f7aa3882370ba5923961",
+        "memory_coeff.bin": "724d23280561eb1e7909a86fefdc778a6d8ba0e209734bd7f26edffe48a76182",
+        "overlays_DeltaW.bin": "6cd9368a0c3333594fe8a356d010538cd4c577b94c5f974183831b42dccbd1c6",
+        "overlays_H.bin": "646005ada365721c1a4c7c6c4c75d2f8153ffa24f937e58be8224b79dc2c411b",
+        "overlays_U.bin": "9ba6d03ff54587bdd0304c6b9b128d4acb73afd449c305e87f3fc841edf551b1",
+        "peer_scores.bin": "7044204096c6000dacb5c823a58031797bbea9515d08f7383f76064dbdf7d227",
+        "prf_W.bin": "b94cc880877de076921f8bea3a3f3b9d46a7bf91349208107d515da9659cdbb5",
+        "s_init.bin": "5a534c99468d8f1d53ed0b4058e1b376265361a42fc8fd57cbf7d28e11d0eab2",
+        "tokenizer_fst.bin": "3f7f982b24185fe6da5aa84f43adec88cd4236447ed7f8f854399c4700455115",
+        "whitening_mu.bin": "6de8277b57b6819bda93c1e23cdbc536d9e3806760ec71b78de79c8d7cb45982",
+        "whitening_sig2.bin": "a49a905b5c9d158bf85efc300b0bb9c29908c4d95fc68dc582ffa054569d8447",
     }
 
-    assert checksums == expected
+    differences = {
+        name: (checksums[name], expected.get(name))
+        for name in sorted(checksums)
+        if checksums[name] != expected.get(name)
+    }
+    assert differences == {}

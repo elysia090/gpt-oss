@@ -17,7 +17,7 @@ import re
 import struct
 import sys
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterable as _Iterable, Mapping as _Mapping, MutableMapping
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
@@ -56,6 +56,47 @@ if TYPE_CHECKING:  # pragma: no cover - typing helper
     TensorLike = list | _NDArray | _TorchTensor
 else:  # pragma: no cover - runtime alias
     TensorLike = Any
+
+
+@dataclass
+class DeterminismSettings:
+    """Runtime configuration describing deterministic kernel requirements."""
+
+    mxfp4_backend: str = "python"
+    torch_threads: int | None = None
+    numpy_threads: int | None = None
+    assume_ftz: bool = False
+    assume_fma: bool = False
+
+    def allow_torch(self) -> bool:
+        return (
+            self.mxfp4_backend == "torch"
+            and self.torch_threads == 1
+            and self.assume_ftz
+            and self.assume_fma
+        )
+
+    def allow_numpy(self) -> bool:
+        return (
+            self.mxfp4_backend == "numpy"
+            and self.numpy_threads == 1
+            and self.assume_ftz
+            and self.assume_fma
+        )
+
+
+@dataclass
+class DeterminismObserver:
+    """Capture deterministic execution decisions for auditing."""
+
+    mxfp4_backends: set[str] = field(default_factory=set)
+
+    def record_backend(self, backend: str) -> None:
+        self.mxfp4_backends.add(backend)
+
+
+_CURRENT_DETERMINISM = DeterminismSettings()
+_DETERMINISM_OBSERVER: DeterminismObserver | None = None
 
 
 def safe_open(*args, **kwargs):
@@ -181,6 +222,49 @@ def _config_to_dict(config):
     return config
 
 logger = logging.getLogger(__name__)
+
+
+def _active_determinism() -> DeterminismSettings:
+    return _CURRENT_DETERMINISM
+
+
+def _set_determinism(settings: DeterminismSettings) -> None:
+    global _CURRENT_DETERMINISM
+    _CURRENT_DETERMINISM = settings
+    _apply_thread_configuration(settings)
+
+
+def _set_determinism_observer(observer: DeterminismObserver | None) -> None:
+    global _DETERMINISM_OBSERVER
+    _DETERMINISM_OBSERVER = observer
+
+
+def _record_mxfp4_backend(backend: str) -> None:
+    observer = _DETERMINISM_OBSERVER
+    if observer is not None:
+        observer.record_backend(backend)
+
+
+def _apply_thread_configuration(settings: DeterminismSettings) -> None:
+    if settings.torch_threads is not None and _torch is not None:
+        try:
+            _torch.set_num_threads(settings.torch_threads)
+        except Exception:  # pragma: no cover - defensive logging
+            logger.debug("Unable to set torch thread count to %s", settings.torch_threads)
+        if settings.assume_ftz and hasattr(_torch, "set_flush_denormal"):
+            try:
+                _torch.set_flush_denormal(True)
+            except Exception:  # pragma: no cover - defensive logging
+                logger.debug("Unable to request torch flush-to-zero behaviour")
+    if settings.numpy_threads is not None:
+        thread_value = str(settings.numpy_threads)
+        for env_name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+            os.environ[env_name] = thread_value
+        if hasattr(_np, "set_num_threads"):
+            try:  # pragma: no cover - optional API
+                _np.set_num_threads(settings.numpy_threads)  # type: ignore[attr-defined]
+            except Exception:
+                logger.debug("Unable to set numpy thread count to %s", thread_value)
 
 
 _MODEL_CONFIG_LOG_ORDER: Tuple[str, ...] = (
@@ -751,6 +835,9 @@ def _build_two_level_mph(keys: Sequence[int]) -> Tuple[List[int], List[int], Dic
 # Linear algebra helpers
 
 
+_HOUSEHOLDER_TOLERANCE = 1e-12
+
+
 def transpose(matrix: List[List[float]]) -> List[List[float]]:
     if not matrix:
         return []
@@ -777,42 +864,104 @@ def matmul(A: List[List[float]], B: List[List[float]]) -> List[List[float]]:
     return result
 
 
-def gram_schmidt(columns: List[List[float]]) -> List[List[float]]:
-    orth: List[List[float]] = []
-    for vec in columns:
-        v = list(vec)
-        for basis in orth:
-            dot = sum(a * b for a, b in zip(v, basis))
-            v = [a - dot * b for a, b in zip(v, basis)]
-        norm = math.sqrt(sum(a * a for a in v))
-        if norm < 1e-12:
-            raise ValueError("Vectors are linearly dependent")
-        v = [a / norm for a in v]
-        orth.append(v)
-    return orth
-
-
-def orthonormal_matrix(rows: int, cols: int, generator: Iterable[List[float]]) -> List[List[float]]:
-    orth: List[List[float]] = []
-    for column in generator:
-        vec = list(column[:rows])
-        if len(vec) < rows:
-            vec.extend([0.0] * (rows - len(vec)))
-        for basis in orth:
-            dot = sum(a * b for a, b in zip(vec, basis))
-            vec = [a - dot * b for a, b in zip(vec, basis)]
-        norm = math.sqrt(sum(a * a for a in vec))
-        if norm < 1e-12:
-            continue
-        vec = [a / norm for a in vec]
-        orth.append(vec)
-        if len(orth) == cols:
+def _prepare_householder_column(column: Iterable[float], rows: int) -> List[float]:
+    values: List[float] = []
+    for idx, value in enumerate(column):
+        if idx >= rows:
             break
-    if len(orth) < cols:
+        values.append(float(value))
+    if len(values) < rows:
+        values.extend([0.0] * (rows - len(values)))
+    return values
+
+
+def _assemble_columns(columns: Sequence[List[float]], rows: int) -> List[List[float]]:
+    if rows <= 0 or not columns:
+        return []
+    matrix: List[List[float]] = []
+    for row_idx in range(rows):
+        matrix.append([column[row_idx] for column in columns])
+    return matrix
+
+
+def _householder_qr(
+    matrix: List[List[float]], eps: float = _HOUSEHOLDER_TOLERANCE
+) -> Tuple[List[List[float]], List[List[float]], List[float]]:
+    rows = len(matrix)
+    cols = len(matrix[0]) if rows and matrix[0] else 0
+    Q: List[List[float]] = [
+        [1.0 if i == j else 0.0 for j in range(rows)] for i in range(rows)
+    ]
+    R: List[List[float]] = [row[:] for row in matrix]
+    diag: List[float] = []
+    for k in range(min(rows, cols)):
+        norm_x = 0.0
+        for i in range(k, rows):
+            value = R[i][k]
+            norm_x += value * value
+        norm_x = math.sqrt(norm_x)
+        if norm_x < eps:
+            diag.append(0.0)
+            continue
+        x0 = R[k][k]
+        sign = -1.0 if x0 >= 0.0 else 1.0
+        alpha = sign * norm_x
+        v = [0.0] * rows
+        v[k] = x0 - alpha
+        for i in range(k + 1, rows):
+            v[i] = R[i][k]
+        norm_v = math.sqrt(sum(v[i] * v[i] for i in range(k, rows)))
+        if norm_v < eps:
+            diag.append(0.0)
+            continue
+        inv_norm_v = 1.0 / norm_v
+        for i in range(k, rows):
+            v[i] *= inv_norm_v
+        for j in range(k, cols):
+            dot = 0.0
+            for i in range(k, rows):
+                dot += v[i] * R[i][j]
+            for i in range(k, rows):
+                R[i][j] -= 2.0 * v[i] * dot
+        for j in range(rows):
+            dot = 0.0
+            for i in range(k, rows):
+                dot += v[i] * Q[i][j]
+            for i in range(k, rows):
+                Q[i][j] -= 2.0 * v[i] * dot
+        diag.append(R[k][k])
+    return Q, R, diag
+
+
+def orthonormal_matrix(
+    rows: int, cols: int, generator: Iterable[Iterable[float]]
+) -> List[List[float]]:
+    if rows <= 0 or cols <= 0:
+        return []
+    selected: List[List[float]] = []
+    basis_q: List[List[float]] | None = None
+    for column in generator:
+        vec = _prepare_householder_column(column, rows)
+        candidate = selected + [vec]
+        matrix = _assemble_columns(candidate, rows)
+        q_matrix, _r_matrix, diag = _householder_qr(matrix)
+        diag_index = len(candidate) - 1
+        if diag_index >= len(diag):
+            raise ValueError(
+                "Unable to construct orthonormal basis (columns exceed row count)"
+            )
+        if abs(diag[diag_index]) <= _HOUSEHOLDER_TOLERANCE:
+            continue
+        selected.append(vec)
+        basis_q = q_matrix
+        if len(selected) == cols:
+            break
+    if len(selected) < cols or basis_q is None:
         raise ValueError(
             "Unable to construct orthonormal basis (insufficient independent vectors)"
         )
-    return transpose(orth)
+    q_full = transpose(basis_q)
+    return [row[:cols] for row in q_full]
 
 
 # ---------------------------------------------------------------------------
@@ -870,40 +1019,37 @@ def _as_nested_list(value):
     return value
 
 
-def _decode_mxfp4_pair(blocks: TensorLike, scales: TensorLike):
-    if _TORCH_TENSOR_TYPES and isinstance(blocks, _TORCH_TENSOR_TYPES):
-        blocks_tensor = blocks.to(dtype=_torch.uint8)
-        if _TORCH_TENSOR_TYPES and isinstance(scales, _TORCH_TENSOR_TYPES):
-            scales_tensor = scales.to(dtype=_torch.int32, device=blocks_tensor.device)
-        else:
-            scales_tensor = _torch.as_tensor(
-                scales, dtype=_torch.int32, device=blocks_tensor.device
-            )
-        scales_tensor = scales_tensor - 127
-        lut = _torch.tensor(
-            _MXFP4_FP4_VALUES, dtype=_torch.float32, device=blocks_tensor.device
+def _decode_mxfp4_torch(blocks: "_TorchTensor", scales: TensorLike):
+    blocks_tensor = blocks.to(dtype=_torch.uint8)
+    if _TORCH_TENSOR_TYPES and isinstance(scales, _TORCH_TENSOR_TYPES):
+        scales_tensor = scales.to(dtype=_torch.int32, device=blocks_tensor.device)
+    else:
+        scales_tensor = _torch.as_tensor(
+            scales, dtype=_torch.int32, device=blocks_tensor.device
         )
-        prefix_shape = blocks_tensor.shape[:-1]
-        idx_lo = (blocks_tensor & 0x0F).to(dtype=_torch.long)
-        idx_hi = (blocks_tensor >> 4).to(dtype=_torch.long)
-        decoded = _torch.stack((lut[idx_lo], lut[idx_hi]), dim=-1)
-        decoded = _torch.ldexp(
-            decoded,
-            scales_tensor.reshape(*prefix_shape, 1, 1),
-        )
-        return decoded.reshape(*prefix_shape, blocks_tensor.shape[-1] * 2)
+    scales_tensor = scales_tensor - 127
+    lut = _torch.tensor(_MXFP4_FP4_VALUES, dtype=_torch.float32, device=blocks_tensor.device)
+    prefix_shape = blocks_tensor.shape[:-1]
+    idx_lo = (blocks_tensor & 0x0F).to(dtype=_torch.long)
+    idx_hi = (blocks_tensor >> 4).to(dtype=_torch.long)
+    decoded = _torch.stack((lut[idx_lo], lut[idx_hi]), dim=-1)
+    decoded = _torch.ldexp(decoded, scales_tensor.reshape(*prefix_shape, 1, 1))
+    return decoded.reshape(*prefix_shape, blocks_tensor.shape[-1] * 2)
 
-    if _NP_ARRAY_TYPES and isinstance(blocks, _NP_ARRAY_TYPES):
-        blocks_array = _np.asarray(blocks, dtype=_np.uint8)
-        scales_array = _np.asarray(scales, dtype=_np.int32) - 127
-        lut = _np.asarray(_MXFP4_FP4_VALUES, dtype=_np.float32)
-        prefix_shape = blocks_array.shape[:-1]
-        idx_lo = blocks_array & 0x0F
-        idx_hi = blocks_array >> 4
-        decoded = _np.stack((lut[idx_lo], lut[idx_hi]), axis=-1)
-        decoded = _np.ldexp(decoded, scales_array.reshape(*prefix_shape, 1, 1))
-        return decoded.reshape(*prefix_shape, blocks_array.shape[-1] * 2)
 
+def _decode_mxfp4_numpy(blocks: "_NDArray", scales: TensorLike):
+    blocks_array = _np.asarray(blocks, dtype=_np.uint8)
+    scales_array = _np.asarray(scales, dtype=_np.int32) - 127
+    lut = _np.asarray(_MXFP4_FP4_VALUES, dtype=_np.float32)
+    prefix_shape = blocks_array.shape[:-1]
+    idx_lo = blocks_array & 0x0F
+    idx_hi = blocks_array >> 4
+    decoded = _np.stack((lut[idx_lo], lut[idx_hi]), axis=-1)
+    decoded = _np.ldexp(decoded, scales_array.reshape(*prefix_shape, 1, 1))
+    return decoded.reshape(*prefix_shape, blocks_array.shape[-1] * 2)
+
+
+def _decode_mxfp4_python(blocks: TensorLike, scales: TensorLike):
     blocks_list = _as_nested_list(blocks)
     scales_list = _as_nested_list(scales)
 
@@ -926,6 +1072,28 @@ def _decode_mxfp4_pair(blocks: TensorLike, scales: TensorLike):
         return row
 
     return _decode_recursive(blocks_list, scales_list)
+
+
+def _decode_mxfp4_pair(blocks: TensorLike, scales: TensorLike):
+    settings = _active_determinism()
+    if _TORCH_TENSOR_TYPES and isinstance(blocks, _TORCH_TENSOR_TYPES):
+        if settings.allow_torch():
+            _record_mxfp4_backend("torch")
+            return _decode_mxfp4_torch(blocks, scales)
+        blocks = _as_nested_list(blocks)
+        scales = _as_nested_list(scales)
+    if _NP_ARRAY_TYPES and isinstance(blocks, _NP_ARRAY_TYPES):
+        if settings.allow_numpy():
+            _record_mxfp4_backend("numpy")
+            return _decode_mxfp4_numpy(blocks, scales)
+        blocks = _as_nested_list(blocks)
+        scales = _as_nested_list(scales)
+    if _TORCH_TENSOR_TYPES and isinstance(scales, _TORCH_TENSOR_TYPES):
+        scales = _as_nested_list(scales)
+    if _NP_ARRAY_TYPES and isinstance(scales, _NP_ARRAY_TYPES):
+        scales = _as_nested_list(scales)
+    _record_mxfp4_backend("python")
+    return _decode_mxfp4_python(blocks, scales)
 
 
 def _split_qkv_tensor(
@@ -2445,6 +2613,29 @@ def _write_utf8(f: io.BufferedWriter, value: str) -> None:
     f.write(data)
 
 
+def _determinism_metadata(
+    settings: DeterminismSettings, observer: DeterminismObserver | None
+) -> Dict[str, object]:
+    observed = sorted(observer.mxfp4_backends) if observer is not None else []
+    if not observed:
+        observed = ["python"]
+    return {
+        "householder_qr": {
+            "algorithm": "householder",
+            "tolerance": _HOUSEHOLDER_TOLERANCE,
+            "sign_rule": "negative_if_nonnegative_pivot",
+        },
+        "mxfp4_decoder": {
+            "configured_backend": settings.mxfp4_backend,
+            "observed_backends": observed,
+            "torch_threads": settings.torch_threads,
+            "numpy_threads": settings.numpy_threads,
+            "assume_ftz": settings.assume_ftz,
+            "assume_fma": settings.assume_fma,
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Conversion driver
 
@@ -2458,6 +2649,7 @@ def convert(
     top_l: int = 8,
     original_subdir: str | Path | None = None,
     verbose: bool = False,
+    determinism: DeterminismSettings | None = None,
 ) -> ConversionSummary:
     """Convert a checkpoint directory into a Sera Transfer Kit artefact.
 
@@ -2478,6 +2670,17 @@ def convert(
     except OSError:
         created_output_dir = True
     output.mkdir(parents=True, exist_ok=True)
+
+    previous_settings = dataclasses.replace(_active_determinism())
+    active_settings = (
+        dataclasses.replace(determinism)
+        if determinism is not None
+        else previous_settings
+    )
+    observer = DeterminismObserver()
+    previous_observer = _DETERMINISM_OBSERVER
+    _set_determinism(active_settings)
+    _set_determinism_observer(observer)
 
     if verbose and not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO)
@@ -2546,6 +2749,7 @@ def convert(
             raise FileNotFoundError(message)
 
         def _convert_inner() -> ConversionSummary:
+            determinism_meta: Dict[str, object] = {}
             config_path = find_file("config.json")
             model_path = find_file("model.safetensors")
             log_notice("Reading model configuration from %s", config_path)
@@ -2676,6 +2880,8 @@ def convert(
             store_array("bridge_qDout", bridge_data["bridge_qDout"], "i16")
             store_array("peer_scores", bridge_data["peer_scores"], "i16")
             metadata["bridge"] = bridge_meta
+            determinism_meta = _determinism_metadata(active_settings, observer)
+            metadata["determinism"] = determinism_meta
 
             manifest_path = output / "sera_manifest.bin"
             write_manifest_fn(
@@ -2686,6 +2892,13 @@ def convert(
                 r_v=local_r_v,
                 vocab_size=cfg.vocab_size or 16,
             )
+            determinism_meta["manifest_path"] = manifest_path.name
+            try:
+                determinism_meta["manifest_digest"] = hashlib.sha256(
+                    manifest_path.read_bytes()
+                ).hexdigest()
+            except OSError as exc:  # pragma: no cover - IO errors uncommon
+                determinism_meta["manifest_digest_error"] = str(exc)
 
             runtime_snapshot_error: Dict[str, str] | None = None
             try:
@@ -2774,6 +2987,12 @@ def convert(
                         "status": "error",
                         "error": runtime_snapshot_error,
                     }
+            if isinstance(runtime_snapshot, dict):
+                runtime_meta = runtime_snapshot.get("metadata")
+                if not isinstance(runtime_meta, dict):
+                    runtime_meta = {}
+                    runtime_snapshot["metadata"] = runtime_meta
+                runtime_meta["determinism"] = determinism_meta
             if runtime_snapshot_error is not None:
                 metadata["runtime_snapshot_error"] = runtime_snapshot_error
 
@@ -2831,6 +3050,8 @@ def convert(
             logger.exception("Conversion failed: %s", exc)
             raise
     finally:
+        _set_determinism_observer(previous_observer)
+        _set_determinism(previous_settings)
         if file_handler is not None:
             logger.removeHandler(file_handler)
             file_handler.close()
@@ -2855,6 +3076,7 @@ def run_interactive_cli(
     top_l: int = 8,
     original_subdir: str | Path | None = None,
     verbose: bool = True,
+    determinism: DeterminismSettings | None = None,
     input_func: Callable[[str], str] = input,
     output_func: Callable[[str], None] = print,
 ) -> ConversionSummary:
@@ -2963,6 +3185,7 @@ def run_interactive_cli(
         top_l=selected_topl,
         original_subdir=selected_original,
         verbose=verbose,
+        determinism=determinism,
     )
     _display("")
     _display(render_summary(summary, format="table"))
@@ -3037,6 +3260,35 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="Optional path to write the conversion summary to",
     )
+    parser.add_argument(
+        "--mxfp4-backend",
+        choices=("python", "numpy", "torch"),
+        default="python",
+        help=(
+            "Backend to use when decoding MXFP4 tensors. "
+            "Non-python options require deterministic attestations."
+        ),
+    )
+    parser.add_argument(
+        "--torch-threads",
+        type=int,
+        help="Pin the Torch thread count used for deterministic MXFP4 decoding.",
+    )
+    parser.add_argument(
+        "--numpy-threads",
+        type=int,
+        help="Pin the NumPy thread count used for deterministic MXFP4 decoding.",
+    )
+    parser.add_argument(
+        "--assume-ftz",
+        action="store_true",
+        help="Attest that the environment flushes denormal floats to zero (FTZ).",
+    )
+    parser.add_argument(
+        "--assume-fma",
+        action="store_true",
+        help="Attest that fused multiply-add behaviour is deterministic.",
+    )
     parser.set_defaults(print_summary=True)
 
     args = parser.parse_args(argv)
@@ -3071,6 +3323,44 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 " and ".join(missing) + " required unless --interactive is supplied"
             )
 
+    if args.torch_threads is not None and args.torch_threads <= 0:
+        parser.error("--torch-threads must be a positive integer")
+    if args.numpy_threads is not None and args.numpy_threads <= 0:
+        parser.error("--numpy-threads must be a positive integer")
+
+    backend = args.mxfp4_backend
+    if backend == "torch":
+        if args.torch_threads is None:
+            parser.error("--torch-threads=1 is required when using --mxfp4-backend=torch")
+        if args.torch_threads != 1:
+            parser.error("Deterministic torch MXFP4 decoding requires --torch-threads=1")
+        if not args.assume_ftz or not args.assume_fma:
+            parser.error(
+                "Torch MXFP4 decoding requires --assume-ftz and --assume-fma attestations"
+            )
+    elif backend == "numpy":
+        if args.numpy_threads is None:
+            parser.error("--numpy-threads=1 is required when using --mxfp4-backend=numpy")
+        if args.numpy_threads != 1:
+            parser.error("Deterministic NumPy MXFP4 decoding requires --numpy-threads=1")
+        if not args.assume_ftz or not args.assume_fma:
+            parser.error(
+                "NumPy MXFP4 decoding requires --assume-ftz and --assume-fma attestations"
+            )
+    else:
+        if args.torch_threads not in (None, 1):
+            parser.error("--torch-threads must be 1 when specified with --mxfp4-backend=python")
+        if args.numpy_threads not in (None, 1):
+            parser.error("--numpy-threads must be 1 when specified with --mxfp4-backend=python")
+
+    args.determinism = DeterminismSettings(
+        mxfp4_backend=backend,
+        torch_threads=args.torch_threads,
+        numpy_threads=args.numpy_threads,
+        assume_ftz=args.assume_ftz,
+        assume_fma=args.assume_fma,
+    )
+
     return args
 
 
@@ -3088,6 +3378,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             top_l=args.topL,
             original_subdir=args.original_subdir,
             verbose=args.verbose,
+            determinism=args.determinism,
         )
         return
 
@@ -3100,6 +3391,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             top_l=args.topL,
             original_subdir=args.original_subdir,
             verbose=args.verbose,
+            determinism=args.determinism,
         )
     except ModuleNotFoundError as exc:
         message = str(exc) or _SAFETENSORS_MISSING_MSG
