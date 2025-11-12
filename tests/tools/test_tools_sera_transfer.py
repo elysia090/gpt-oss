@@ -1004,6 +1004,14 @@ def test_cli_round_trip(tmp_path: Path, factory) -> None:
     manifest_bytes = (output / "sera_manifest.bin").read_bytes()
     assert manifest_bytes[:4] == struct.pack("<I", 0x5345524D)
     manifest = sera_transfer.decode_manifest(manifest_bytes)
+    tokenizer_tables = [
+        entry
+        for entry in manifest.arrays.entries
+        if entry.section == int(sera_transfer.ManifestSectionID.TOKENIZER)
+        and entry.kind == int(sera_transfer.ManifestArrayKind.TOKENIZER_TABLE)
+    ]
+    assert len(tokenizer_tables) == snapshot_cfg["tokenizer"]["max_piece_length"]
+    assert all(entry.length > 0 for entry in tokenizer_tables)
     if factory.__name__ == "_create_checkpoint":
         fixture_path = ROOT / "tests" / "data" / "sera_manifest_fixture.json"
         fixture = json.loads(fixture_path.read_text())

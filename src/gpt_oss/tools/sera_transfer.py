@@ -4528,6 +4528,18 @@ def write_manifest(
                 digest=_manifest_digest(info.sha256),
             )
         )
+
+    for name, info in artefacts.items():
+        if not name.startswith("T_"):
+            continue
+        entries.append(
+            ManifestArrayEntry(
+                section=int(ManifestSectionID.TOKENIZER),
+                kind=int(ManifestArrayKind.TOKENIZER_TABLE),
+                length=info.bytes,
+                digest=_manifest_digest(info.sha256),
+            )
+        )
     entries.sort(key=lambda item: (item.section, item.kind))
     arrays_section = ManifestArraysSection(entries=tuple(entries))
 
